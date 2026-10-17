@@ -26,7 +26,16 @@ import {
   Plus,
   Sparkles,
   TrendingUp,
-  Award
+  Award,
+  Paintbrush,
+  Eraser,
+  Play,
+  RotateCcw,
+  Clipboard,
+  Command,
+  Calculator,
+  Trash2,
+  Share2
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -155,6 +164,28 @@ export default function App() {
   const [aiAdvice, setAiAdvice] = useState<string>('');
   const [isLoadingAdvice, setIsLoadingAdvice] = useState(false);
 
+  // Phase 4 State: Collaborative Whiteboard
+  const [boardStrokes, setBoardStrokes] = useState<any[]>([]);
+  const [boardTexts, setBoardTexts] = useState<any[]>([]);
+  const [drawColor, setDrawColor] = useState<string>('#f59e0b');
+  const [brushWidth, setBrushWidth] = useState<number>(3);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [currentStrokePoints, setCurrentStrokePoints] = useState<{ x: number; y: number }[]>([]);
+  const [boardMode, setBoardMode] = useState<'draw' | 'text'>('draw');
+  const [newBoardText, setNewBoardText] = useState('');
+  const [isTimelapsePlaying, setIsTimelapsePlaying] = useState(false);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Phase 4 State: Shared Clipboard
+  const [clipboardText, setClipboardText] = useState<string>('');
+  const [clipboardUpdatedBy, setClipboardUpdatedBy] = useState<string>('');
+  const [isCopiedToOS, setIsCopiedToOS] = useState(false);
+
+  // Phase 4 State: Ctrl+K Command Palette
+  const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState('');
+  const [calcResult, setCalcResult] = useState<string | null>(null);
+
   // WebSocket Ref
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -254,6 +285,16 @@ export default function App() {
           }
         } else if (msg.type === 'USER_STATUS_CHANGED') {
           setOnlineUsers(prev => prev.map(u => u.id === msg.payload.userId ? { ...u, status: msg.payload.status } : u));
+        } else if (msg.type === 'BOARD_NEW_STROKE') {
+          setBoardStrokes(prev => [...prev, msg.payload]);
+        } else if (msg.type === 'BOARD_NEW_TEXT') {
+          setBoardTexts(prev => [...prev, msg.payload]);
+        } else if (msg.type === 'BOARD_CLEARED') {
+          setBoardStrokes([]);
+          setBoardTexts([]);
+        } else if (msg.type === 'CLIPBOARD_UPDATED') {
+          setClipboardText(msg.payload.content);
+          setClipboardUpdatedBy(msg.payload.updated_by);
         }
       } catch (err) {
         console.error('WS parse error:', err);
@@ -312,7 +353,40 @@ export default function App() {
       .then(res => res.json())
       .then(data => setTestScores(data))
       .catch(console.error);
+
+    fetch('/api/board', { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.json())
+      .then(data => {
+        if (data.strokes) setBoardStrokes(data.strokes);
+        if (data.texts) setBoardTexts(data.texts);
+      })
+      .catch(console.error);
+
+    fetch('/api/clipboard', { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.json())
+      .then(data => {
+        if (data.content) {
+          setClipboardText(data.content);
+          setClipboardUpdatedBy(data.updated_by || 'system');
+        }
+      })
+      .catch(console.error);
   }, [token]);
+
+  // Global Ctrl+K Keydown Listener
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsPaletteOpen(prev => !prev);
+      }
+      if (e.key === 'Escape') {
+        setIsPaletteOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // Messages Load
   useEffect(() => {
@@ -608,6 +682,219 @@ export default function App() {
       console.error(err);
     } finally {
       setIsLoadingAdvice(false);
+    }
+  };
+
+  // Phase 4: Board Drawing Handlers
+  const redrawCanvas = (strokes: any[], texts: any[]) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw strokes
+    for (const stroke of strokes) {
+      if (!stroke.points || stroke.points.length < 2) continue;
+      ctx.strokeStyle = stroke.color || '#f59e0b';
+      ctx.lineWidth = stroke.width || 3;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+      for (let i = 1; i < stroke.points.length; i++) {
+        ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+      }
+      ctx.stroke();
+    }
+
+    // Draw texts
+    for (const t of texts) {
+      ctx.font = '14px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(t.text, t.x, t.y);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'board' && !isTimelapsePlaying) {
+      redrawCanvas(boardStrokes, boardTexts);
+    }
+  }, [activeTab, boardStrokes, boardTexts, isTimelapsePlaying]);
+
+  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (boardMode !== 'draw') return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    setIsDrawing(true);
+    setCurrentStrokePoints([{ x, y }]);
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDrawing || boardMode !== 'draw') return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const newPoints = [...currentStrokePoints, { x, y }];
+    setCurrentStrokePoints(newPoints);
+
+    const ctx = canvas.getContext('2d');
+    if (ctx && newPoints.length >= 2) {
+      ctx.strokeStyle = drawColor;
+      ctx.lineWidth = brushWidth;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(newPoints[newPoints.length - 2].x, newPoints[newPoints.length - 2].y);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    }
+  };
+
+  const handleCanvasMouseUp = async () => {
+    if (!isDrawing || boardMode !== 'draw') return;
+    setIsDrawing(false);
+
+    if (currentStrokePoints.length >= 2 && token) {
+      try {
+        await fetch('/api/board/stroke', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            color: drawColor,
+            width: brushWidth,
+            points: currentStrokePoints
+          })
+        });
+      } catch (err) {
+        console.error('Stroke save error:', err);
+      }
+    }
+    setCurrentStrokePoints([]);
+  };
+
+  const handleAddBoardText = async (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (boardMode !== 'text' || !newBoardText.trim() || !token) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    try {
+      await fetch('/api/board/text', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ x, y, text: newBoardText })
+      });
+      setNewBoardText('');
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleClearBoard = async () => {
+    if (!token || !confirm('ホワイトボードを全員分クリアしますか？')) return;
+    try {
+      await fetch('/api/board/clear', {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // タイムラプス再生 (履歴を最初から順次描画)
+  const handlePlayTimelapse = () => {
+    if (boardStrokes.length === 0 || isTimelapsePlaying) return;
+    setIsTimelapsePlaying(true);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    let i = 0;
+    const interval = setInterval(() => {
+      if (i >= boardStrokes.length) {
+        clearInterval(interval);
+        setIsTimelapsePlaying(false);
+        redrawCanvas(boardStrokes, boardTexts);
+        return;
+      }
+      const stroke = boardStrokes[i];
+      if (stroke.points && stroke.points.length >= 2) {
+        ctx.strokeStyle = stroke.color || '#f59e0b';
+        ctx.lineWidth = stroke.width || 3;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        for (let p = 1; p < stroke.points.length; p++) {
+          ctx.lineTo(stroke.points[p].x, stroke.points[p].y);
+        }
+        ctx.stroke();
+      }
+      i++;
+    }, 120);
+  };
+
+  // Phase 4: Shared Clipboard Handlers
+  const handleUpdateClipboard = async (newText: string) => {
+    setClipboardText(newText);
+    if (!token) return;
+    try {
+      await fetch('/api/clipboard', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ content: newText })
+      });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleCopyClipboardToOS = () => {
+    navigator.clipboard.writeText(clipboardText);
+    setIsCopiedToOS(true);
+    setTimeout(() => setIsCopiedToOS(false), 2000);
+  };
+
+  // Phase 4: Command Palette & Calculator Query Evaluator
+  const handlePaletteInput = (val: string) => {
+    setPaletteQuery(val);
+    setCalcResult(null);
+
+    // Simple calculator regex evaluation: e.g. "12 * 45", "100 / 4"
+    if (/^[\d\s+\-*/().%^]+$/.test(val.trim())) {
+      try {
+        // Safe evaluation of simple arithmetic
+        const sanitized = val.replace(/\^/g, '**');
+        // eslint-disable-next-line no-eval
+        const res = Function(`'use strict'; return (${sanitized})`)();
+        if (typeof res === 'number' && !isNaN(res)) {
+          setCalcResult(String(res));
+        }
+      } catch {
+        setCalcResult(null);
+      }
     }
   };
 
@@ -1352,12 +1639,129 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 5: ボード */}
+        {/* TAB 5: リアルタイム共同作業ボード & クリップボード同期 (Phase 4 Full Feature) */}
         {activeTab === 'board' && (
-          <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
-            <Layout className="w-12 h-12 text-stone-600 mb-3" />
-            <h3 className="text-xl font-bold font-['Space_Grotesk'] text-white">リアルタイム共同作業ボード</h3>
-            <p className="text-xs font-mono text-stone-400 mt-1">手描きお絵描き・文章付箋・履歴タイムラプス機能</p>
+          <div className="flex-1 flex flex-col p-4 bg-[#090A0C] overflow-hidden">
+            {/* Whiteboard Toolbar */}
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-[#111214] border border-stone-800/80 rounded-2xl p-3 mb-3 font-mono text-xs">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setBoardMode('draw')}
+                  className={`px-3 py-1.5 rounded-xl flex items-center gap-1.5 transition ${
+                    boardMode === 'draw' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                  }`}
+                >
+                  <Paintbrush className="w-3.5 h-3.5" />
+                  <span>ペン描画</span>
+                </button>
+
+                <button
+                  onClick={() => setBoardMode('text')}
+                  className={`px-3 py-1.5 rounded-xl flex items-center gap-1.5 transition ${
+                    boardMode === 'text' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                  }`}
+                >
+                  <span>付箋/文章</span>
+                </button>
+
+                {boardMode === 'draw' && (
+                  <div className="flex items-center gap-2 pl-2 border-l border-stone-800">
+                    <span className="text-stone-500">Color:</span>
+                    {['#f59e0b', '#ef4444', '#10b981', '#3b82f6', '#ffffff'].map(c => (
+                      <button
+                        key={c}
+                        onClick={() => setDrawColor(c)}
+                        style={{ backgroundColor: c }}
+                        className={`w-5 h-5 rounded-full border-2 transition ${
+                          drawColor === c ? 'border-white scale-110' : 'border-transparent'
+                        }`}
+                      />
+                    ))}
+
+                    <span className="text-stone-500 ml-2">Size:</span>
+                    {[2, 4, 8].map(w => (
+                      <button
+                        key={w}
+                        onClick={() => setBrushWidth(w)}
+                        className={`px-2 py-0.5 rounded border transition ${
+                          brushWidth === w ? 'border-amber-400 text-amber-400' : 'border-stone-800 text-stone-500'
+                        }`}
+                      >
+                        {w}px
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {boardMode === 'text' && (
+                  <div className="flex items-center gap-2 pl-2 border-l border-stone-800">
+                    <input
+                      type="text"
+                      placeholder="配置する文章を入力してボードをクリック"
+                      value={newBoardText}
+                      onChange={e => setNewBoardText(e.target.value)}
+                      className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-1 text-white w-64 focus:outline-none focus:border-amber-500/60"
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handlePlayTimelapse}
+                  disabled={isTimelapsePlaying || boardStrokes.length === 0}
+                  className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-amber-400 rounded-xl flex items-center gap-1.5 transition disabled:opacity-40"
+                >
+                  <Play className="w-3.5 h-3.5 text-amber-400" />
+                  <span>{isTimelapsePlaying ? 'タイムラプス再生中...' : 'タイムラプス再生'}</span>
+                </button>
+
+                <button
+                  onClick={handleClearBoard}
+                  className="p-1.5 rounded-xl bg-stone-900 border border-stone-800 text-stone-500 hover:text-red-400 hover:border-red-900 transition"
+                  title="全員分クリア"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Canvas Area */}
+            <div className="flex-1 relative border border-stone-800/80 rounded-2xl bg-[#0C0D10] overflow-hidden flex items-center justify-center cursor-crosshair">
+              <canvas
+                ref={canvasRef}
+                width={1400}
+                height={800}
+                onMouseDown={handleCanvasMouseDown}
+                onMouseMove={handleCanvasMouseMove}
+                onMouseUp={handleCanvasMouseUp}
+                onClick={handleAddBoardText}
+                className="w-full h-full object-contain"
+              />
+
+              {/* クリップボード同期ドック (右下にPinP風配置) */}
+              <div className="absolute bottom-4 left-4 w-80 bg-[#111214]/90 backdrop-blur-md border border-stone-800/80 rounded-2xl p-3 shadow-2xl font-mono text-xs space-y-2">
+                <div className="flex items-center justify-between text-stone-400">
+                  <span className="flex items-center gap-1.5 font-bold text-white">
+                    <Clipboard className="w-3.5 h-3.5 text-amber-400" /> クリップボード同期
+                  </span>
+                  <span className="text-[10px] text-stone-500">by {clipboardUpdatedBy || 'system'}</span>
+                </div>
+                <textarea
+                  value={clipboardText}
+                  onChange={e => handleUpdateClipboard(e.target.value)}
+                  placeholder="ここに貼り付け・記入すると全員と即座に同期されます..."
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-2 text-stone-200 focus:outline-none focus:border-amber-500/60 resize-none h-18 text-xs leading-relaxed"
+                />
+                <button
+                  onClick={handleCopyClipboardToOS}
+                  className="w-full py-1.5 bg-stone-900 border border-stone-800 hover:border-stone-700 text-stone-300 rounded-lg flex items-center justify-center gap-1.5 transition text-[11px]"
+                >
+                  {isCopiedToOS ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{isCopiedToOS ? 'クリップボードにコピー完了！' : 'OSのクリップボードへコピー'}</span>
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
@@ -1521,6 +1925,67 @@ export default function App() {
           </div>
           <div className="h-44 bg-black flex items-center justify-center text-stone-600 text-xs font-mono">
             Camera Active (WebRTC Stream)
+          </div>
+        </div>
+      )}
+
+      {/* Ctrl+K コマンドパレット (Spotlight風モーダル) */}
+      {isPaletteOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-start justify-center pt-24 p-4">
+          <div 
+            onClick={e => e.stopPropagation()} 
+            className="w-full max-w-xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs"
+          >
+            <div className="p-3 border-b border-stone-800 flex items-center gap-2">
+              <Command className="w-4 h-4 text-amber-400" />
+              <input
+                autoFocus
+                type="text"
+                placeholder="コマンド、計算式 (例: 12 * 85)、タブ名を入力..."
+                value={paletteQuery}
+                onChange={e => handlePaletteInput(e.target.value)}
+                className="w-full bg-transparent text-white focus:outline-none placeholder-stone-600 text-sm"
+              />
+              <span className="text-[10px] text-stone-500 border border-stone-800 px-1.5 py-0.5 rounded">ESC</span>
+            </div>
+
+            {/* 計算機結果 */}
+            {calcResult !== null && (
+              <div className="p-3 bg-amber-500/10 border-b border-amber-500/20 text-amber-300 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Calculator className="w-4 h-4 text-amber-400" />
+                  <span>計算結果:</span>
+                </div>
+                <span className="text-base font-bold font-['Space_Grotesk'] text-white">{calcResult}</span>
+              </div>
+            )}
+
+            {/* ナビゲーションショートカット候補 */}
+            <div className="p-2 space-y-1">
+              <div className="text-[10px] uppercase text-stone-500 px-2 py-1 font-bold">Quick Navigation</div>
+              {[
+                { id: 'chat', label: 'チャットへ移動', desc: '/chat' },
+                { id: 'memo', label: 'リアルタイムメモへ移動', desc: '/memo' },
+                { id: 'assignments', label: '提出物・時間割へ移動', desc: '/assignments' },
+                { id: 'board', label: 'ホワイトボードへ移動', desc: '/board' },
+                { id: 'ai', label: 'Gemini AIへ移動', desc: '/ai' },
+                { id: 'more', label: 'テスト点数メモへ移動', desc: '/more' },
+                { id: 'settings', label: '設定へ移動', desc: '/settings' },
+              ].filter(c => c.label.includes(paletteQuery) || c.desc.includes(paletteQuery) || !paletteQuery).map(cmd => (
+                <button
+                  key={cmd.id}
+                  onClick={() => {
+                    setActiveTab(cmd.id as any);
+                    setIsPaletteOpen(false);
+                    setPaletteQuery('');
+                  }}
+                  className="w-full px-3 py-2 rounded-xl flex items-center justify-between hover:bg-stone-900/80 text-stone-300 hover:text-white transition text-left"
+                >
+                  <span>{cmd.label}</span>
+                  <span className="text-stone-500 text-[10px]">{cmd.desc}</span>
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       )}

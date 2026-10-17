@@ -110,6 +110,33 @@ export async function initDb() {
         exam_name VARCHAR(100) NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS board_strokes (
+        id SERIAL PRIMARY KEY,
+        user_id INT REFERENCES users(id) ON DELETE SET NULL,
+        username VARCHAR(50),
+        color VARCHAR(20) DEFAULT '#f59e0b',
+        width INT DEFAULT 3,
+        points JSONB NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS board_texts (
+        id SERIAL PRIMARY KEY,
+        user_id INT REFERENCES users(id) ON DELETE SET NULL,
+        username VARCHAR(50),
+        x INT NOT NULL,
+        y INT NOT NULL,
+        text TEXT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS shared_clipboard (
+        id INT PRIMARY KEY DEFAULT 1,
+        content TEXT DEFAULT '',
+        updated_by VARCHAR(50) DEFAULT 'system',
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
     `);
 
     // 初期チャンネルの作成

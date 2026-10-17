@@ -471,6 +471,100 @@ app.post('/api/test-scores/advice', authMiddleware, async (req: AuthRequest, res
   }
 });
 
+// Board API
+app.get('/api/board', authMiddleware, async (req, res) => {
+  try {
+    const strokes = await pool.query(`SELECT * FROM board_strokes ORDER BY id ASC`);
+    const texts = await pool.query(`SELECT * FROM board_texts ORDER BY id ASC`);
+    res.json({ strokes: strokes.rows, texts: texts.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'ボードデータ取得エラー' });
+  }
+});
+
+app.post('/api/board/stroke', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const username = req.user!.username;
+    const { color, width, points } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO board_strokes (user_id, username, color, width, points) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [userId, username, color || '#f59e0b', width || 3, JSON.stringify(points)]
+    );
+    const stroke = result.rows[0];
+    broadcast({ type: 'BOARD_NEW_STROKE', payload: stroke });
+    res.json(stroke);
+  } catch (err) {
+    res.status(500).json({ error: 'ストローク保存エラー' });
+  }
+});
+
+app.post('/api/board/text', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const username = req.user!.username;
+    const { x, y, text } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO board_texts (user_id, username, x, y, text) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [userId, username, x, y, text]
+    );
+    const textItem = result.rows[0];
+    broadcast({ type: 'BOARD_NEW_TEXT', payload: textItem });
+    res.json(textItem);
+  } catch (err) {
+    res.status(500).json({ error: 'テキスト付箋保存エラー' });
+  }
+});
+
+app.delete('/api/board/clear', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    await pool.query(`DELETE FROM board_strokes`);
+    await pool.query(`DELETE FROM board_texts`);
+    broadcast({ type: 'BOARD_CLEARED' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'ボードクリアエラー' });
+  }
+});
+
+// Shared Clipboard API
+app.get('/api/clipboard', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM shared_clipboard WHERE id = 1`);
+    if (result.rows.length === 0) {
+      await pool.query(`INSERT INTO shared_clipboard (id, content) VALUES (1, '') ON CONFLICT DO NOTHING`);
+      return res.json({ content: '', updated_by: 'system', updated_at: new Date().toISOString() });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'クリップボード取得エラー' });
+  }
+});
+
+app.put('/api/clipboard', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { content } = req.body;
+    const username = req.user!.username;
+
+    const result = await pool.query(
+      `INSERT INTO shared_clipboard (id, content, updated_by, updated_at) 
+       VALUES (1, $1, $2, NOW()) 
+       ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, updated_by = EXCLUDED.updated_by, updated_at = NOW() 
+       RETURNING *`,
+      [content, username]
+    );
+    const updated = result.rows[0];
+    broadcast({ type: 'CLIPBOARD_UPDATED', payload: updated });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: 'クリップボード同期エラー' });
+  }
+});
+
 // Notes (Slots 1-10) API
 app.get('/api/notes', authMiddleware, async (req, res) => {
   try {
