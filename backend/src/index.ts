@@ -5,6 +5,10 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import sharp from 'sharp';
+import path from 'path';
+import fs from 'fs';
 import { pool, initDb } from './db.js';
 
 dotenv.config();
@@ -16,9 +20,22 @@ const wss = new WebSocketServer({ server });
 const PORT = process.env.PORT || 8091;
 const JWT_SECRET = process.env.JWT_SECRET || 'asdfbase_jwt_super_secret_key_2026_x89q';
 const INVITE_CODE = process.env.INVITE_CODE || 'ASDF';
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
+
+const UPLOAD_DIR = path.resolve('uploads');
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
 
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use('/uploads', express.static(UPLOAD_DIR));
+
+// Multer in-memory storage for sharp compression
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit before compression
+});
 
 // Auth Middleware
 export interface AuthRequest extends Request {
@@ -75,7 +92,6 @@ app.post('/api/auth/register', async (req, res) => {
       expiresIn: '30d',
     });
 
-    // 監査ログ
     await pool.query(
       `INSERT INTO audit_logs (user_id, username, action, target_type, target_id, details) 
        VALUES ($1, $2, 'register', 'user', $3, $4)`,
@@ -131,7 +147,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Get Current User Profile
+// Current User Profile
 app.get('/api/auth/me', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const result = await pool.query(
@@ -144,6 +160,30 @@ app.get('/api/auth/me', authMiddleware, async (req: AuthRequest, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'プロフィール取得エラー' });
+  }
+});
+
+// Image Upload with Auto-WebP Compression
+app.post('/api/upload', authMiddleware, upload.single('image'), async (req: AuthRequest, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: '画像ファイルが見つかりません' });
+    }
+
+    const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.webp`;
+    const outputPath = path.join(UPLOAD_DIR, filename);
+
+    // 最大幅1600px、品質80%のWebPに自動圧縮
+    await sharp(req.file.buffer)
+      .resize({ width: 1600, withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toFile(outputPath);
+
+    const imageUrl = `/uploads/${filename}`;
+    res.json({ url: imageUrl, filename });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: '画像の圧縮保存に失敗しました' });
   }
 });
 
@@ -176,6 +216,101 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
   }
 });
 
+// Post Message (REST fallback)
+app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId, 10);
+    const { content, attachments, replyToId } = req.body;
+    const userId = req.user!.id;
+    const username = req.user!.username;
+
+    const result = await pool.query(
+      `INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [channelId, userId, username, content, JSON.stringify(attachments || []), replyToId || null]
+    );
+
+    const savedMessage = { ...result.rows[0], sender_username: username };
+
+    // WebSocketブロードキャスト
+    broadcast({
+      type: 'NEW_MESSAGE',
+      payload: savedMessage,
+    });
+
+    // Discord Webhook 中継（設定されている場合）
+    if (DISCORD_WEBHOOK_URL) {
+      fetch(DISCORD_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: `[asdfbase] ${username}`,
+          content: content,
+        }),
+      }).catch(err => console.error('Discord webhook relay error:', err));
+    }
+
+    res.json(savedMessage);
+  } catch (err) {
+    console.error('Post message error:', err);
+    res.status(500).json({ error: 'メッセージ投稿エラー' });
+  }
+});
+
+// Reaction on Message
+app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId, 10);
+    const { emoji } = req.body;
+    const userId = req.user!.id;
+
+    const msgRes = await pool.query(`SELECT reactions FROM messages WHERE id = $1`, [messageId]);
+    if (msgRes.rows.length === 0) return res.status(404).json({ error: 'メッセージがありません' });
+
+    const reactions = msgRes.rows[0].reactions || {};
+    const users = reactions[emoji] || [];
+
+    if (users.includes(userId)) {
+      reactions[emoji] = users.filter((id: number) => id !== userId);
+      if (reactions[emoji].length === 0) delete reactions[emoji];
+    } else {
+      reactions[emoji] = [...users, userId];
+    }
+
+    const updated = await pool.query(
+      `UPDATE messages SET reactions = $1 WHERE id = $2 RETURNING *`,
+      [JSON.stringify(reactions), messageId]
+    );
+
+    broadcast({
+      type: 'MESSAGE_REACTION_UPDATED',
+      payload: { messageId, reactions: updated.rows[0].reactions },
+    });
+
+    res.json(updated.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'リアクション更新エラー' });
+  }
+});
+
+// Pin Message
+app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId, 10);
+    const updated = await pool.query(
+      `UPDATE messages SET is_pinned = NOT is_pinned WHERE id = $1 RETURNING *`,
+      [messageId]
+    );
+    broadcast({
+      type: 'MESSAGE_PIN_UPDATED',
+      payload: updated.rows[0],
+    });
+    res.json(updated.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'ピン留め更新エラー' });
+  }
+});
+
 // Notes (Slots 1-10) API
 app.get('/api/notes', authMiddleware, async (req, res) => {
   try {
@@ -189,16 +324,21 @@ app.get('/api/notes', authMiddleware, async (req, res) => {
 app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const slotIndex = parseInt(req.params.slotIndex, 10);
-    const { title, content, mode } = req.body;
+    const { title, content, mode, assigned_user_id } = req.body;
     const userId = req.user!.id;
     const username = req.user!.username;
 
     const currentNoteRes = await pool.query(`SELECT * FROM notes WHERE slot_index = $1`, [slotIndex]);
     const currentNote = currentNoteRes.rows[0];
 
-    // Monaco editor モードかつ割り当てユーザーがいる場合のロックチェック
-    if (currentNote && currentNote.mode === 'monaco' && currentNote.assigned_user_id && currentNote.assigned_user_id !== userId) {
-      return res.status(403).json({ error: 'このメモは他のユーザー専用ゾーンです（閲覧専用）' });
+    // Monaco editor モードかつ専用ゾーン指定がある場合のロックチェック
+    if (
+      currentNote && 
+      currentNote.mode === 'monaco' && 
+      currentNote.assigned_user_id && 
+      currentNote.assigned_user_id !== userId
+    ) {
+      return res.status(403).json({ error: 'このメモは他ユーザーの専用ゾーンです（閲覧専用）' });
     }
 
     // 履歴保存
@@ -214,13 +354,13 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
        SET title = COALESCE($1, title), 
            content = COALESCE($2, content), 
            mode = COALESCE($3, mode), 
+           assigned_user_id = COALESCE($4, assigned_user_id),
            version = version + 1, 
            updated_at = NOW() 
-       WHERE slot_index = $4 RETURNING *`,
-      [title, content, mode, slotIndex]
+       WHERE slot_index = $5 RETURNING *`,
+      [title, content, mode, assigned_user_id !== undefined ? assigned_user_id : null, slotIndex]
     );
 
-    // ブロードキャスト
     broadcast({
       type: 'NOTE_UPDATED',
       payload: updated.rows[0],
@@ -234,7 +374,7 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
-// Audit Logs API
+// Audit Logs
 app.get('/api/audit-logs', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(`SELECT * FROM audit_logs ORDER BY id DESC LIMIT 50`);
@@ -244,7 +384,7 @@ app.get('/api/audit-logs', authMiddleware, async (req, res) => {
   }
 });
 
-// Users List (Online/Offline Status)
+// Users List
 app.get('/api/users', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -267,7 +407,7 @@ const clients = new Map<WebSocket, ClientInfo>();
 
 function broadcast(message: object, excludeWs?: WebSocket) {
   const data = JSON.stringify(message);
-  for (const [ws, info] of clients.entries()) {
+  for (const [ws] of clients.entries()) {
     if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) {
       ws.send(data);
     }
@@ -281,12 +421,10 @@ wss.on('connection', (ws: WebSocket) => {
     try {
       const msg = JSON.parse(data.toString());
 
-      // 認証ハンドシェイク
       if (msg.type === 'AUTH') {
         const decoded = jwt.verify(msg.token, JWT_SECRET) as { id: number; username: string; role: string };
         clients.set(ws, { ws, userId: decoded.id, username: decoded.username });
         
-        // オンラインステータス更新
         await pool.query(`UPDATE users SET status = 'online', last_active_at = NOW() WHERE id = $1`, [decoded.id]);
         broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: decoded.id, status: 'online' } });
         return;
@@ -295,25 +433,43 @@ wss.on('connection', (ws: WebSocket) => {
       const clientInfo = clients.get(ws);
       if (!clientInfo || !clientInfo.userId) return;
 
-      // チャット送信
       if (msg.type === 'SEND_MESSAGE') {
-        const { channelId, content, replyToId } = msg;
+        const { channelId, content, attachments, replyToId } = msg;
         const result = await pool.query(
-          `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
-           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-          [channelId, clientInfo.userId, clientInfo.username, content, replyToId || null]
+          `INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+          [channelId, clientInfo.userId, clientInfo.username, content, JSON.stringify(attachments || []), replyToId || null]
         );
-        const savedMessage = result.rows[0];
+        const savedMessage = { ...result.rows[0], sender_username: clientInfo.username };
 
         broadcast({
           type: 'NEW_MESSAGE',
-          payload: { ...savedMessage, sender_username: clientInfo.username },
+          payload: savedMessage,
         });
+
+        if (DISCORD_WEBHOOK_URL) {
+          fetch(DISCORD_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              username: `[asdfbase] ${clientInfo.username}`,
+              content: content,
+            }),
+          }).catch(err => console.error('Discord webhook relay error:', err));
+        }
       }
 
-      // 退席中・ステータス更新
+      if (msg.type === 'NOTE_SYNC') {
+        // メモのリアルタイムキーストローク共有
+        broadcast({
+          type: 'NOTE_SYNC',
+          payload: msg.payload, // { slotIndex, content, version }
+          sender: clientInfo.username,
+        }, ws);
+      }
+
       if (msg.type === 'SET_STATUS') {
-        const { status } = msg; // online, away, offline
+        const { status } = msg;
         await pool.query(`UPDATE users SET status = $1, last_active_at = NOW() WHERE id = $2`, [status, clientInfo.userId]);
         broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: clientInfo.userId, status } });
       }
@@ -332,7 +488,6 @@ wss.on('connection', (ws: WebSocket) => {
   });
 });
 
-// 起動
 server.listen(PORT, async () => {
   console.log(`[asdfbase-backend] Server listening on http://127.0.0.1:${PORT}`);
   try {

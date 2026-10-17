@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   CloudSun, 
   CalendarClock, 
@@ -11,16 +11,23 @@ import {
   MoreHorizontal, 
   Settings,
   Camera,
-  Search,
   LogOut,
   Send,
   Hash,
-  Users,
-  ChevronRight,
   ShieldAlert,
   Mic,
-  Maximize2
+  Image,
+  Pin,
+  Smile,
+  Copy,
+  Lock,
+  History,
+  CheckCircle2,
+  RefreshCw
 } from 'lucide-react';
+import Editor from '@monaco-editor/react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface User {
   id: number;
@@ -29,17 +36,41 @@ interface User {
   status: string;
 }
 
+interface Message {
+  id: number;
+  channel_id: number;
+  user_id: number;
+  username: string;
+  sender_username?: string;
+  content: string;
+  attachments?: string[];
+  reply_to_id?: number | null;
+  reactions?: Record<string, number[]>;
+  is_pinned?: boolean;
+  created_at: string;
+}
+
+interface MemoSlot {
+  slot_index: number;
+  title: string;
+  content: string;
+  mode: 'markdown' | 'monaco';
+  assigned_user_id?: number | null;
+  version: number;
+  updated_at: string;
+}
+
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('asdf_token'));
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   
-  // Navigation Tabs: chat | memo | ai | assignments | board | more | settings
+  // Navigation Tabs
   const [activeTab, setActiveTab] = useState<'chat' | 'memo' | 'ai' | 'assignments' | 'board' | 'more' | 'settings'>('chat');
 
   // Header Data
   const [currentTime, setCurrentTime] = useState<string>('');
   const [weather, setWeather] = useState<{ temp: number; desc: string }>({ temp: 21, desc: '晴れ' });
-  const [nextSubject, setNextSubject] = useState<{ name: string; time: string }>({ name: '数学', time: '10:45~' });
+  const [nextSubject] = useState<{ name: string; time: string }>({ name: '数学', time: '10:45~' });
   const [showCamera, setShowCamera] = useState<boolean>(false);
 
   // Auth Form State
@@ -56,17 +87,34 @@ export default function App() {
     { id: 3, name: 'vc1', type: 'voice' },
   ]);
   const [activeChannelId, setActiveChannelId] = useState<number>(1);
-  const [messages, setMessages] = useState<any[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [copiedLinkMessageId, setCopiedLinkMessageId] = useState<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Memo State (10 slots)
-  const [memoSlots, setMemoSlots] = useState<{ slot_index: number; title: string; content: string; mode: string }[]>([]);
-  const [selectedMemoSlot, setSelectedMemoSlot] = useState<number>(1);
+  // Memo State
+  const [memoSlots, setMemoSlots] = useState<MemoSlot[]>([]);
+  const [selectedSlotIndex, setSelectedSlotIndex] = useState<number>(1);
   const [memoTitle, setMemoTitle] = useState('');
   const [memoContent, setMemoContent] = useState('');
   const [memoMode, setMemoMode] = useState<'markdown' | 'monaco'>('markdown');
+  const [memoAssignedUser, setMemoAssignedUser] = useState<number | null>(null);
   const [isSavingMemo, setIsSavingMemo] = useState(false);
+
+  // WebSocket Ref
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Auto-scroll chat
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
   // Live Clock
   useEffect(() => {
@@ -81,7 +129,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Weather (Takamatsu: lat 34.34, lon 134.04)
+  // Weather (Takamatsu)
   useEffect(() => {
     async function fetchWeather() {
       try {
@@ -94,15 +142,15 @@ export default function App() {
           });
         }
       } catch (e) {
-        console.error('Weather fetch error:', e);
+        console.error('Weather error:', e);
       }
     }
     fetchWeather();
-    const interval = setInterval(fetchWeather, 600000); // 10 min
+    const interval = setInterval(fetchWeather, 600000);
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch Current User on Token Change
+  // Fetch Current User
   useEffect(() => {
     if (!token) return;
     fetch('/api/auth/me', {
@@ -119,7 +167,65 @@ export default function App() {
       });
   }, [token]);
 
-  // Load Channels & Messages & Notes
+  // WebSocket Connection & Real-time Handlers
+  useEffect(() => {
+    if (!token) return;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host;
+    const wsUrl = `${protocol}//${host}/ws`;
+
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'AUTH', token }));
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'NEW_MESSAGE') {
+          setMessages(prev => {
+            if (prev.some(m => m.id === msg.payload.id)) return prev;
+            return [...prev, msg.payload];
+          });
+        } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
+          setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
+        } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
+          setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
+        } else if (msg.type === 'NOTE_UPDATED') {
+          setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? msg.payload : n));
+          if (msg.payload.slot_index === selectedSlotIndex) {
+            setMemoTitle(msg.payload.title);
+            setMemoContent(msg.payload.content);
+            setMemoMode(msg.payload.mode);
+            setMemoAssignedUser(msg.payload.assigned_user_id);
+          }
+        } else if (msg.type === 'USER_STATUS_CHANGED') {
+          setOnlineUsers(prev => prev.map(u => u.id === msg.payload.userId ? { ...u, status: msg.payload.status } : u));
+        }
+      } catch (err) {
+        console.error('WS parse error:', err);
+      }
+    };
+
+    // Presence detection (online / away)
+    const handleVisibilityChange = () => {
+      if (ws.readyState === WebSocket.OPEN) {
+        const status = document.hidden ? 'away' : 'online';
+        ws.send(JSON.stringify({ type: 'SET_STATUS', status }));
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      ws.close();
+    };
+  }, [token, selectedSlotIndex]);
+
+  // Initial Load (Channels, Notes, Users)
   useEffect(() => {
     if (!token) return;
     fetch('/api/channels', { headers: { Authorization: `Bearer ${token}` } })
@@ -138,10 +244,11 @@ export default function App() {
         setMemoSlots(data);
         if (data.length > 0) {
           const first = data[0];
-          setSelectedMemoSlot(first.slot_index);
+          setSelectedSlotIndex(first.slot_index);
           setMemoTitle(first.title);
           setMemoContent(first.content);
           setMemoMode(first.mode);
+          setMemoAssignedUser(first.assigned_user_id);
         }
       })
       .catch(console.error);
@@ -193,35 +300,116 @@ export default function App() {
     setCurrentUser(null);
   };
 
+  // Image Upload Handler
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !token) return;
+
+    setIsUploading(true);
+    const formData = new FormData();
+    formData.append('image', file);
+
+    try {
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+      const data = await res.json();
+      if (res.ok && data.url) {
+        // 画像を添付メッセージとして即時送信
+        await fetch(`/api/channels/${activeChannelId}/messages`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            content: `![image](${data.url})`,
+            attachments: [data.url]
+          })
+        });
+      }
+    } catch (err) {
+      console.error('Image upload error:', err);
+    } finally {
+      setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  // Chat Send Handler
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim() || !token) return;
 
-    try {
-      // 一時的な直接保存 (WS対応へのフォールバック兼用)
-      const res = await fetch(`/api/channels/${activeChannelId}/messages`, {
+    const content = chatInput;
+    setChatInput('');
+
+    // WebSocket 送信を優先
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'SEND_MESSAGE',
+        channelId: activeChannelId,
+        content,
+      }));
+    } else {
+      // フォールバック
+      await fetch(`/api/channels/${activeChannelId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ content: chatInput })
+        body: JSON.stringify({ content })
       });
-      if (res.ok) {
-        const newMsg = await res.json();
-        setMessages(prev => [...prev, newMsg]);
-        setChatInput('');
-      }
+    }
+  };
+
+  // Reaction Handler
+  const handleToggleReaction = async (messageId: number, emoji: string) => {
+    if (!token) return;
+    try {
+      await fetch(`/api/messages/${messageId}/reactions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ emoji })
+      });
     } catch (err) {
       console.error(err);
     }
   };
 
+  // Pin Handler
+  const handleTogglePin = async (messageId: number) => {
+    if (!token) return;
+    try {
+      await fetch(`/api/messages/${messageId}/pin`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Copy Message Link
+  const handleCopyMessageLink = (messageId: number) => {
+    const url = `${window.location.origin}/#msg-${messageId}`;
+    navigator.clipboard.writeText(url);
+    setCopiedLinkMessageId(messageId);
+    setTimeout(() => setCopiedLinkMessageId(null), 2000);
+  };
+
+  // Save Memo
   const handleSaveMemo = async () => {
     if (!token) return;
     setIsSavingMemo(true);
     try {
-      const res = await fetch(`/api/notes/${selectedMemoSlot}`, {
+      const res = await fetch(`/api/notes/${selectedSlotIndex}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -230,12 +418,16 @@ export default function App() {
         body: JSON.stringify({
           title: memoTitle,
           content: memoContent,
-          mode: memoMode
+          mode: memoMode,
+          assigned_user_id: memoAssignedUser
         })
       });
       if (res.ok) {
         const updated = await res.json();
-        setMemoSlots(prev => prev.map(m => m.slot_index === selectedMemoSlot ? updated : m));
+        setMemoSlots(prev => prev.map(m => m.slot_index === selectedSlotIndex ? updated : m));
+      } else {
+        const err = await res.json();
+        alert(err.error || '保存に失敗しました');
       }
     } catch (err) {
       console.error(err);
@@ -244,11 +436,12 @@ export default function App() {
     }
   };
 
-  // ログイン前の認証モーダル
+  const isMonacoLocked = memoMode === 'monaco' && memoAssignedUser !== null && memoAssignedUser !== currentUser?.id;
+
+  // 認証前画面
   if (!token || !currentUser) {
     return (
       <div className="min-h-screen bg-[#090A0C] flex flex-col items-center justify-center p-4">
-        {/* Ambient Glow */}
         <div className="absolute w-[450px] h-[450px] bg-amber-500/10 rounded-full blur-3xl pointer-events-none -z-10" />
 
         <div className="w-full max-w-md bg-[#111214] border border-stone-800/80 rounded-2xl p-8 shadow-2xl interactive-card">
@@ -336,11 +529,9 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#090A0C] text-[#D6D3D1] flex flex-col font-['Inter']">
-      {/* 1. TOP BAR (as specified in spec.md) */}
+      {/* 1. TOP BAR */}
       <header className="h-14 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md sticky top-0 z-50 px-4 flex items-center justify-between select-none">
-        {/* Left Half: Tabs */}
         <div className="flex items-center gap-1 sm:gap-2">
-          {/* Logo */}
           <div 
             onClick={() => setActiveTab('chat')}
             className="logo-container mr-3 font-['Space_Grotesk'] font-extrabold text-lg flex items-center tracking-wider"
@@ -349,7 +540,6 @@ export default function App() {
             <span className="logo-dot">.</span>
           </div>
 
-          {/* Navigation Links: チャット, メモ, AI, 提出物, ボード, その他, 設定 */}
           <nav className="flex items-center gap-1 font-mono text-xs">
             {[
               { id: 'chat', label: 'チャット', icon: MessageSquare },
@@ -380,9 +570,8 @@ export default function App() {
           </nav>
         </div>
 
-        {/* Right Half: 日付/時間、高松市天気、次の教科 */}
+        {/* Right Header Block */}
         <div className="flex items-center gap-3 sm:gap-4 font-mono text-xs">
-          {/* カメラ起動小窓ボタン */}
           <button
             onClick={() => setShowCamera(!showCamera)}
             title="カメラ小窓"
@@ -395,19 +584,16 @@ export default function App() {
             <Camera className="w-3.5 h-3.5" />
           </button>
 
-          {/* 今日の日付と時間 */}
           <div className="hidden md:flex items-center gap-1.5 text-stone-400 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70">
             <CalendarClock className="w-3.5 h-3.5 text-stone-500" />
             <span>{currentTime || 'Loading...'}</span>
           </div>
 
-          {/* 香川県高松市の天気と温度 */}
           <div className="flex items-center gap-1.5 text-stone-300 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70">
             <CloudSun className="w-3.5 h-3.5 text-amber-400" />
             <span>高松 {weather.temp}℃ ({weather.desc})</span>
           </div>
 
-          {/* 次の教科 (クリックで時間割に飛ぶ) */}
           <button
             onClick={() => setActiveTab('assignments')}
             title="時間割 / 提出物に移動"
@@ -418,7 +604,6 @@ export default function App() {
             <span className="text-stone-400 text-[10px]">({nextSubject.time})</span>
           </button>
 
-          {/* ログアウト */}
           <button
             onClick={handleLogout}
             title="ログアウト"
@@ -458,11 +643,10 @@ export default function App() {
                 </div>
               </div>
 
-              {/* VC join shortcut */}
               <div className="bg-[#111214] border border-stone-800 rounded-xl p-2.5">
                 <div className="flex items-center justify-between text-[11px] font-mono text-stone-400 mb-1">
-                  <span className="flex items-center gap-1"><Mic className="w-3 h-3 text-emerald-400" /> Voice Channel</span>
-                  <span className="text-[9px] text-stone-500">READY</span>
+                  <span className="flex items-center gap-1"><Mic className="w-3 h-3 text-emerald-400" /> VC & 画面共有</span>
+                  <span className="text-[9px] text-stone-500">VOICEVOX</span>
                 </div>
                 <button className="w-full py-1 text-[11px] bg-stone-800 hover:bg-stone-700 text-stone-300 rounded font-mono transition">
                   /join vc1
@@ -470,16 +654,15 @@ export default function App() {
               </div>
             </aside>
 
-            {/* Center: メインチャットタイムライン */}
+            {/* Center: メインチャット */}
             <section className="flex-1 flex flex-col bg-[#090A0C] overflow-hidden">
-              {/* Channel Header */}
               <div className="h-12 border-b border-stone-800/80 px-4 flex items-center justify-between bg-[#0C0D10]/50 font-mono text-xs">
                 <div className="flex items-center gap-2 font-bold text-white">
                   <Hash className="w-4 h-4 text-amber-400" />
                   <span>{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
                 </div>
                 <div className="text-stone-500 text-[11px]">
-                  リアルタイム同期中 (Discord / VPS)
+                  WebSocket + WebP圧縮 + Discord同期中
                 </div>
               </div>
 
@@ -488,33 +671,125 @@ export default function App() {
                 {messages.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-stone-600 font-mono text-xs space-y-2">
                     <MessageSquare className="w-8 h-8 opacity-40 text-amber-400" />
-                    <p>まだメッセージはありません。/ai や @gemini コマンドも使えます。</p>
+                    <p>メッセージはありません。画像をクリップボード貼り付けまたは添付できます。</p>
                   </div>
                 ) : (
-                  messages.map((m, idx) => (
-                    <div key={idx} className="flex items-start gap-3 group">
-                      <div className="w-8 h-8 rounded-lg bg-stone-800 border border-stone-700 flex items-center justify-center text-xs font-mono font-bold text-amber-400 uppercase">
+                  messages.map((m) => (
+                    <div 
+                      key={m.id} 
+                      id={`msg-${m.id}`}
+                      className={`flex items-start gap-3 group relative p-1 rounded-xl transition ${
+                        m.is_pinned ? 'bg-amber-500/5 border border-amber-500/20' : ''
+                      }`}
+                    >
+                      <div className="w-8 h-8 rounded-lg bg-stone-800 border border-stone-700 flex items-center justify-center text-xs font-mono font-bold text-amber-400 uppercase shrink-0">
                         {(m.sender_username || m.username || 'U')[0]}
                       </div>
-                      <div className="flex-1">
+
+                      <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-1">
                           <span className="text-xs font-bold text-stone-200">{m.sender_username || m.username}</span>
                           <span className="text-[10px] text-stone-500 font-mono">
                             {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                           </span>
+                          {m.is_pinned && (
+                            <span className="flex items-center gap-0.5 text-[10px] text-amber-400 bg-amber-400/10 px-1.5 py-0.2 rounded border border-amber-400/20">
+                              <Pin className="w-2.5 h-2.5" /> ピン留め
+                            </span>
+                          )}
                         </div>
+
+                        {/* Message content */}
                         <div className="text-sm text-stone-300 bg-[#111214] border border-stone-800/80 rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed">
-                          {m.content}
+                          {m.content.startsWith('![image]') ? (
+                            <img 
+                              src={m.content.match(/\((.*?)\)/)?.[1]} 
+                              alt="attachment" 
+                              className="max-h-72 rounded-lg object-contain my-1 border border-stone-800"
+                            />
+                          ) : (
+                            <span>{m.content}</span>
+                          )}
                         </div>
+
+                        {/* Reactions Bar */}
+                        {m.reactions && Object.keys(m.reactions).length > 0 && (
+                          <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                            {Object.entries(m.reactions).map(([emoji, userIds]) => (
+                              <button
+                                key={emoji}
+                                onClick={() => handleToggleReaction(m.id, emoji)}
+                                className={`text-xs px-2 py-0.5 rounded-md border font-mono flex items-center gap-1 transition ${
+                                  userIds.includes(currentUser.id)
+                                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                                    : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-700'
+                                }`}
+                              >
+                                <span>{emoji}</span>
+                                <span>{userIds.length}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Action buttons (hover overlay) */}
+                      <div className="opacity-0 group-hover:opacity-100 transition absolute right-2 top-2 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-1 shadow-md">
+                        <button
+                          onClick={() => handleToggleReaction(m.id, '👍')}
+                          title="いいね"
+                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400 text-xs"
+                        >
+                          👍
+                        </button>
+                        <button
+                          onClick={() => handleToggleReaction(m.id, '❤️')}
+                          title="ハート"
+                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400 text-xs"
+                        >
+                          ❤️
+                        </button>
+                        <button
+                          onClick={() => handleTogglePin(m.id)}
+                          title="ピン留め"
+                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
+                        >
+                          <Pin className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={() => handleCopyMessageLink(m.id)}
+                          title="メッセージリンクをコピー"
+                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-white"
+                        >
+                          {copiedLinkMessageId === m.id ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                        </button>
                       </div>
                     </div>
                   ))
                 )}
+                <div ref={messagesEndRef} />
               </div>
 
-              {/* Chat Input */}
+              {/* Chat Input Bar */}
               <form onSubmit={handleSendMessage} className="p-3 border-t border-stone-800/80 bg-[#0C0D10]/50">
                 <div className="flex items-center gap-2 bg-[#14161C] border border-stone-800 rounded-xl px-3 py-2 focus-within:border-amber-500/60 transition">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    ref={fileInputRef}
+                    onChange={handleImageUpload}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isUploading}
+                    title="画像添付 (自動WebP圧縮)"
+                    className="p-1 rounded-lg text-stone-400 hover:text-amber-400 transition"
+                  >
+                    {isUploading ? <RefreshCw className="w-4 h-4 animate-spin text-amber-400" /> : <Image className="w-4 h-4" />}
+                  </button>
+
                   <input
                     type="text"
                     value={chatInput}
@@ -550,27 +825,29 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: リアルタイムメモ (10スロット) */}
+        {/* TAB 2: リアルタイムメモ (10スロット & Monaco / Markdown) */}
         {activeTab === 'memo' && (
           <div className="flex-1 flex overflow-hidden">
-            {/* Slot Selector (1 to 10) */}
+            {/* Slot Selector */}
             <aside className="w-64 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between">
               <div>
-                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold">
-                  Memo Slots (Max 10)
+                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between">
+                  <span>Memo Slots (Max 10)</span>
+                  <History className="w-3.5 h-3.5 text-stone-500" />
                 </div>
                 <div className="space-y-1.5">
                   {memoSlots.map(slot => (
                     <button
                       key={slot.slot_index}
                       onClick={() => {
-                        setSelectedMemoSlot(slot.slot_index);
+                        setSelectedSlotIndex(slot.slot_index);
                         setMemoTitle(slot.title);
                         setMemoContent(slot.content);
-                        setMemoMode(slot.mode as any);
+                        setMemoMode(slot.mode);
+                        setMemoAssignedUser(slot.assigned_user_id || null);
                       }}
                       className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-mono transition text-left ${
-                        selectedMemoSlot === slot.slot_index
+                        selectedSlotIndex === slot.slot_index
                           ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
                           : 'bg-[#111214] border border-stone-800/80 text-stone-400 hover:text-stone-200 hover:border-stone-700'
                       }`}
@@ -579,61 +856,90 @@ export default function App() {
                         <span className="text-stone-500 font-bold">#{slot.slot_index}</span>
                         <span className="truncate">{slot.title || `メモ #${slot.slot_index}`}</span>
                       </div>
-                      <span className="text-[10px] text-stone-600 uppercase font-mono">{slot.mode}</span>
+                      <div className="flex items-center gap-1">
+                        {slot.mode === 'monaco' && <Lock className="w-2.5 h-2.5 text-stone-500" />}
+                        <span className="text-[10px] text-stone-600 uppercase font-mono">{slot.mode}</span>
+                      </div>
                     </button>
                   ))}
                 </div>
               </div>
             </aside>
 
-            {/* Memo Editor Zone */}
+            {/* Editor Container */}
             <section className="flex-1 flex flex-col bg-[#090A0C] p-4">
               <div className="flex items-center justify-between mb-3 border-b border-stone-800/80 pb-3">
                 <input
                   type="text"
+                  disabled={isMonacoLocked}
                   value={memoTitle}
                   onChange={e => setMemoTitle(e.target.value)}
                   placeholder="タイトルを入力..."
-                  className="bg-transparent text-xl font-bold font-['Space_Grotesk'] text-white focus:outline-none flex-1 mr-4"
+                  className="bg-transparent text-xl font-bold font-['Space_Grotesk'] text-white focus:outline-none flex-1 mr-4 disabled:opacity-50"
                 />
 
                 <div className="flex items-center gap-2 font-mono text-xs">
+                  {isMonacoLocked && (
+                    <span className="text-red-400 flex items-center gap-1 bg-red-950/40 border border-red-800/60 px-2.5 py-1 rounded-lg">
+                      <Lock className="w-3 h-3" /> 他ユーザーの専用ゾーン（閲覧専用）
+                    </span>
+                  )}
+
                   <select
                     value={memoMode}
+                    disabled={isMonacoLocked}
                     onChange={e => setMemoMode(e.target.value as any)}
-                    className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2.5 py-1.5 focus:outline-none"
+                    className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2.5 py-1.5 focus:outline-none disabled:opacity-50"
                   >
-                    <option value="markdown">Markdown</option>
+                    <option value="markdown">Markdownモード</option>
                     <option value="monaco">Monaco Editor (専用枠)</option>
                   </select>
 
                   <button
                     onClick={handleSaveMemo}
-                    disabled={isSavingMemo}
-                    className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition interactive-btn uppercase"
+                    disabled={isSavingMemo || isMonacoLocked}
+                    className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition interactive-btn uppercase disabled:opacity-50"
                   >
                     {isSavingMemo ? '保存中...' : '保存'}
                   </button>
                 </div>
               </div>
 
-              {/* Editor Body */}
-              <div className="flex-1 flex gap-4 overflow-hidden">
-                <textarea
-                  value={memoContent}
-                  onChange={e => setMemoContent(e.target.value)}
-                  placeholder="ここにリアルタイムでメモを記述..."
-                  className="flex-1 h-full bg-[#111214] border border-stone-800/80 rounded-2xl p-4 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
-                />
-
-                {memoMode === 'markdown' && (
-                  <div className="flex-1 h-full bg-[#111214]/60 border border-stone-800/80 rounded-2xl p-4 text-stone-300 font-sans text-sm overflow-y-auto leading-relaxed">
-                    <div className="text-[11px] font-mono text-stone-500 mb-2 border-b border-stone-800 pb-1">
-                      LIVE PREVIEW
+              {/* Editor Workspace */}
+              <div className="flex-1 flex gap-4 overflow-hidden rounded-2xl border border-stone-800/80 bg-[#111214]">
+                {memoMode === 'monaco' ? (
+                  <div className="w-full h-full rounded-2xl overflow-hidden">
+                    <Editor
+                      height="100%"
+                      defaultLanguage="typescript"
+                      theme="vs-dark"
+                      value={memoContent}
+                      options={{
+                        readOnly: isMonacoLocked,
+                        minimap: { enabled: false },
+                        fontSize: 13,
+                        fontFamily: "'JetBrains Mono', monospace",
+                        automaticLayout: true,
+                      }}
+                      onChange={val => setMemoContent(val || '')}
+                    />
+                  </div>
+                ) : (
+                  <div className="flex-1 flex gap-4 p-4 overflow-hidden">
+                    <textarea
+                      value={memoContent}
+                      onChange={e => setMemoContent(e.target.value)}
+                      placeholder="Markdownテキストを入力..."
+                      className="flex-1 h-full bg-[#16181D] border border-stone-800 rounded-xl p-3.5 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
+                    />
+                    <div className="flex-1 h-full bg-[#16181D]/60 border border-stone-800 rounded-xl p-4 text-stone-300 font-sans text-sm overflow-y-auto leading-relaxed prose prose-invert max-w-none">
+                      <div className="text-[10px] font-mono text-stone-500 mb-2 border-b border-stone-800 pb-1">
+                        MARKDOWN LIVE PREVIEW
+                      </div>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {memoContent || '（内容がありません）'}
+                      </ReactMarkdown>
                     </div>
-                    <pre className="whitespace-pre-wrap font-mono text-xs text-stone-400">
-                      {memoContent || '（内容がありません）'}
-                    </pre>
                   </div>
                 )}
               </div>
@@ -677,7 +983,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Sample Assignment Cards */}
               <div className="space-y-3">
                 {[
                   { title: '数学II 第3章 演習問題', subject: '数学', deadline: '2026/10/20', status: '進行中' },
@@ -711,7 +1016,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 6: その他 (テスト点数メモ) */}
+        {/* TAB 6: その他 */}
         {activeTab === 'more' && (
           <div className="flex-1 p-6">
             <div className="max-w-2xl mx-auto bg-[#111214] border border-stone-800/80 rounded-2xl p-6">
@@ -721,20 +1026,18 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 7: 設定 (アカウント、通知、webhook、監査ログ) */}
+        {/* TAB 7: 設定 */}
         {activeTab === 'settings' && (
           <div className="flex-1 p-6 overflow-y-auto">
             <div className="max-w-3xl mx-auto space-y-6">
               <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">設定</h2>
 
-              {/* Account Box */}
               <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
                 <div className="text-stone-400 uppercase font-bold tracking-wider">Account Information</div>
                 <div className="text-stone-200">ユーザー名: <span className="text-amber-400 font-bold">{currentUser.username}</span></div>
                 <div className="text-stone-200">権限: <span className="text-stone-400">{currentUser.role}</span></div>
               </div>
 
-              {/* Audit Logs Sample */}
               <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
                 <div className="text-stone-400 uppercase font-bold tracking-wider">監査ログ & 復元</div>
                 <div className="space-y-2 text-stone-300">
@@ -749,7 +1052,7 @@ export default function App() {
         )}
       </main>
 
-      {/* カメラ小窓 (Pip風オーバーレイ) */}
+      {/* カメラ小窓 */}
       {showCamera && (
         <div className="fixed bottom-4 right-4 w-72 bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden z-50">
           <div className="p-2 border-b border-stone-800 flex items-center justify-between text-xs font-mono text-stone-400">
