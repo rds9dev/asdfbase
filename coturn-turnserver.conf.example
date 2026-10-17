@@ -1,0 +1,29 @@
+# Coturn (WebRTC TURN Server) Configuration Template for asdfbase
+# /etc/turnserver.conf
+
+# 外部アクセス用ポート (学校フィルタ・i-Filter回避のため443 TLSを使用)
+tls-listening-port=443
+alt-tls-listening-port=5349
+
+# 認証設定
+fingerprint
+lt-cred-mech
+use-auth-secret
+static-auth-secret=asdfbase_turn_secret_token_2026
+
+# レルム設定 (Cloudflareドメインなど)
+realm=asdfbase.net
+
+# ログ設定
+verbose
+syslog
+
+# メモリおよびリソース節約設定
+no-loopback-peers
+no-multicast-peers
+max-allocate-timeout=60
+stale-nonce=600
+
+# TLS証明書 (Let's Encrypt / Certbot等)
+# cert=/etc/letsencrypt/live/turn.asdfbase.net/fullchain.pem
+# pkey=/etc/letsencrypt/live/turn.asdfbase.net/privkey.pem
