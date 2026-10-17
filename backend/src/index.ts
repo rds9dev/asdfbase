@@ -413,6 +413,33 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
   }
 });
 
+// Discord Inbound Sync Endpoint (Discord Bot -> asdfbase)
+app.post('/api/discord/webhook', async (req, res) => {
+  try {
+    const { username, content, channelId, attachments } = req.body;
+    if (!content && (!attachments || attachments.length === 0)) {
+      return res.status(400).json({ error: 'content is required' });
+    }
+
+    const targetChannelId = parseInt(channelId, 10) || 1;
+    const senderName = username ? `[Discord] ${username}` : '[Discord]';
+
+    const result = await pool.query(
+      `INSERT INTO messages (channel_id, user_id, username, content, attachments) 
+       VALUES ($1, NULL, $2, $3, $4) RETURNING *`,
+      [targetChannelId, senderName, content || '', JSON.stringify(attachments || [])]
+    );
+
+    const savedMessage = { ...result.rows[0], sender_username: senderName };
+    broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
+
+    res.json({ success: true, message: savedMessage });
+  } catch (err) {
+    console.error('Discord inbound sync error:', err);
+    res.status(500).json({ error: 'Discord同期エラー' });
+  }
+});
+
 // Reactions & Pin
 app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthRequest, res) => {
   try {

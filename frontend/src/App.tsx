@@ -168,7 +168,7 @@ export default function App() {
   const [newTtPeriod, setNewTtPeriod] = useState(1);
   const [newTtSubject, setNewTtSubject] = useState('');
 
-  // Chat UI State (Mention, Search, Edit, Member Panel)
+  // Chat UI State (Mention, Search, Edit, Member Panel, Responsive)
   const [chatSearchQuery, setChatSearchQuery] = useState('');
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
@@ -177,6 +177,8 @@ export default function App() {
   const [showMentionSuggestions, setShowMentionSuggestions] = useState(false);
   const [mentionFilter, setMentionFilter] = useState('');
   const [isMembersCollapsed, setIsMembersCollapsed] = useState(false);
+  const [isChannelsCollapsed, setIsChannelsCollapsed] = useState(false);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(Boolean(localStorage.getItem('asdf_token')));
   const [isNewChannelModalOpen, setIsNewChannelModalOpen] = useState(false);
   const [newChannelName, setNewChannelName] = useState('');
   const [newChannelType, setNewChannelType] = useState<'text' | 'voice'>('text');
@@ -362,7 +364,10 @@ export default function App() {
 
   // Fetch Current User
   useEffect(() => {
-    if (!token) return;
+    if (!token) {
+      setIsCheckingAuth(false);
+      return;
+    }
     safeFetch('/api/auth/me', {
       headers: { Authorization: `Bearer ${token}` }
     })
@@ -374,90 +379,122 @@ export default function App() {
       .catch(() => {
         localStorage.removeItem('asdf_token');
         setToken(null);
+        setCurrentUser(null);
+      })
+      .finally(() => {
+        setIsCheckingAuth(false);
       });
   }, [token]);
 
-  // WebSocket Setup
+  // WebSocket Setup with Auto-Reconnect & Heartbeat
   useEffect(() => {
     if (!token) return;
 
-    const wsUrl = getWsUrl();
+    let isUnmounted = false;
+    let reconnectTimeout: any = null;
+    let heartbeatInterval: any = null;
 
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    const connectWs = () => {
+      if (isUnmounted) return;
+      const wsUrl = getWsUrl();
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'AUTH', token }));
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'NEW_MESSAGE') {
-          setMessages(prev => {
-            if (prev.some(m => m.id === msg.payload.id)) return prev;
-            return [...prev, msg.payload];
-          });
-        } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
-          setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
-        } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
-          setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
-        } else if (msg.type === 'NOTE_UPDATED') {
-          setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? msg.payload : n));
-          if (msg.payload.slot_index === selectedSlotIndex) {
-            setMemoTitle(msg.payload.title);
-            setMemoContent(msg.payload.content);
-            setMemoMode(msg.payload.mode);
-            setMemoAssignedUser(msg.payload.assigned_user_id);
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'AUTH', token }));
+        // Heartbeat every 25s
+        heartbeatInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'PING' }));
           }
-        } else if (msg.type === 'USER_STATUS_CHANGED') {
-          setOnlineUsers(prev => prev.map(u => u.id === msg.payload.userId ? { ...u, status: msg.payload.status } : u));
-        } else if (msg.type === 'BOARD_NEW_STROKE') {
-          setBoardStrokes(prev => [...prev, msg.payload]);
-        } else if (msg.type === 'BOARD_NEW_TEXT') {
-          setBoardTexts(prev => [...prev, msg.payload]);
-        } else if (msg.type === 'BOARD_CLEARED') {
-          setBoardStrokes([]);
-          setBoardTexts([]);
-        } else if (msg.type === 'CLIPBOARD_UPDATED') {
-          setClipboardText(msg.payload.content);
-          setClipboardUpdatedBy(msg.payload.updated_by);
-        } else if (msg.type === 'CHANNEL_CREATED') {
-          setChannels(prev => prev.some(c => c.id === msg.payload.id) ? prev : [...prev, msg.payload]);
-        } else if (msg.type === 'CHANNEL_DELETED') {
-          setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
-        } else if (msg.type === 'MESSAGE_DELETED') {
-          setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
-        } else if (msg.type === 'MESSAGE_UPDATED') {
-          setMessages(prev => prev.map(m => m.id === msg.payload.id ? { ...m, content: msg.payload.content } : m));
-        } else if (msg.type === 'NOTE_CONTENT_SYNC') {
-          if (msg.payload.slotIndex === selectedSlotIndex) {
-            setMemoContent(msg.payload.content);
-            if (msg.payload.title) setMemoTitle(msg.payload.title);
+        }, 25000);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'NEW_MESSAGE') {
+            setMessages(prev => {
+              if (prev.some(m => m.id === msg.payload.id)) return prev;
+              return [...prev, msg.payload];
+            });
+          } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
+            setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
+          } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
+            setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
+          } else if (msg.type === 'NOTE_UPDATED') {
+            setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? msg.payload : n));
+            if (msg.payload.slot_index === selectedSlotIndex) {
+              setMemoTitle(msg.payload.title);
+              setMemoContent(msg.payload.content);
+              setMemoMode(msg.payload.mode);
+              setMemoAssignedUser(msg.payload.assigned_user_id);
+            }
+          } else if (msg.type === 'USER_STATUS_CHANGED') {
+            setOnlineUsers(prev => prev.map(u => u.id === msg.payload.userId ? { ...u, status: msg.payload.status } : u));
+          } else if (msg.type === 'BOARD_NEW_STROKE') {
+            setBoardStrokes(prev => [...prev, msg.payload]);
+          } else if (msg.type === 'BOARD_NEW_TEXT') {
+            setBoardTexts(prev => [...prev, msg.payload]);
+          } else if (msg.type === 'BOARD_CLEARED') {
+            setBoardStrokes([]);
+            setBoardTexts([]);
+          } else if (msg.type === 'CLIPBOARD_UPDATED') {
+            setClipboardText(msg.payload.content);
+            setClipboardUpdatedBy(msg.payload.updated_by);
+          } else if (msg.type === 'CHANNEL_CREATED') {
+            setChannels(prev => prev.some(c => c.id === msg.payload.id) ? prev : [...prev, msg.payload]);
+          } else if (msg.type === 'CHANNEL_DELETED') {
+            setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
+          } else if (msg.type === 'MESSAGE_DELETED') {
+            setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
+          } else if (msg.type === 'MESSAGE_UPDATED') {
+            setMessages(prev => prev.map(m => m.id === msg.payload.id ? { ...m, content: msg.payload.content } : m));
+          } else if (msg.type === 'NOTE_CONTENT_SYNC') {
+            if (msg.payload.slotIndex === selectedSlotIndex) {
+              setMemoContent(msg.payload.content);
+              if (msg.payload.title) setMemoTitle(msg.payload.title);
+            }
+          } else if (msg.type === 'USER_DELETED') {
+            setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
+          } else if (msg.type === 'VC_USER_JOINED') {
+            setActiveVcUsers(prev => prev.some(u => u.userId === msg.payload.userId) ? prev : [...prev, msg.payload]);
+          } else if (msg.type === 'VC_USER_LEFT') {
+            setActiveVcUsers(prev => prev.filter(u => u.userId !== msg.payload.userId));
           }
-        } else if (msg.type === 'USER_DELETED') {
-          setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
-        } else if (msg.type === 'VC_USER_JOINED') {
-          setActiveVcUsers(prev => prev.some(u => u.userId === msg.payload.userId) ? prev : [...prev, msg.payload]);
-        } else if (msg.type === 'VC_USER_LEFT') {
-          setActiveVcUsers(prev => prev.filter(u => u.userId !== msg.payload.userId));
+        } catch (err) {
+          console.error('WS parse error:', err);
         }
-      } catch (err) {
-        console.error('WS parse error:', err);
-      }
+      };
+
+      ws.onclose = () => {
+        clearInterval(heartbeatInterval);
+        if (!isUnmounted) {
+          reconnectTimeout = setTimeout(connectWs, 2000);
+        }
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
     };
+
+    connectWs();
 
     const handleVisibilityChange = () => {
-      if (ws.readyState === WebSocket.OPEN) {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const status = document.hidden ? 'away' : 'online';
-        ws.send(JSON.stringify({ type: 'SET_STATUS', status }));
+        wsRef.current.send(JSON.stringify({ type: 'SET_STATUS', status }));
       }
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
+      isUnmounted = true;
+      clearInterval(heartbeatInterval);
+      clearTimeout(reconnectTimeout);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      ws.close();
+      if (wsRef.current) wsRef.current.close();
     };
   }, [token, selectedSlotIndex]);
 
@@ -1544,6 +1581,17 @@ export default function App() {
   const totalScore = testScores.reduce((acc, curr) => acc + Number(curr.score), 0);
   const totalMaxScore = testScores.reduce((acc, curr) => acc + Number(curr.max_score), 0);
 
+  if (isCheckingAuth) {
+    return (
+      <div className="min-h-screen bg-[#090A0C] flex flex-col items-center justify-center p-4 text-stone-400 font-mono text-xs">
+        <div className="flex items-center gap-2 mb-2">
+          <RefreshCw className="w-5 h-5 text-amber-400 animate-spin" />
+          <span className="font-bold text-white">セッション確認中...</span>
+        </div>
+      </div>
+    );
+  }
+
   if (!token || !currentUser) {
     return (
       <div className="min-h-screen bg-[#090A0C] flex flex-col items-center justify-center p-4">
@@ -1635,17 +1683,17 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#090A0C] text-[#D6D3D1] flex flex-col font-['Inter']">
       {/* 1. TOP BAR */}
-      <header className="h-14 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md sticky top-0 z-50 px-4 flex items-center justify-between select-none">
-        <div className="flex items-center gap-1 sm:gap-2">
+      <header className="h-14 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md sticky top-0 z-50 px-2 sm:px-4 flex items-center justify-between select-none overflow-x-auto gap-2">
+        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           <div 
             onClick={() => setActiveTab('chat')}
-            className="logo-container mr-3 font-['Space_Grotesk'] font-extrabold text-lg flex items-center tracking-wider"
+            className="logo-container mr-1 sm:mr-3 font-['Space_Grotesk'] font-extrabold text-base sm:text-lg flex items-center tracking-wider"
           >
             <span className="text-white">asdfbase</span>
             <span className="logo-dot">.</span>
           </div>
 
-          <nav className="flex items-center gap-1 font-mono text-xs">
+          <nav className="flex items-center gap-0.5 sm:gap-1 font-mono text-[11px] sm:text-xs">
             {[
               { id: 'chat', label: 'チャット', icon: MessageSquare },
               { id: 'memo', label: 'メモ', icon: FileText },
@@ -1661,14 +1709,14 @@ export default function App() {
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id as any)}
-                  className={`px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
+                  className={`px-2 sm:px-2.5 py-1.5 rounded-lg flex items-center gap-1 sm:gap-1.5 transition whitespace-nowrap ${
                     isActive 
                       ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30' 
                       : 'text-stone-400 hover:text-stone-200 hover:bg-stone-900/60'
                   }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
-                  <span>{tab.label}</span>
+                  <span className="hidden sm:inline">{tab.label}</span>
                 </button>
               );
             })}
@@ -1676,7 +1724,7 @@ export default function App() {
         </div>
 
         {/* Right Header Block */}
-        <div className="flex items-center gap-2 sm:gap-3 font-mono text-xs">
+        <div className="flex items-center gap-1.5 sm:gap-2.5 font-mono text-[11px] sm:text-xs shrink-0">
           <button
             onClick={() => {
               handleFetchTimetables();
@@ -1729,125 +1777,135 @@ export default function App() {
         {/* TAB 1: リアルタイムチャット (3ペイン) */}
         {activeTab === 'chat' && (
           <div className="flex-1 flex overflow-hidden">
-            <aside className="w-56 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between">
-              <div>
-                <div className="flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold">
-                  <span>Channels</span>
-                  <button
-                    onClick={() => setIsNewChannelModalOpen(true)}
-                    className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800 transition"
-                    title="チャンネルを作成"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-                <div className="space-y-1">
-                  {channels.map(ch => (
-                    <div
-                      key={ch.id}
-                      className={`group flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-mono transition ${
-                        activeChannelId === ch.id
-                          ? 'bg-amber-500/10 text-amber-400 font-bold border border-amber-500/30'
-                          : 'text-stone-400 hover:bg-stone-900/60 hover:text-stone-200'
-                      }`}
-                    >
-                      <button
-                        onClick={() => setActiveChannelId(ch.id)}
-                        className="flex items-center gap-2 flex-1 text-left truncate"
-                      >
-                        {ch.type === 'voice' ? <Mic className="w-3.5 h-3.5 text-stone-500" /> : <Hash className="w-3.5 h-3.5 text-stone-500" />}
-                        <span className="truncate">{ch.name}</span>
-                      </button>
-                      {channels.length > 1 && currentUser?.role === 'admin' && (
-                        <button
-                          onClick={() => handleDeleteChannel(ch.id)}
-                          className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600 transition"
-                          title="チャンネル削除"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* VC コントロール & 画面共有 */}
-              <div className="bg-[#111214] border border-stone-800 rounded-xl p-2.5 space-y-2">
-                <div className="flex items-center justify-between text-[11px] font-mono text-stone-400">
-                  <span className="flex items-center gap-1.5 font-bold text-white">
-                    <Mic className={`w-3.5 h-3.5 ${inVoiceChannel ? 'text-emerald-400 animate-pulse' : 'text-stone-500'}`} />
-                    ボイスチャット
-                  </span>
-                  <span className="text-[10px] text-stone-500">{inVoiceChannel ? '接続中' : '未接続'}</span>
-                </div>
-
-                {inVoiceChannel ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between gap-1 pt-1">
-                      <button
-                        onClick={handleToggleMicMute}
-                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
-                          isMicMuted ? 'bg-red-950/40 border-red-800 text-red-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
-                        }`}
-                        title={isMicMuted ? 'ミュート解除' : 'マイクミュート'}
-                      >
-                        {isMicMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-                      </button>
-
-                      <button
-                        onClick={() => setIsDeafened(!isDeafened)}
-                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
-                          isDeafened ? 'bg-red-950/40 border-red-800 text-red-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
-                        }`}
-                        title={isDeafened ? 'スピーカー有効化' : 'スピーカーミュート'}
-                      >
-                        {isDeafened ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-                      </button>
-
-                      <button
-                        onClick={handleToggleScreenShare}
-                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
-                          isScreenSharing ? 'bg-amber-500 text-black border-amber-400 font-bold' : 'bg-stone-800/80 border-stone-700 text-stone-200'
-                        }`}
-                        title="画面共有"
-                      >
-                        <Monitor className="w-3.5 h-3.5" />
-                      </button>
-
-                      <button
-                        onClick={() => setIsTtsEnabled(!isTtsEnabled)}
-                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
-                          isTtsEnabled ? 'bg-amber-500/20 border-amber-500/40 text-amber-400' : 'bg-stone-800/80 border-stone-700 text-stone-400'
-                        }`}
-                        title="聞き専モード（チャット読み上げ）"
-                      >
-                        <Headphones className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
+            {/* Channels Sidebar: Small screen / Chromebook responsive toggle */}
+            {!isChannelsCollapsed && (
+              <aside className="w-48 sm:w-56 border-r border-stone-800/80 bg-[#0C0D10] p-2.5 sm:p-3 flex flex-col justify-between shrink-0">
+                <div>
+                  <div className="flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold">
+                    <span>Channels</span>
                     <button
-                      onClick={handleToggleVoiceChannel}
-                      className="w-full py-1 text-xs bg-red-950/50 hover:bg-red-900/60 border border-red-800/80 text-red-400 rounded-lg font-mono transition"
+                      onClick={() => setIsNewChannelModalOpen(true)}
+                      className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800 transition"
+                      title="チャンネルを作成"
                     >
-                      切断
+                      <Plus className="w-3.5 h-3.5" />
                     </button>
                   </div>
-                ) : (
-                  <button
-                    onClick={handleToggleVoiceChannel}
-                    className="w-full py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg font-mono transition"
-                  >
-                    参加する
-                  </button>
-                )}
-              </div>
-            </aside>
+                  <div className="space-y-1">
+                    {channels.map(ch => (
+                      <div
+                        key={ch.id}
+                        className={`group flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-mono transition ${
+                          activeChannelId === ch.id
+                            ? 'bg-amber-500/10 text-amber-400 font-bold border border-amber-500/30'
+                            : 'text-stone-400 hover:bg-stone-900/60 hover:text-stone-200'
+                        }`}
+                      >
+                        <button
+                          onClick={() => setActiveChannelId(ch.id)}
+                          className="flex items-center gap-2 flex-1 text-left truncate"
+                        >
+                          {ch.type === 'voice' ? <Mic className="w-3.5 h-3.5 text-stone-500" /> : <Hash className="w-3.5 h-3.5 text-stone-500" />}
+                          <span className="truncate">{ch.name}</span>
+                        </button>
+                        {channels.length > 1 && currentUser?.role === 'admin' && (
+                          <button
+                            onClick={() => handleDeleteChannel(ch.id)}
+                            className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600 transition"
+                            title="チャンネル削除"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* VC コントロール & 画面共有 */}
+                <div className="bg-[#111214] border border-stone-800 rounded-xl p-2.5 space-y-2">
+                  <div className="flex items-center justify-between text-[11px] font-mono text-stone-400">
+                    <span className="flex items-center gap-1.5 font-bold text-white">
+                      <Mic className={`w-3.5 h-3.5 ${inVoiceChannel ? 'text-emerald-400 animate-pulse' : 'text-stone-500'}`} />
+                      ボイスチャット
+                    </span>
+                    <span className="text-[10px] text-stone-500">{inVoiceChannel ? '接続中' : '未接続'}</span>
+                  </div>
+
+                  {inVoiceChannel ? (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-1 pt-1">
+                        <button
+                          onClick={handleToggleMicMute}
+                          className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                            isMicMuted ? 'bg-red-950/40 border-red-800 text-red-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
+                          }`}
+                          title={isMicMuted ? 'ミュート解除' : 'マイクミュート'}
+                        >
+                          {isMicMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                        </button>
+
+                        <button
+                          onClick={() => setIsDeafened(!isDeafened)}
+                          className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                            isDeafened ? 'bg-red-950/40 border-red-800 text-red-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
+                          }`}
+                          title={isDeafened ? 'スピーカー有効化' : 'スピーカーミュート'}
+                        >
+                          {isDeafened ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                        </button>
+
+                        <button
+                          onClick={handleToggleScreenShare}
+                          className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                            isScreenSharing ? 'bg-amber-500 text-black border-amber-400 font-bold' : 'bg-stone-800/80 border-stone-700 text-stone-200'
+                          }`}
+                          title="画面共有"
+                        >
+                          <Monitor className="w-3.5 h-3.5" />
+                        </button>
+
+                        <button
+                          onClick={() => setIsTtsEnabled(!isTtsEnabled)}
+                          className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                            isTtsEnabled ? 'bg-amber-500/20 border-amber-500/40 text-amber-400' : 'bg-stone-800/80 border-stone-700 text-stone-400'
+                          }`}
+                          title="聞き専モード（チャット読み上げ）"
+                        >
+                          <Headphones className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      <button
+                        onClick={handleToggleVoiceChannel}
+                        className="w-full py-1 text-xs bg-red-950/50 hover:bg-red-900/60 border border-red-800/80 text-red-400 rounded-lg font-mono transition"
+                      >
+                        切断
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={handleToggleVoiceChannel}
+                      className="w-full py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg font-mono transition"
+                    >
+                      参加する
+                    </button>
+                  )}
+                </div>
+              </aside>
+            )}
 
             {/* Center: メインチャット */}
             <section className="flex-1 flex flex-col bg-[#090A0C] overflow-hidden">
-              <div className="h-12 border-b border-stone-800/80 px-4 flex items-center justify-between bg-[#0C0D10]/50 font-mono text-xs">
+              <div className="h-12 border-b border-stone-800/80 px-3 sm:px-4 flex items-center justify-between bg-[#0C0D10]/50 font-mono text-xs">
                 <div className="flex items-center gap-2 font-bold text-white">
+                  <button
+                    onClick={() => setIsChannelsCollapsed(!isChannelsCollapsed)}
+                    className="p-1 rounded hover:bg-stone-800 text-stone-400 hover:text-amber-400 transition"
+                    title={isChannelsCollapsed ? 'チャンネル一覧を開く' : 'チャンネル一覧を隠す'}
+                  >
+                    <Layout className="w-3.5 h-3.5" />
+                  </button>
                   <Hash className="w-4 h-4 text-amber-400" />
                   <span>{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
                 </div>
