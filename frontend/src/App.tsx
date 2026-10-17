@@ -324,10 +324,7 @@ export default function App() {
   useEffect(() => {
     async function fetchWeather() {
       try {
-        let res = await fetch(`${getApiBaseUrl()}/api/weather`).catch(() => null);
-        if (!res || !res.ok) {
-          res = await fetch(`${REMOTE_API_BASE}/api/weather`).catch(() => null);
-        }
+        const res = await fetch('/api/weather').catch(() => null);
         if (res && res.ok) {
           const data = await res.json();
           if (data && typeof data.temp === 'number') {
@@ -346,35 +343,21 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Safe fetch helper with automatic failover to remote VPS if relative proxy fails
+  // Safe fetch helper: always strictly same-origin relative path
   const safeFetch = async (input: string, init?: RequestInit): Promise<Response> => {
     let cleanPath = input;
-    if (cleanPath.startsWith(REMOTE_API_BASE)) {
-      cleanPath = cleanPath.slice(REMOTE_API_BASE.length);
+    if (cleanPath.startsWith('http://') || cleanPath.startsWith('https://')) {
+      try {
+        const parsed = new URL(cleanPath);
+        cleanPath = parsed.pathname + parsed.search;
+      } catch {
+        // fallback
+      }
     }
     if (!cleanPath.startsWith('/')) {
       cleanPath = `/${cleanPath}`;
     }
-
-    let baseUrl = getApiBaseUrl();
-    let url = `${baseUrl}${cleanPath}`;
-    try {
-      let res = await fetch(url, init);
-      const contentType = res.headers.get('content-type') || '';
-      if (baseUrl === '' && (res.status === 404 || contentType.includes('text/html'))) {
-        setApiBaseUrl(REMOTE_API_BASE);
-        url = `${REMOTE_API_BASE}${cleanPath}`;
-        res = await fetch(url, init);
-      }
-      return res;
-    } catch (err) {
-      if (baseUrl === '') {
-        setApiBaseUrl(REMOTE_API_BASE);
-        url = `${REMOTE_API_BASE}${cleanPath}`;
-        return await fetch(url, init);
-      }
-      throw err;
-    }
+    return fetch(cleanPath, init);
   };
 
   // Fetch Current User
@@ -566,32 +549,24 @@ export default function App() {
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
-    await detectApiBase();
     
-    let baseUrl = getApiBaseUrl();
     const subPath = `/api/auth/${authMode === 'login' ? 'login' : 'register'}`;
-    const body: any = { username: authUsername, password: authPassword };
+    const body: any = { username: authUsername.trim(), password: authPassword };
     if (authMode === 'register') {
-      body.inviteCode = authInviteCode;
+      body.inviteCode = authInviteCode.trim();
     }
 
     try {
-      let res = await fetch(`${baseUrl}${subPath}`, {
+      const res = await fetch(subPath, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
 
-      // If relative proxy returned 404 or HTML (common on static servers without node proxy)
       const contentType = res.headers.get('content-type') || '';
-      if (baseUrl === '' && (res.status === 404 || contentType.includes('text/html'))) {
-        baseUrl = REMOTE_API_BASE;
-        setApiBaseUrl(REMOTE_API_BASE);
-        res = await fetch(`${REMOTE_API_BASE}${subPath}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
+      if (!contentType.includes('application/json')) {
+        setAuthError('サーバーとの通信に失敗しました (プロキシエラー)');
+        return;
       }
 
       const data = await res.json();
@@ -603,25 +578,7 @@ export default function App() {
       setToken(data.token);
       setCurrentUser(data.user);
     } catch (err: any) {
-      // Network error on relative path: fallback to direct VPS
-      try {
-        setApiBaseUrl(REMOTE_API_BASE);
-        const res = await fetch(`${REMOTE_API_BASE}${subPath}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          setAuthError(data.error || 'エラーが発生しました');
-          return;
-        }
-        localStorage.setItem('asdf_token', data.token);
-        setToken(data.token);
-        setCurrentUser(data.user);
-      } catch (fErr) {
-        setAuthError('通信に失敗しました。サーバーの稼働状態を確認してください。');
-      }
+      setAuthError('通信に失敗しました。ネットワークまたはサーバーの接続を確認してください。');
     }
   };
 
