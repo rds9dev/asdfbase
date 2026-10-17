@@ -63,12 +63,15 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8091',
+        target: 'https://api-asdf.rds9.net',
         changeOrigin: true,
+        secure: true,
       },
       '/ws': {
-        target: 'ws://127.0.0.1:8091',
+        target: 'wss://api-asdf.rds9.net',
+        changeOrigin: true,
         ws: true,
+        secure: true,
       },
     },
   },

@@ -53,7 +53,7 @@ import {
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { API_BASE_URL, getWsUrl } from './config';
+import { API_BASE_URL, REMOTE_API_BASE, detectApiBase, getApiBaseUrl, setApiBaseUrl, getWsUrl, getWsFallbackUrl } from './config';
 
 interface User {
   id: number;
@@ -287,17 +287,53 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Weather (Takamatsu)
+  // Stealth / Camouflage Mode (for Chromebook / School monitoring bypass)
+  const [stealthMode, setStealthMode] = useState<'none' | 'classroom' | 'docs' | 'portal'>('none');
+  const [isPanicked, setIsPanicked] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (isPanicked) {
+      document.title = 'ホーム - Google Classroom';
+      return;
+    }
+    if (stealthMode === 'classroom') {
+      document.title = 'ホーム - Google Classroom';
+    } else if (stealthMode === 'docs') {
+      document.title = '情報基礎まとめノート - Google ドキュメント';
+    } else if (stealthMode === 'portal') {
+      document.title = '文部科学省 学習支援ポータルサイト';
+    } else {
+      document.title = 'asdfbase';
+    }
+  }, [stealthMode, isPanicked]);
+
+  // Esc key panic listener (Press Esc to immediately disguise screen)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsPanicked(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Weather (Takamatsu - via internal backend API to bypass external domain filters)
   useEffect(() => {
     async function fetchWeather() {
       try {
-        const res = await fetch('https://api.open-meteo.com/v1/forecast?latitude=34.34&longitude=134.04&current_weather=true');
-        const data = await res.json();
-        if (data.current_weather) {
-          setWeather({
-            temp: Math.round(data.current_weather.temperature),
-            desc: data.current_weather.weathercode <= 3 ? '晴れ/曇り' : '雨/曇り',
-          });
+        let res = await fetch(`${getApiBaseUrl()}/api/weather`).catch(() => null);
+        if (!res || !res.ok) {
+          res = await fetch(`${REMOTE_API_BASE}/api/weather`).catch(() => null);
+        }
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data && typeof data.temp === 'number') {
+            setWeather({
+              temp: data.temp,
+              desc: data.desc || '晴れ',
+            });
+          }
         }
       } catch (e) {
         console.error('Weather error:', e);
@@ -308,10 +344,41 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // Safe fetch helper with automatic failover to remote VPS if relative proxy fails
+  const safeFetch = async (input: string, init?: RequestInit): Promise<Response> => {
+    let cleanPath = input;
+    if (cleanPath.startsWith(REMOTE_API_BASE)) {
+      cleanPath = cleanPath.slice(REMOTE_API_BASE.length);
+    }
+    if (!cleanPath.startsWith('/')) {
+      cleanPath = `/${cleanPath}`;
+    }
+
+    let baseUrl = getApiBaseUrl();
+    let url = `${baseUrl}${cleanPath}`;
+    try {
+      let res = await fetch(url, init);
+      const contentType = res.headers.get('content-type') || '';
+      if (baseUrl === '' && (res.status === 404 || contentType.includes('text/html'))) {
+        setApiBaseUrl(REMOTE_API_BASE);
+        url = `${REMOTE_API_BASE}${cleanPath}`;
+        res = await fetch(url, init);
+      }
+      return res;
+    } catch (err) {
+      if (baseUrl === '') {
+        setApiBaseUrl(REMOTE_API_BASE);
+        url = `${REMOTE_API_BASE}${cleanPath}`;
+        return await fetch(url, init);
+      }
+      throw err;
+    }
+  };
+
   // Fetch Current User
   useEffect(() => {
     if (!token) return;
-    fetch(`${API_BASE_URL}/api/auth/me`, {
+    safeFetch('/api/auth/me', {
       headers: { Authorization: `Bearer ${token}` }
     })
       .then(res => {
@@ -413,17 +480,17 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
 
-    fetch(`${API_BASE_URL}/api/channels`, { headers: { Authorization: `Bearer ${token}` } })
+    safeFetch('/api/channels', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setChannels(data))
       .catch(console.error);
 
-    fetch(`${API_BASE_URL}/api/users`, { headers: { Authorization: `Bearer ${token}` } })
+    safeFetch('/api/users', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setOnlineUsers(data))
       .catch(console.error);
 
-    fetch(`${API_BASE_URL}/api/notes`, { headers: { Authorization: `Bearer ${token}` } })
+    safeFetch('/api/notes', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => {
         setMemoSlots(data);
@@ -438,17 +505,17 @@ export default function App() {
       })
       .catch(console.error);
 
-    fetch(`${API_BASE_URL}/api/assignments`, { headers: { Authorization: `Bearer ${token}` } })
+    safeFetch('/api/assignments', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setAssignments(data))
       .catch(console.error);
 
-    fetch(`${API_BASE_URL}/api/test-scores`, { headers: { Authorization: `Bearer ${token}` } })
+    safeFetch('/api/test-scores', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setTestScores(data))
       .catch(console.error);
 
-    fetch(`${API_BASE_URL}/api/board`, { headers: { Authorization: `Bearer ${token}` } })
+    safeFetch('/api/board', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => {
         if (data.strokes) setBoardStrokes(data.strokes);
@@ -456,7 +523,7 @@ export default function App() {
       })
       .catch(console.error);
 
-    fetch(`${API_BASE_URL}/api/clipboard`, { headers: { Authorization: `Bearer ${token}` } })
+    safeFetch('/api/clipboard', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => {
         if (data.content) {
@@ -485,7 +552,7 @@ export default function App() {
   // Messages Load
   useEffect(() => {
     if (!token || !activeChannelId) return;
-    fetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
+    safeFetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
       headers: { Authorization: `Bearer ${token}` }
     })
       .then(res => res.json())
@@ -497,18 +564,34 @@ export default function App() {
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
-    const endpoint = `${API_BASE_URL}/api/auth/${authMode === 'login' ? 'login' : 'register'}`;
+    await detectApiBase();
+    
+    let baseUrl = getApiBaseUrl();
+    const subPath = `/api/auth/${authMode === 'login' ? 'login' : 'register'}`;
     const body: any = { username: authUsername, password: authPassword };
     if (authMode === 'register') {
       body.inviteCode = authInviteCode;
     }
 
     try {
-      const res = await fetch(endpoint, {
+      let res = await fetch(`${baseUrl}${subPath}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+
+      // If relative proxy returned 404 or HTML (common on static servers without node proxy)
+      const contentType = res.headers.get('content-type') || '';
+      if (baseUrl === '' && (res.status === 404 || contentType.includes('text/html'))) {
+        baseUrl = REMOTE_API_BASE;
+        setApiBaseUrl(REMOTE_API_BASE);
+        res = await fetch(`${REMOTE_API_BASE}${subPath}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+      }
+
       const data = await res.json();
       if (!res.ok) {
         setAuthError(data.error || 'エラーが発生しました');
@@ -518,7 +601,25 @@ export default function App() {
       setToken(data.token);
       setCurrentUser(data.user);
     } catch (err: any) {
-      setAuthError('通信に失敗しました');
+      // Network error on relative path: fallback to direct VPS
+      try {
+        setApiBaseUrl(REMOTE_API_BASE);
+        const res = await fetch(`${REMOTE_API_BASE}${subPath}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setAuthError(data.error || 'エラーが発生しました');
+          return;
+        }
+        localStorage.setItem('asdf_token', data.token);
+        setToken(data.token);
+        setCurrentUser(data.user);
+      } catch (fErr) {
+        setAuthError('通信に失敗しました。サーバーの稼働状態を確認してください。');
+      }
     }
   };
 
@@ -538,14 +639,14 @@ export default function App() {
     formData.append('image', file);
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/upload`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/upload`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
         body: formData,
       });
       const data = await res.json();
       if (res.ok && data.url) {
-        await fetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
+        await safeFetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -580,7 +681,7 @@ export default function App() {
         content,
       }));
     } else {
-      await fetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
+      await safeFetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -594,7 +695,7 @@ export default function App() {
   const handleToggleReaction = async (messageId: number, emoji: string) => {
     if (!token) return;
     try {
-      await fetch(`${API_BASE_URL}/api/messages/${messageId}/reactions`, {
+      await safeFetch(`${API_BASE_URL}/api/messages/${messageId}/reactions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -610,7 +711,7 @@ export default function App() {
   const handleTogglePin = async (messageId: number) => {
     if (!token) return;
     try {
-      await fetch(`${API_BASE_URL}/api/messages/${messageId}/pin`, {
+      await safeFetch(`${API_BASE_URL}/api/messages/${messageId}/pin`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -629,7 +730,7 @@ export default function App() {
   const handleDeleteMessage = async (messageId: number) => {
     if (!token) return;
     try {
-      await fetch(`${API_BASE_URL}/api/messages/${messageId}`, {
+      await safeFetch(`${API_BASE_URL}/api/messages/${messageId}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -642,7 +743,7 @@ export default function App() {
   const handleEditMessage = async (messageId: number) => {
     if (!token || !editingContent.trim()) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/messages/${messageId}`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/messages/${messageId}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -665,7 +766,7 @@ export default function App() {
     e.preventDefault();
     if (!newChannelName.trim() || !token) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/channels`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -689,7 +790,7 @@ export default function App() {
     if (!token || channels.length <= 1) return;
     if (!confirm('このチャンネルを削除しますか？')) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/channels/${channelId}`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels/${channelId}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -710,7 +811,7 @@ export default function App() {
     if (!token || !currentPasswordInput || !newPasswordInput) return;
     setPasswordChangeStatus('変更中...');
     try {
-      const res = await fetch(`${API_BASE_URL}/api/auth/change-password`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/auth/change-password`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -735,7 +836,7 @@ export default function App() {
     if (!token || !currentUser) return;
     if (!confirm('本当にアカウントを削除しますか？この操作は元に戻せません。')) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/users/${currentUser.id}`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/users/${currentUser.id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -754,7 +855,7 @@ export default function App() {
     if (!token) return;
     setWebhookStatus('テスト送信中...');
     try {
-      const res = await fetch(`${API_BASE_URL}/api/webhook/test`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/webhook/test`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -776,13 +877,13 @@ export default function App() {
   const handleRestoreAuditLog = async (logId: number) => {
     if (!token) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/audit-logs/${logId}/restore`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/audit-logs/${logId}/restore`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
         alert('復元が完了しました');
-        fetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
+        safeFetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
           .then(r => r.json())
           .then(data => setAuditLogs(data))
           .catch(console.error);
@@ -813,7 +914,7 @@ export default function App() {
     if (!token) return;
     setIsSavingMemo(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/notes/${selectedSlotIndex}`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/notes/${selectedSlotIndex}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -846,7 +947,7 @@ export default function App() {
     if (!newAssignTitle || !newAssignDeadline || !token) return;
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/assignments`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/assignments`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -874,7 +975,7 @@ export default function App() {
   const handleUpdateAssignmentStatus = async (id: number, status: string) => {
     if (!token) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/assignments/${id}/progress`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/assignments/${id}/progress`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -895,7 +996,7 @@ export default function App() {
     if (!token || !assignment.description) return;
     setIsSummarizingAI(assignment.id);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/assignments/summarize`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/assignments/summarize`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -920,7 +1021,7 @@ export default function App() {
     if (!token) return;
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/test-scores`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/test-scores`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -947,7 +1048,7 @@ export default function App() {
     if (!token) return;
     setIsLoadingAdvice(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/test-scores/advice`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/test-scores/advice`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -1043,7 +1144,7 @@ export default function App() {
 
     if (currentStrokePoints.length >= 2 && token) {
       try {
-        await fetch(`${API_BASE_URL}/api/board/stroke`, {
+        await safeFetch(`${API_BASE_URL}/api/board/stroke`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -1067,7 +1168,7 @@ export default function App() {
     const { x, y } = getCanvasCoords(e);
 
     try {
-      await fetch(`${API_BASE_URL}/api/board/text`, {
+      await safeFetch(`${API_BASE_URL}/api/board/text`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1084,7 +1185,7 @@ export default function App() {
   const handleClearBoard = async () => {
     if (!token || !confirm('ホワイトボードを全員分クリアしますか？')) return;
     try {
-      await fetch(`${API_BASE_URL}/api/board/clear`, {
+      await safeFetch(`${API_BASE_URL}/api/board/clear`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -1133,7 +1234,7 @@ export default function App() {
     setClipboardText(newText);
     if (!token) return;
     try {
-      await fetch(`${API_BASE_URL}/api/clipboard`, {
+      await safeFetch(`${API_BASE_URL}/api/clipboard`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -1337,6 +1438,31 @@ export default function App() {
             <CalendarClock className="w-3.5 h-3.5 text-stone-500" />
             <span>{currentTime || 'Loading...'}</span>
           </div>
+
+          {/* カモフラージュ偽装セレクター */}
+          <div className="hidden lg:flex items-center gap-1 bg-stone-900/60 px-2 py-1 rounded-lg border border-stone-800/70 text-[10px]">
+            <span className="text-stone-500">偽装:</span>
+            <select
+              value={stealthMode}
+              onChange={e => setStealthMode(e.target.value as any)}
+              className="bg-transparent text-stone-300 focus:outline-none cursor-pointer"
+            >
+              <option value="none" className="bg-[#111214]">通常</option>
+              <option value="classroom" className="bg-[#111214]">Google Classroom</option>
+              <option value="docs" className="bg-[#111214]">Google Docs</option>
+              <option value="portal" className="bg-[#111214]">学習ポータル</option>
+            </select>
+          </div>
+
+          {/* 緊急パニックボタン (Boss Key) */}
+          <button
+            onClick={() => setIsPanicked(true)}
+            title="緊急カモフラージュ画面 (Escキーでも発動)"
+            className="px-2 py-1 rounded-lg bg-stone-900/80 border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-amber-500/50 transition flex items-center gap-1 text-[10px]"
+          >
+            <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden xl:inline text-stone-400">緊急偽装(Esc)</span>
+          </button>
 
           <button
             onClick={() => setShowCamera(!showCamera)}
@@ -2369,7 +2495,7 @@ export default function App() {
                       onClick={() => {
                         setSettingsSection(sec.id as any);
                         if (sec.id === 'audit' && token) {
-                          fetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
+                          safeFetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
                             .then(r => r.json())
                             .then(data => setAuditLogs(data))
                             .catch(console.error);
@@ -2515,7 +2641,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         if (token) {
-                          fetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
+                          safeFetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
                             .then(r => r.json())
                             .then(data => setAuditLogs(data))
                             .catch(console.error);
@@ -2694,6 +2820,50 @@ export default function App() {
                   <span className="text-stone-500 text-[10px]">{cmd.desc}</span>
                 </button>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 緊急カモフラージュ画面 (Boss Key / Escキーで瞬時に切替) */}
+      {isPanicked && (
+        <div className="fixed inset-0 z-[9999] bg-[#202124] text-[#E8EAED] flex flex-col font-sans select-none">
+          <header className="h-16 border-b border-[#3c4043] px-6 flex items-center justify-between bg-[#202124]">
+            <div className="flex items-center gap-3">
+              <span className="text-xl font-bold text-[#E8EAED]">Google Classroom</span>
+              <span className="text-xs text-[#9aa0a6] bg-[#303134] px-2.5 py-1 rounded">情報科学演習 第2学年</span>
+            </div>
+            <div className="flex items-center gap-3 text-xs text-[#9aa0a6]">
+              <span>提出期限: 明日 23:59</span>
+              <button 
+                onClick={() => setIsPanicked(false)} 
+                className="opacity-40 hover:opacity-100 text-[11px] text-[#9aa0a6] hover:text-white border border-[#5f6368] px-3 py-1 rounded transition"
+                title="復帰 (Esc)"
+              >
+                解除 (Esc)
+              </button>
+            </div>
+          </header>
+          <div className="flex-1 max-w-4xl w-full mx-auto p-8 space-y-6 overflow-y-auto">
+            <div className="bg-[#303134] border border-[#3c4043] rounded-2xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-4">
+                <h1 className="text-xl font-medium text-white">第5回 情報セキュリティとネットワーク基礎演習</h1>
+                <span className="text-xs text-[#8ab4f8] bg-[#1a73e8]/20 px-3 py-1 rounded-full border border-[#1a73e8]/40">割り当て済み</span>
+              </div>
+              <p className="text-sm text-[#bdc1c6] leading-relaxed mb-4">
+                教科書 p.48〜p.55 を読み、以下の設問に解答してレポートを作成してください。<br/>
+                1. 公開鍵暗号方式と共通鍵暗号方式の仕組みの違いについてまとめよ。<br/>
+                2. ファイアウォールとパケットフィルタリングの役割を説明せよ。
+              </p>
+              <div className="border-t border-[#3c4043] pt-4 flex items-center justify-between text-xs text-[#9aa0a6]">
+                <span>添付資料: 授業用スライド_第5回.pdf</span>
+                <span className="text-[#81c995]">提出状況: 未提出 (期限内)</span>
+              </div>
+            </div>
+
+            <div className="bg-[#303134] border border-[#3c4043] rounded-2xl p-6 shadow-lg">
+              <h2 className="text-base font-medium text-white mb-2">クラスの連絡事項</h2>
+              <p className="text-xs text-[#9aa0a6]">次回の授業では、各自の端末で演習課題の確認を行います。教科書を持参してください。</p>
             </div>
           </div>
         </div>

@@ -51,8 +51,65 @@ function authMiddleware(req, res, next) {
         return res.status(401).json({ error: '無効または期限切れのトークンです' });
     }
 }
+app.get('/', (req, res) => {
+    res.json({ status: 'ok', service: 'asdfbase-api', timestamp: new Date().toISOString() });
+});
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', service: 'asdfbase-api', timestamp: new Date().toISOString() });
+});
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', service: 'asdfbase-api', timestamp: new Date().toISOString() });
+});
+// Weather Cache & API (高松市)
+let weatherCache = null;
+function getWeatherDescription(code) {
+    if (code === 0)
+        return '快晴';
+    if (code === 1)
+        return '晴れ';
+    if (code === 2)
+        return '一部曇';
+    if (code === 3)
+        return '曇り';
+    if (code === 45 || code === 48)
+        return '霧';
+    if (code >= 51 && code <= 55)
+        return '霧雨';
+    if (code >= 61 && code <= 65)
+        return '雨';
+    if (code >= 71 && code <= 77)
+        return '雪';
+    if (code >= 80 && code <= 82)
+        return 'にわか雨';
+    if (code >= 85 && code <= 86)
+        return '雪';
+    if (code >= 95)
+        return '雷雨';
+    return '晴れ';
+}
+app.get('/api/weather', async (req, res) => {
+    const now = Date.now();
+    if (weatherCache && (now - weatherCache.updatedAt) < 10 * 60 * 1000) {
+        return res.json(weatherCache);
+    }
+    try {
+        const response = await fetch('https://api.open-meteo.com/v1/forecast?latitude=34.34&longitude=134.04&current_weather=true&timezone=Asia%2FTokyo');
+        if (response.ok) {
+            const data = await response.json();
+            if (data && data.current_weather) {
+                const weatherCode = Number(data.current_weather.weathercode);
+                const temp = Math.round(data.current_weather.temperature);
+                const desc = getWeatherDescription(weatherCode);
+                weatherCache = { temp, desc, weatherCode, updatedAt: now };
+                return res.json(weatherCache);
+            }
+        }
+    }
+    catch (err) {
+        console.error('Failed to fetch weather in backend:', err);
+    }
+    const fallback = weatherCache || { temp: 21, desc: '晴れ', weatherCode: 1, updatedAt: now };
+    res.json(fallback);
 });
 // Register
 app.post('/api/auth/register', async (req, res) => {
