@@ -23,6 +23,35 @@ const JWT_SECRET = process.env.JWT_SECRET || 'asdfbase_jwt_super_secret_key_2026
 const INVITE_CODE = process.env.INVITE_CODE || 'ASDF';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
+export async function getDiscordWebhookUrl(): Promise<string> {
+  try {
+    const res = await pool.query(`SELECT value FROM system_settings WHERE key = 'discord_webhook_url'`);
+    if (res.rows.length > 0 && res.rows[0].value) {
+      return res.rows[0].value;
+    }
+  } catch (err) {
+    // fallback
+  }
+  return DISCORD_WEBHOOK_URL;
+}
+
+export async function relayToDiscord(username: string, content: string) {
+  try {
+    const webhookUrl = await getDiscordWebhookUrl();
+    if (!webhookUrl) return;
+    fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: `[asdfbase] ${username}`,
+        content: content,
+      }),
+    }).catch(err => console.error('Discord webhook relay error:', err));
+  } catch (err) {
+    console.error('relayToDiscord error:', err);
+  }
+}
+
 const UPLOAD_DIR = path.resolve('uploads');
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -239,7 +268,7 @@ app.post('/api/upload', authMiddleware, upload.single('image'), async (req: Auth
 // Channels API
 app.get('/api/channels', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM channels ORDER BY id ASC`);
+    const result = await pool.query(`SELECT * FROM channels ORDER BY position ASC, id ASC`);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'チャンネル取得エラー' });
@@ -255,9 +284,12 @@ app.post('/api/channels', authMiddleware, async (req: AuthRequest, res) => {
     const cleanName = name.trim().toLowerCase().replace(/\s+/g, '-');
     const chType = type === 'voice' ? 'voice' : 'text';
 
+    const maxPosRes = await pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
+    const nextPos = parseInt(maxPosRes.rows[0].max_pos, 10) + 1;
+
     const result = await pool.query(
-      `INSERT INTO channels (name, type) VALUES ($1, $2) RETURNING *`,
-      [cleanName, chType]
+      `INSERT INTO channels (name, type, position) VALUES ($1, $2, $3) RETURNING *`,
+      [cleanName, chType, nextPos]
     );
     const newChannel = result.rows[0];
     broadcast({ type: 'CHANNEL_CREATED', payload: newChannel });
@@ -268,10 +300,29 @@ app.post('/api/channels', authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
+app.put('/api/channels/reorder', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { channelIds } = req.body;
+    if (!Array.isArray(channelIds)) {
+      return res.status(400).json({ error: 'channelIds配列が必要です' });
+    }
+
+    for (let i = 0; i < channelIds.length; i++) {
+      await pool.query(`UPDATE channels SET position = $1 WHERE id = $2`, [i, channelIds[i]]);
+    }
+
+    const updated = await pool.query(`SELECT * FROM channels ORDER BY position ASC, id ASC`);
+    broadcast({ type: 'CHANNELS_REORDERED', payload: updated.rows });
+    res.json(updated.rows);
+  } catch (err) {
+    console.error('Channel reorder error:', err);
+    res.status(500).json({ error: 'チャンネル順序の変更に失敗しました' });
+  }
+});
+
 app.delete('/api/channels/:id', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    // Don't allow deleting id 1 or last channel
     const countRes = await pool.query(`SELECT COUNT(*) FROM channels`);
     if (parseInt(countRes.rows[0].count, 10) <= 1) {
       return res.status(400).json({ error: '最後のチャンネルは削除できません' });
@@ -377,16 +428,7 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
     const savedMessage = { ...result.rows[0], sender_username: username };
     broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
 
-    if (DISCORD_WEBHOOK_URL) {
-      fetch(DISCORD_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: `[asdfbase] ${username}`,
-          content: content,
-        }),
-      }).catch(err => console.error('Discord webhook relay error:', err));
-    }
+    relayToDiscord(username, content);
 
     // Check for @gemini mention trigger
     const trimmed = content.trim();
@@ -548,6 +590,18 @@ app.post('/api/assignments', authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
+app.delete('/api/assignments/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    await pool.query(`DELETE FROM assignments WHERE id = $1`, [id]);
+    broadcast({ type: 'ASSIGNMENT_DELETED', payload: { id } });
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('Assignment delete error:', err);
+    res.status(500).json({ error: '提出物削除エラー' });
+  }
+});
+
 // Update Assignment Progress (未着手/進行中/提出済み/再提出/合格)
 app.put('/api/assignments/:id/progress', authMiddleware, async (req: AuthRequest, res) => {
   try {
@@ -600,11 +654,23 @@ app.post('/api/assignments/summarize', authMiddleware, async (req, res) => {
 // Test Scores & AI Advice
 app.get('/api/test-scores', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const userId = req.user!.id;
-    const result = await pool.query(
-      `SELECT * FROM test_scores WHERE user_id = $1 ORDER BY exam_name ASC, subject ASC`,
-      [userId]
-    );
+    const requestedUserId = req.query.userId as string;
+    let query = `
+      SELECT t.*, u.username 
+      FROM test_scores t 
+      LEFT JOIN users u ON t.user_id = u.id
+    `;
+    const params: any[] = [];
+    if (requestedUserId && requestedUserId !== 'all') {
+      query += ` WHERE t.user_id = $1`;
+      params.push(parseInt(requestedUserId, 10));
+    } else if (!requestedUserId) {
+      query += ` WHERE t.user_id = $1`;
+      params.push(req.user!.id);
+    }
+    query += ` ORDER BY t.exam_name ASC, t.subject ASC`;
+
+    const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'テスト点数取得エラー' });
@@ -621,9 +687,32 @@ app.post('/api/test-scores', authMiddleware, async (req: AuthRequest, res) => {
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [userId, examName, subject, score, maxScore || 100]
     );
-    res.json(result.rows[0]);
+    res.json({ ...result.rows[0], username: req.user!.username });
   } catch (err) {
     res.status(500).json({ error: 'テスト点数登録エラー' });
+  }
+});
+
+app.delete('/api/test-scores/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const userId = req.user!.id;
+    const userRole = req.user!.role;
+
+    const scoreRes = await pool.query(`SELECT * FROM test_scores WHERE id = $1`, [id]);
+    if (scoreRes.rows.length === 0) {
+      return res.status(404).json({ error: 'テスト点数が見つかりません' });
+    }
+
+    if (userRole !== 'admin' && scoreRes.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: '削除権限がありません' });
+    }
+
+    await pool.query(`DELETE FROM test_scores WHERE id = $1`, [id]);
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('Test score delete error:', err);
+    res.status(500).json({ error: 'テスト点数削除エラー' });
   }
 });
 
@@ -830,12 +919,48 @@ app.put('/api/clipboard', authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-// Notes (Slots 1-10) API
+// Notes (Slots 1-10 Common + Slots 11+ Dedicated Monaco) API
 app.get('/api/notes', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM notes ORDER BY slot_index ASC`);
+    // 1. スロット1〜10の確保
+    for (let i = 1; i <= 10; i++) {
+      await pool.query(`
+        INSERT INTO notes (slot_index, title, content, mode) 
+        VALUES ($1, $2, '', 'markdown') 
+        ON CONFLICT (slot_index) DO NOTHING
+      `, [i, `メモ ${i}`]);
+    }
+
+    // 2. 既存スロット1〜10の「メモ #1」などの重複タイトルをクリーンアップ
+    await pool.query(`
+      UPDATE notes 
+      SET title = REGEXP_REPLACE(title, '^メモ\\s*#([0-9]+)', 'メモ \\1') 
+      WHERE slot_index <= 10 AND title LIKE '%#%'
+    `).catch(() => {});
+
+    // 3. 全利用メンバーの専用Monacoエディタスロット（スロット11以降）を自動確保
+    const usersRes = await pool.query(`SELECT id, username FROM users ORDER BY id ASC`);
+    for (let uIdx = 0; uIdx < usersRes.rows.length; uIdx++) {
+      const u = usersRes.rows[uIdx];
+      const slotIndex = 11 + uIdx; // 1人1スロット順次割り当て
+      await pool.query(`
+        INSERT INTO notes (slot_index, title, content, mode, assigned_user_id)
+        VALUES ($1, $2, '', 'monaco', $3)
+        ON CONFLICT (slot_index) DO UPDATE 
+        SET assigned_user_id = EXCLUDED.assigned_user_id,
+            title = CASE WHEN notes.title LIKE '%の専用エディタ' THEN EXCLUDED.title ELSE notes.title END
+      `, [slotIndex, `${u.username}の専用エディタ`, u.id]);
+    }
+
+    const result = await pool.query(`
+      SELECT n.*, u.username as assigned_username 
+      FROM notes n 
+      LEFT JOIN users u ON n.assigned_user_id = u.id 
+      ORDER BY n.slot_index ASC
+    `);
     res.json(result.rows);
   } catch (err) {
+    console.error('Notes fetch error:', err);
     res.status(500).json({ error: 'メモ取得エラー' });
   }
 });
@@ -843,18 +968,20 @@ app.get('/api/notes', authMiddleware, async (req, res) => {
 app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const slotIndex = parseInt(req.params.slotIndex, 10);
-    const { title, content, mode, assigned_user_id } = req.body;
+    const { title, content, mode } = req.body;
     const userId = req.user!.id;
+    const userRole = req.user!.role;
     const username = req.user!.username;
 
     const currentNoteRes = await pool.query(`SELECT * FROM notes WHERE slot_index = $1`, [slotIndex]);
     const currentNote = currentNoteRes.rows[0];
 
+    // スロット11以降、または担当ユーザーが設定されている場合は本人のみ編集可能
     if (
       currentNote && 
-      currentNote.mode === 'monaco' && 
       currentNote.assigned_user_id && 
-      currentNote.assigned_user_id !== userId
+      currentNote.assigned_user_id !== userId &&
+      userRole !== 'admin'
     ) {
       return res.status(403).json({ error: 'このメモは他ユーザーの専用ゾーンです（閲覧専用）' });
     }
@@ -866,25 +993,31 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
       );
     }
 
+    const effectiveMode = slotIndex >= 11 ? 'monaco' : (mode || currentNote?.mode || 'markdown');
+
     const updated = await pool.query(
       `UPDATE notes 
        SET title = COALESCE($1, title), 
            content = COALESCE($2, content), 
-           mode = COALESCE($3, mode), 
-           assigned_user_id = COALESCE($4, assigned_user_id),
+           mode = $3, 
            version = version + 1, 
            updated_at = NOW() 
-       WHERE slot_index = $5 RETURNING *`,
-      [title, content, mode, assigned_user_id !== undefined ? assigned_user_id : null, slotIndex]
+       WHERE slot_index = $4 RETURNING *`,
+      [title, content, effectiveMode, slotIndex]
     );
+
+    const updatedNote = {
+      ...updated.rows[0],
+      assigned_username: currentNote?.assigned_user_id ? username : null
+    };
 
     broadcast({
       type: 'NOTE_UPDATED',
-      payload: updated.rows[0],
+      payload: updatedNote,
       sender: username,
     });
 
-    res.json(updated.rows[0]);
+    res.json(updatedNote);
   } catch (err) {
     console.error('Note update error:', err);
     res.status(500).json({ error: 'メモ更新エラー' });
@@ -938,13 +1071,37 @@ app.post('/api/audit-logs/:id/restore', authMiddleware, async (req: AuthRequest,
   }
 });
 
-// Discord Webhook Test & Relay
+// Discord Webhook Settings & Test
+app.get('/api/settings/webhook', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const webhookUrl = await getDiscordWebhookUrl();
+    res.json({ webhookUrl });
+  } catch (err) {
+    res.status(500).json({ error: 'Webhook設定取得エラー' });
+  }
+});
+
+app.post('/api/settings/webhook', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { webhookUrl } = req.body;
+    await pool.query(
+      `INSERT INTO system_settings (key, value, updated_at) 
+       VALUES ('discord_webhook_url', $1, NOW()) 
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [webhookUrl || '']
+    );
+    res.json({ success: true, webhookUrl: webhookUrl || '' });
+  } catch (err) {
+    res.status(500).json({ error: 'Webhook設定保存エラー' });
+  }
+});
+
 app.post('/api/webhook/test', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { webhookUrl } = req.body;
-    const targetUrl = webhookUrl || DISCORD_WEBHOOK_URL;
+    const targetUrl = webhookUrl || await getDiscordWebhookUrl();
     if (!targetUrl) {
-      return res.status(400).json({ error: 'Discord Webhook URLが指定されていません' });
+      return res.status(400).json({ error: 'Discord Webhook URLが設定されていません' });
     }
 
     const response = await fetch(targetUrl, {
@@ -1078,16 +1235,7 @@ wss.on('connection', (ws: WebSocket) => {
 
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
 
-        if (DISCORD_WEBHOOK_URL) {
-          fetch(DISCORD_WEBHOOK_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              username: `[asdfbase] ${clientInfo.username}`,
-              content: content,
-            }),
-          }).catch(err => console.error('Discord webhook relay error:', err));
-        }
+        relayToDiscord(clientInfo.username || 'unknown', content);
 
         // Handle AI reply via WS
         const trimmed = content.trim();

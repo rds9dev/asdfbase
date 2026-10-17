@@ -30,6 +30,7 @@ async function initDb() {
         id SERIAL PRIMARY KEY,
         name VARCHAR(50) NOT NULL,
         type VARCHAR(20) DEFAULT 'text',
+        position INT DEFAULT 0,
         discord_channel_id VARCHAR(50),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
@@ -49,7 +50,7 @@ async function initDb() {
       );
 
       CREATE TABLE IF NOT EXISTS notes (
-        slot_index INT PRIMARY KEY CHECK (slot_index BETWEEN 1 AND 10),
+        slot_index INT PRIMARY KEY CHECK (slot_index >= 1),
         title VARCHAR(100) DEFAULT '無題のメモ',
         content TEXT DEFAULT '',
         mode VARCHAR(20) DEFAULT 'markdown',
@@ -141,7 +142,18 @@ async function initDb() {
         updated_by VARCHAR(50) DEFAULT 'system',
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key VARCHAR(50) PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
     `);
+        // マイグレーション: notesの制約解除とchannelsのposition追加
+        await client.query(`
+      ALTER TABLE notes DROP CONSTRAINT IF EXISTS notes_slot_index_check;
+      ALTER TABLE channels ADD COLUMN IF NOT EXISTS position INT DEFAULT 0;
+    `).catch(err => console.warn('Migration note/channel warning:', err.message));
         // 初期チャンネルの作成
         const channelRes = await client.query('SELECT COUNT(*) FROM channels');
         if (parseInt(channelRes.rows[0].count, 10) === 0) {

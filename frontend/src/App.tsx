@@ -50,6 +50,7 @@ import {
   Trash2,
   Share2,
   Link,
+  Code,
   Subtitles,
   Headphones
 } from 'lucide-react';
@@ -110,6 +111,8 @@ interface Assignment {
 
 interface TestScore {
   id: number;
+  user_id?: number;
+  username?: string;
   exam_name: string;
   subject: string;
   score: number;
@@ -119,6 +122,29 @@ interface TestScore {
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('asdf_token'));
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const currentUserRef = useRef<User | null>(null);
+  currentUserRef.current = currentUser;
+
+  const playNotificationSound = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.15);
+      gain.gain.setValueAtTime(0.12, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.15);
+    } catch (e) {
+      // Audio might be restricted
+    }
+  };
   
   // Navigation Tabs
   const [activeTab, setActiveTab] = useState<'chat' | 'memo' | 'ai' | 'assignments' | 'board' | 'more' | 'settings'>('chat');
@@ -157,6 +183,7 @@ export default function App() {
   const [aiInput, setAiInput] = useState('');
   const [isLoadingAi, setIsLoadingAi] = useState(false);
   const [includeContextInAi, setIncludeContextInAi] = useState(true);
+  const aiEndRef = useRef<HTMLDivElement | null>(null);
 
   // Memo AI State
   const [isMemoAiLoading, setIsMemoAiLoading] = useState(false);
@@ -212,6 +239,8 @@ export default function App() {
     { id: 3, name: 'vc1', type: 'voice' },
   ]);
   const [activeChannelId, setActiveChannelId] = useState<number>(1);
+  const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
+  const [lastReadMessageIds, setLastReadMessageIds] = useState<Record<number, number>>({});
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
@@ -219,6 +248,8 @@ export default function App() {
   const [copiedLinkMessageId, setCopiedLinkMessageId] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeChannelIdRef = useRef<number>(activeChannelId);
+  activeChannelIdRef.current = activeChannelId;
 
   // Memo State
   const [memoSlots, setMemoSlots] = useState<MemoSlot[]>([]);
@@ -243,6 +274,7 @@ export default function App() {
 
   // Phase 3 State: Test Scores & AI
   const [testScores, setTestScores] = useState<TestScore[]>([]);
+  const [testScoreUserFilter, setTestScoreUserFilter] = useState<string>('me');
   const [newExamName, setNewExamName] = useState('中間考査');
   const [newExamSubject, setNewExamSubject] = useState('英語');
   const [newExamScore, setNewExamScore] = useState<number>(85);
@@ -414,10 +446,39 @@ export default function App() {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'NEW_MESSAGE') {
-            setMessages(prev => {
-              if (prev.some(m => m.id === msg.payload.id)) return prev;
-              return [...prev, msg.payload];
-            });
+            const newMsg = msg.payload;
+            const currentActive = activeChannelIdRef.current;
+            const me = currentUserRef.current;
+
+            // メンション検知 & 通知音・通知
+            if (me && newMsg.sender_username !== me.username) {
+              const isMentioned = newMsg.content?.includes(`@${me.username}`) || newMsg.content?.includes('@everyone');
+              if (isMentioned) {
+                playNotificationSound();
+                if ('Notification' in window && Notification.permission === 'granted') {
+                  try {
+                    new Notification(`asdfbase - ${newMsg.sender_username} からのメンション`, {
+                      body: newMsg.content,
+                    });
+                  } catch (_) {}
+                }
+              }
+            }
+
+            if (newMsg.channel_id === currentActive) {
+              setMessages(prev => {
+                if (prev.some(m => m.id === newMsg.id)) return prev;
+                return [...prev, newMsg];
+              });
+              setTimeout(() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+              }, 50);
+            } else {
+              setUnreadCounts(prev => ({
+                ...prev,
+                [newMsg.channel_id]: (prev[newMsg.channel_id] || 0) + 1,
+              }));
+            }
           } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
             setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
           } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
@@ -444,8 +505,12 @@ export default function App() {
             setClipboardUpdatedBy(msg.payload.updated_by);
           } else if (msg.type === 'CHANNEL_CREATED') {
             setChannels(prev => prev.some(c => c.id === msg.payload.id) ? prev : [...prev, msg.payload]);
+          } else if (msg.type === 'CHANNELS_REORDERED') {
+            setChannels(msg.payload);
           } else if (msg.type === 'CHANNEL_DELETED') {
             setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
+          } else if (msg.type === 'ASSIGNMENT_DELETED') {
+            setAssignments(prev => prev.filter(a => a.id !== msg.payload.id));
           } else if (msg.type === 'MESSAGE_DELETED') {
             setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
           } else if (msg.type === 'MESSAGE_UPDATED') {
@@ -554,9 +619,29 @@ export default function App() {
         }
       })
       .catch(console.error);
+
+    safeFetch('/api/settings/webhook', { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.json())
+      .then(data => {
+        if (data.webhookUrl) setWebhookUrlInput(data.webhookUrl);
+      })
+      .catch(console.error);
   }, [token]);
 
-  // Global Ctrl+K Keydown Listener
+  // Tab switch to board: reload latest strokes & texts (Proxy synchronization)
+  useEffect(() => {
+    if (activeTab === 'board' && token) {
+      safeFetch('/api/board', { headers: { Authorization: `Bearer ${token}` } })
+        .then(res => res.json())
+        .then(data => {
+          if (data.strokes) setBoardStrokes(data.strokes);
+          if (data.texts) setBoardTexts(data.texts);
+        })
+        .catch(console.error);
+    }
+  }, [activeTab, token]);
+
+  // Global Shortcuts: Ctrl+K, Escape (closes all modals)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
@@ -565,6 +650,10 @@ export default function App() {
       }
       if (e.key === 'Escape') {
         setIsPaletteOpen(false);
+        setIsTimetableModalOpen(false);
+        setIsNewChannelModalOpen(false);
+        setMemoAiResultModal(null);
+        setIsSearchOpen(false);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -662,22 +751,17 @@ export default function App() {
     }
   };
 
-  // Chat Send
+  // Chat Send with Instant Local Reflection & Auto Scroll
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim() || !token) return;
 
     const content = chatInput;
+    const targetChannelId = activeChannelId;
     setChatInput('');
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'SEND_MESSAGE',
-        channelId: activeChannelId,
-        content,
-      }));
-    } else {
-      await safeFetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels/${targetChannelId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -685,6 +769,43 @@ export default function App() {
         },
         body: JSON.stringify({ content })
       });
+      if (res.ok) {
+        const savedMessage = await res.json();
+        setMessages(prev => {
+          if (prev.some(m => m.id === savedMessage.id)) return prev;
+          return [...prev, savedMessage];
+        });
+        setTimeout(() => {
+          messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }, 50);
+      }
+    } catch (err) {
+      console.error('Failed to send message:', err);
+    }
+  };
+
+  // Reorder Channels (Up / Down)
+  const handleMoveChannel = async (e: React.MouseEvent, index: number, direction: 'up' | 'down') => {
+    e.stopPropagation();
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= channels.length) return;
+
+    const newChannels = [...channels];
+    const [moved] = newChannels.splice(index, 1);
+    newChannels.splice(targetIndex, 0, moved);
+    setChannels(newChannels);
+
+    try {
+      await safeFetch(`${API_BASE_URL}/api/channels/reorder`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ channelIds: newChannels.map(c => c.id) })
+      });
+    } catch (err) {
+      console.error('Failed to reorder channels:', err);
     }
   };
 
@@ -1240,6 +1361,21 @@ export default function App() {
     }
   };
 
+  const handleDeleteAssignment = async (id: number) => {
+    if (!confirm('この提出物を削除しますか？')) return;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/assignments/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setAssignments(prev => prev.filter(a => a.id !== id));
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   // Phase 3: Gemini Summarize Assignment
   const handleSummarizeAssignment = async (assignment: Assignment) => {
     if (!token || !assignment.description) return;
@@ -1264,7 +1400,39 @@ export default function App() {
     }
   };
 
-  // Phase 3: Create Test Score
+  // Phase 3: Test Scores Handlers
+  const handleFetchTestScores = async (userFilter: string) => {
+    if (!token) return;
+    setTestScoreUserFilter(userFilter);
+    const query = userFilter === 'me' ? '' : `?userId=${userFilter}`;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/test-scores${query}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setTestScores(data);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleDeleteTestScore = async (id: number) => {
+    if (!confirm('このテスト記録を削除しますか？')) return;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/test-scores/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setTestScores(prev => prev.filter(t => t.id !== id));
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   const handleCreateTestScore = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!token) return;
@@ -1309,6 +1477,28 @@ export default function App() {
       console.error(err);
     } finally {
       setIsLoadingAdvice(false);
+    }
+  };
+
+  const handleSaveWebhookUrl = async () => {
+    if (!token) return;
+    setWebhookStatus('保存中...');
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/settings/webhook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ webhookUrl: webhookUrlInput })
+      });
+      if (res.ok) {
+        setWebhookStatus('Webhook URLを保存しました');
+      } else {
+        setWebhookStatus('保存失敗');
+      }
+    } catch (err) {
+      setWebhookStatus('通信エラー');
     }
   };
 
@@ -1569,7 +1759,7 @@ export default function App() {
     }
   };
 
-  const isMonacoLocked = memoMode === 'monaco' && memoAssignedUser !== null && memoAssignedUser !== currentUser?.id;
+  const isMonacoLocked = (selectedSlotIndex >= 11 || memoMode === 'monaco') && memoAssignedUser !== null && memoAssignedUser !== currentUser?.id && currentUser?.role !== 'admin';
 
   // Filtered assignments
   const filteredAssignments = assignments.filter(a => {
@@ -1791,8 +1981,8 @@ export default function App() {
                       <Plus className="w-3.5 h-3.5" />
                     </button>
                   </div>
-                  <div className="space-y-1">
-                    {channels.map(ch => (
+                  <div className="flex-1 overflow-y-auto space-y-1 max-h-[calc(100vh-250px)] pr-1">
+                    {channels.map((ch, idx) => (
                       <div
                         key={ch.id}
                         className={`group flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-mono transition ${
@@ -1802,21 +1992,56 @@ export default function App() {
                         }`}
                       >
                         <button
-                          onClick={() => setActiveChannelId(ch.id)}
-                          className="flex items-center gap-2 flex-1 text-left truncate"
+                          onClick={() => {
+                            setActiveChannelId(ch.id);
+                            setUnreadCounts(prev => ({ ...prev, [ch.id]: 0 }));
+                          }}
+                          className="flex items-center gap-2 flex-1 text-left truncate min-w-0"
                         >
-                          {ch.type === 'voice' ? <Mic className="w-3.5 h-3.5 text-stone-500" /> : <Hash className="w-3.5 h-3.5 text-stone-500" />}
+                          {ch.type === 'voice' ? <Mic className="w-3.5 h-3.5 text-stone-500 shrink-0" /> : <Hash className="w-3.5 h-3.5 text-stone-500 shrink-0" />}
                           <span className="truncate">{ch.name}</span>
                         </button>
-                        {channels.length > 1 && currentUser?.role === 'admin' && (
-                          <button
-                            onClick={() => handleDeleteChannel(ch.id)}
-                            className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600 transition"
-                            title="チャンネル削除"
-                          >
-                            <Trash2 className="w-3 h-3" />
-                          </button>
-                        )}
+
+                        <div className="flex items-center gap-1 shrink-0 ml-1">
+                          {/* 未読バッジ */}
+                          {(unreadCounts[ch.id] || 0) > 0 && activeChannelId !== ch.id && (
+                            <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.2 rounded-full">
+                              {unreadCounts[ch.id]}
+                            </span>
+                          )}
+
+                          {/* チャンネル並び替え (↑ / ↓) */}
+                          <div className="opacity-0 group-hover:opacity-100 flex items-center transition">
+                            {idx > 0 && (
+                              <button
+                                onClick={e => handleMoveChannel(e, idx, 'up')}
+                                className="p-0.5 hover:text-amber-400 text-stone-500 transition"
+                                title="上へ移動"
+                              >
+                                ▲
+                              </button>
+                            )}
+                            {idx < channels.length - 1 && (
+                              <button
+                                onClick={e => handleMoveChannel(e, idx, 'down')}
+                                className="p-0.5 hover:text-amber-400 text-stone-500 transition"
+                                title="下へ移動"
+                              >
+                                ▼
+                              </button>
+                            )}
+                          </div>
+
+                          {channels.length > 1 && currentUser?.role === 'admin' && (
+                            <button
+                              onClick={() => handleDeleteChannel(ch.id)}
+                              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600 transition"
+                              title="チャンネル削除"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1981,154 +2206,173 @@ export default function App() {
                 ) : (
                   messages
                     .filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase()))
-                    .map((m) => (
-                    <div 
-                      key={m.id} 
-                      id={`msg-${m.id}`}
-                      className={`flex items-start gap-3 group relative p-1.5 rounded-xl transition ${
-                        m.is_pinned ? 'bg-amber-500/5 border border-amber-500/20' : ''
-                      }`}
-                    >
-                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-mono font-bold uppercase shrink-0 ${
-                        m.sender_username === 'Gemini' 
-                          ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40' 
-                          : 'bg-stone-800 border border-stone-700 text-stone-300'
-                      }`}>
-                        {m.sender_username === 'Gemini' ? 'AI' : (m.sender_username || m.username || 'U')[0]}
-                      </div>
+                    .map((m, mIdx, filteredList) => {
+                      const lastReadId = lastReadMessageIds[activeChannelId] || 0;
+                      const isUnread = lastReadId > 0 && m.id > lastReadId;
+                      const prevMsg = mIdx > 0 ? filteredList[mIdx - 1] : null;
+                      const isFirstUnread = isUnread && (!prevMsg || prevMsg.id <= lastReadId);
 
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className={`text-xs font-bold ${m.sender_username === 'Gemini' ? 'text-amber-400 font-mono' : 'text-stone-200'}`}>
-                            {m.sender_username || m.username}
-                          </span>
-                          <span className="text-[10px] text-stone-500 font-mono">
-                            {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                          </span>
-                          {m.is_pinned && (
-                            <span className="flex items-center gap-0.5 text-[10px] text-amber-400 bg-amber-400/10 px-1.5 py-0.2 rounded border border-amber-400/20">
-                              <Pin className="w-2.5 h-2.5" /> ピン留め
-                            </span>
+                      return (
+                        <React.Fragment key={m.id}>
+                          {isFirstUnread && (
+                            <div className="flex items-center gap-3 my-3">
+                              <div className="flex-1 h-px bg-red-500/60" />
+                              <span className="text-[10px] font-mono font-bold text-red-400 bg-red-950/60 border border-red-800/80 px-2.5 py-0.5 rounded-full uppercase tracking-wider flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
+                                ここから未読メッセージ
+                              </span>
+                              <div className="flex-1 h-px bg-red-500/60" />
+                            </div>
                           )}
-                        </div>
 
-                        {editingMessageId === m.id ? (
-                          <div className="flex items-center gap-2 mt-1">
-                            <input
-                              type="text"
-                              value={editingContent}
-                              onChange={e => setEditingContent(e.target.value)}
-                              className="flex-1 bg-[#16181D] border border-amber-500 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none"
-                            />
-                            <button
-                              onClick={() => handleEditMessage(m.id)}
-                              className="px-2.5 py-1 bg-amber-500 text-black font-bold rounded-lg text-xs"
-                            >
-                              保存
-                            </button>
-                            <button
-                              onClick={() => setEditingMessageId(null)}
-                              className="px-2.5 py-1 bg-stone-800 text-stone-400 rounded-lg text-xs"
-                            >
-                              キャンセル
-                            </button>
-                          </div>
-                        ) : (
-                          <div className={`text-sm rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed ${
-                            m.sender_username === 'Gemini' 
-                              ? 'bg-[#151720] border border-amber-500/30 text-amber-100' 
-                              : 'bg-[#111214] border border-stone-800/80 text-stone-300'
-                          }`}>
-                            {m.content.startsWith('![image]') ? (
-                              <img 
-                                src={m.content.match(/\((.*?)\)/)?.[1]} 
-                                alt="attachment" 
-                                className="max-h-72 rounded-lg object-contain my-1 border border-stone-800"
-                              />
-                            ) : (
-                              <span>{m.content}</span>
-                            )}
-                          </div>
-                        )}
+                          <div 
+                            id={`msg-${m.id}`}
+                            className={`flex items-start gap-3 group relative p-1.5 rounded-xl transition ${
+                              m.is_pinned ? 'bg-amber-500/5 border border-amber-500/20' : ''
+                            }`}
+                          >
+                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-mono font-bold uppercase shrink-0 ${
+                              m.sender_username === 'Gemini' 
+                                ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40' 
+                                : 'bg-stone-800 border border-stone-700 text-stone-300'
+                            }`}>
+                              {m.sender_username === 'Gemini' ? 'AI' : (m.sender_username || m.username || 'U')[0]}
+                            </div>
 
-                        {m.reactions && Object.keys(m.reactions).length > 0 && (
-                          <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-                            {Object.entries(m.reactions).map(([emoji, userIds]) => (
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className={`text-xs font-bold ${m.sender_username === 'Gemini' ? 'text-amber-400 font-mono' : 'text-stone-200'}`}>
+                                  {m.sender_username || m.username}
+                                </span>
+                                <span className="text-[10px] text-stone-500 font-mono">
+                                  {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                                {m.is_pinned && (
+                                  <span className="flex items-center gap-0.5 text-[10px] text-amber-400 bg-amber-400/10 px-1.5 py-0.2 rounded border border-amber-400/20">
+                                    <Pin className="w-2.5 h-2.5" /> ピン留め
+                                  </span>
+                                )}
+                              </div>
+
+                              {editingMessageId === m.id ? (
+                                <div className="flex items-center gap-2 mt-1">
+                                  <input
+                                    type="text"
+                                    value={editingContent}
+                                    onChange={e => setEditingContent(e.target.value)}
+                                    className="flex-1 bg-[#16181D] border border-amber-500 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none"
+                                  />
+                                  <button
+                                    onClick={() => handleEditMessage(m.id)}
+                                    className="px-2.5 py-1 bg-amber-500 text-black font-bold rounded-lg text-xs"
+                                  >
+                                    保存
+                                  </button>
+                                  <button
+                                    onClick={() => setEditingMessageId(null)}
+                                    className="px-2.5 py-1 bg-stone-800 text-stone-400 rounded-lg text-xs"
+                                  >
+                                    キャンセル
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className={`text-sm rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed ${
+                                  m.sender_username === 'Gemini' 
+                                    ? 'bg-[#151720] border border-amber-500/30 text-amber-100' 
+                                    : 'bg-[#111214] border border-stone-800/80 text-stone-300'
+                                }`}>
+                                  {m.content.startsWith('![image]') ? (
+                                    <img 
+                                      src={m.content.match(/\((.*?)\)/)?.[1]} 
+                                      alt="attachment" 
+                                      className="max-h-72 rounded-lg object-contain my-1 border border-stone-800"
+                                    />
+                                  ) : (
+                                    <span>{m.content}</span>
+                                  )}
+                                </div>
+                              )}
+
+                              {m.reactions && Object.keys(m.reactions).length > 0 && (
+                                <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                                  {Object.entries(m.reactions).map(([emoji, userIds]) => (
+                                    <button
+                                      key={emoji}
+                                      onClick={() => handleToggleReaction(m.id, emoji)}
+                                      className={`text-xs px-2 py-0.5 rounded-md border font-mono flex items-center gap-1 transition ${
+                                        userIds.includes(currentUser?.id)
+                                          ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                                          : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-700'
+                                      }`}
+                                    >
+                                      <span>{emoji}</span>
+                                      <span>{userIds.length}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="opacity-0 group-hover:opacity-100 transition absolute right-2 top-2 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-1 shadow-md">
                               <button
-                                key={emoji}
-                                onClick={() => handleToggleReaction(m.id, emoji)}
-                                className={`text-xs px-2 py-0.5 rounded-md border font-mono flex items-center gap-1 transition ${
-                                  userIds.includes(currentUser.id)
-                                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                                    : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-700'
-                                }`}
+                                onClick={() => handleToggleReaction(m.id, '👍')}
+                                title="いいね"
+                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400 text-xs"
                               >
-                                <span>{emoji}</span>
-                                <span>{userIds.length}</span>
+                                👍
                               </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="opacity-0 group-hover:opacity-100 transition absolute right-2 top-2 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-1 shadow-md">
-                        <button
-                          onClick={() => handleToggleReaction(m.id, '👍')}
-                          title="いいね"
-                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400 text-xs"
-                        >
-                          👍
-                        </button>
-                        <button
-                          onClick={() => handleToggleReaction(m.id, '❤️')}
-                          title="ハート"
-                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400 text-xs"
-                        >
-                          ❤️
-                        </button>
-                        <button
-                          onClick={() => handleTogglePin(m.id)}
-                          title="ピン留め"
-                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
-                        >
-                          <Pin className="w-3 h-3" />
-                        </button>
-                        <button
-                          onClick={() => handleCopyMessageLink(m.id)}
-                          title="メッセージリンクをコピー"
-                          className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-white"
-                        >
-                          {copiedLinkMessageId === m.id ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                        </button>
-                        {(m.user_id === currentUser.id || currentUser.role === 'admin') && (
-                          <>
-                            {m.user_id === currentUser.id && (
                               <button
-                                onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content); }}
-                                title="編集"
+                                onClick={() => handleToggleReaction(m.id, '❤️')}
+                                title="ハート"
+                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400 text-xs"
+                              >
+                                ❤️
+                              </button>
+                              <button
+                                onClick={() => handleTogglePin(m.id)}
+                                title="ピン留め"
                                 className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
                               >
-                                <Edit3 className="w-3 h-3" />
+                                <Pin className="w-3 h-3" />
                               </button>
-                            )}
-                            <button
-                              onClick={() => handleDeleteMessage(m.id)}
-                              title="削除"
-                              className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  ))
+                              <button
+                                onClick={() => handleCopyMessageLink(m.id)}
+                                title="メッセージリンクをコピー"
+                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-white"
+                              >
+                                {copiedLinkMessageId === m.id ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                              </button>
+                              {(m.user_id === currentUser?.id || currentUser?.role === 'admin') && (
+                                <>
+                                  {m.user_id === currentUser?.id && (
+                                    <button
+                                      onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content); }}
+                                      title="編集"
+                                      className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
+                                    >
+                                      <Edit3 className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() => handleDeleteMessage(m.id)}
+                                    title="削除"
+                                    className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </React.Fragment>
+                      );
+                    })
                 )}
                 <div ref={messagesEndRef} />
               </div>
 
-              {/* Chat Input with @mention suggestions */}
-              <div className="relative p-3 border-t border-stone-800/80 bg-[#0C0D10]/50">
+              {/* Chat Input: Fixed at bottom with shrink-0 */}
+              <div className="relative p-3 border-t border-stone-800/80 bg-[#0C0D10]/95 shrink-0">
                 {showMentionSuggestions && (
                   <div className="absolute bottom-full left-4 mb-2 w-64 bg-[#111214] border border-stone-800 rounded-xl shadow-2xl p-2 font-mono text-xs space-y-1 z-30">
                     <div className="text-[10px] text-stone-500 uppercase px-2 font-bold">メンバー補完</div>
@@ -2184,12 +2428,19 @@ export default function App() {
                           setShowMentionSuggestions(false);
                         }
                       }}
-                      placeholder="メッセージを入力... (@gemini でAI応答)"
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendMessage(e);
+                        }
+                      }}
+                      placeholder="メッセージを入力... (@gemini でAI応答, Enterで送信)"
                       className="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 font-mono"
                     />
                     <button
                       type="submit"
-                      className="p-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black transition interactive-btn"
+                      disabled={!chatInput.trim()}
+                      className="p-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black transition interactive-btn"
                     >
                       <Send className="w-3.5 h-3.5" />
                     </button>
@@ -2198,17 +2449,17 @@ export default function App() {
               </div>
             </section>
 
-            {/* Right: Members Sidebar (Collapsible) */}
+            {/* Right: Members Sidebar (Fixed width & scrollable) */}
             {!isMembersCollapsed && (
-              <aside className="w-52 border-l border-stone-800/80 bg-[#0C0D10] p-3 hidden lg:flex flex-col">
-                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between">
+              <aside className="w-48 sm:w-56 border-l border-stone-800/80 bg-[#0C0D10] p-3 hidden lg:flex flex-col shrink-0 h-full overflow-hidden">
+                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between shrink-0">
                   <span>Members</span>
                   <span className="text-amber-400 font-normal">{onlineUsers.length}</span>
                 </div>
-                <div className="space-y-1">
+                <div className="flex-1 overflow-y-auto space-y-1 pr-1">
                   {onlineUsers.map(u => (
                     <div key={u.id} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-stone-900/60 text-xs font-mono text-stone-300">
-                      <span className={`w-2 h-2 rounded-full ${u.status === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-stone-600'}`} />
+                      <span className={`w-2 h-2 rounded-full shrink-0 ${u.status === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-stone-600'}`} />
                       <span className="truncate">{u.username}</span>
                     </div>
                   ))}
@@ -2221,39 +2472,92 @@ export default function App() {
         {/* TAB 2: リアルタイムメモ */}
         {activeTab === 'memo' && (
           <div className="flex-1 flex overflow-hidden">
-            <aside className="w-64 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between">
-              <div>
-                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between">
-                  <span>Memo Slots (Max 10)</span>
-                  <History className="w-3.5 h-3.5 text-stone-500" />
+            <aside className="w-64 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between shrink-0 h-full overflow-hidden">
+              <div className="flex-1 flex flex-col overflow-hidden">
+                {/* スロット1〜10: 共有メモ */}
+                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold flex items-center justify-between shrink-0">
+                  <span>共有メモ (#1 ~ #10)</span>
+                  <FileText className="w-3.5 h-3.5 text-stone-500" />
                 </div>
-                <div className="space-y-1.5">
-                  {memoSlots.map(slot => (
-                    <button
-                      key={slot.slot_index}
-                      onClick={() => {
-                        setSelectedSlotIndex(slot.slot_index);
-                        setMemoTitle(slot.title);
-                        setMemoContent(slot.content);
-                        setMemoMode(slot.mode);
-                        setMemoAssignedUser(slot.assigned_user_id || null);
-                      }}
-                      className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-mono transition text-left ${
-                        selectedSlotIndex === slot.slot_index
-                          ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
-                          : 'bg-[#111214] border border-stone-800/80 text-stone-400 hover:text-stone-200 hover:border-stone-700'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 truncate">
-                        <span className="text-stone-500 font-bold">#{slot.slot_index}</span>
-                        <span className="truncate">{slot.title || `メモ #${slot.slot_index}`}</span>
-                      </div>
-                      <div className="flex items-center gap-1">
-                        {slot.mode === 'monaco' && <Lock className="w-2.5 h-2.5 text-stone-500" />}
-                        <span className="text-[10px] text-stone-600 uppercase font-mono">{slot.mode}</span>
-                      </div>
-                    </button>
-                  ))}
+                <div className="space-y-1 overflow-y-auto max-h-[38vh] pr-1 mb-4">
+                  {memoSlots.filter(s => s.slot_index <= 10).map(slot => {
+                    const cleanTitle = slot.title ? slot.title.replace(/^メモ\s*#?\d+\s*:?\s*/, '') : '';
+                    const displayTitle = cleanTitle ? cleanTitle : `メモ`;
+
+                    return (
+                      <button
+                        key={slot.slot_index}
+                        onClick={() => {
+                          setSelectedSlotIndex(slot.slot_index);
+                          setMemoTitle(slot.title);
+                          setMemoContent(slot.content);
+                          setMemoMode(slot.mode === 'monaco' ? 'markdown' : slot.mode);
+                          setMemoAssignedUser(null);
+                        }}
+                        className={`w-full flex items-center justify-between px-3 py-1.5 rounded-xl text-xs font-mono transition text-left ${
+                          selectedSlotIndex === slot.slot_index
+                            ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
+                            : 'bg-[#111214] border border-stone-800/80 text-stone-400 hover:text-stone-200 hover:border-stone-700'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 truncate min-w-0">
+                          <span className="text-amber-500/80 font-bold shrink-0">#{slot.slot_index}</span>
+                          <span className="truncate">{displayTitle}</span>
+                        </div>
+                        <span className="text-[10px] text-stone-600 uppercase shrink-0 font-mono">
+                          {slot.mode || 'md'}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* スロット11以降: メンバー専用Monacoエディタ */}
+                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold flex items-center justify-between shrink-0 border-t border-stone-800/80 pt-3">
+                  <span>専用コードゾーン (Monaco)</span>
+                  <Code className="w-3.5 h-3.5 text-stone-500" />
+                </div>
+                <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+                  {memoSlots.filter(s => s.slot_index >= 11).map(slot => {
+                    const isMySlot = slot.assigned_user_id === currentUser?.id;
+                    const assignedName = (slot as any).assigned_username || `ユーザー${slot.assigned_user_id || ''}`;
+
+                    return (
+                      <button
+                        key={slot.slot_index}
+                        onClick={() => {
+                          setSelectedSlotIndex(slot.slot_index);
+                          setMemoTitle(slot.title);
+                          setMemoContent(slot.content);
+                          setMemoMode('monaco');
+                          setMemoAssignedUser(slot.assigned_user_id || null);
+                        }}
+                        className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-mono transition text-left ${
+                          selectedSlotIndex === slot.slot_index
+                            ? 'bg-amber-500/15 text-amber-300 border border-amber-500/40 shadow-sm'
+                            : 'bg-[#111214] border border-stone-800/80 text-stone-400 hover:text-stone-200 hover:border-stone-700'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 truncate min-w-0">
+                          <Code className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          <span className="truncate font-bold text-white">
+                            {assignedName}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0 ml-1">
+                          {isMySlot ? (
+                            <span className="text-[9px] bg-emerald-950/60 border border-emerald-800/80 text-emerald-300 px-1.5 py-0.2 rounded font-mono">
+                              あなた
+                            </span>
+                          ) : (
+                            <span className="text-[9px] bg-stone-900 border border-stone-800 text-stone-500 px-1.5 py-0.2 rounded font-mono flex items-center gap-0.5">
+                              <Lock className="w-2.5 h-2.5" /> 閲覧専用
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             </aside>
@@ -2276,15 +2580,21 @@ export default function App() {
                     </span>
                   )}
 
-                  <select
-                    value={memoMode}
-                    disabled={isMonacoLocked}
-                    onChange={e => setMemoMode(e.target.value as any)}
-                    className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2.5 py-1.5 focus:outline-none disabled:opacity-50"
-                  >
-                    <option value="markdown">Markdownモード</option>
-                    <option value="monaco">Monaco Editor (専用枠)</option>
-                  </select>
+                  {selectedSlotIndex <= 10 ? (
+                    <select
+                      value={memoMode}
+                      disabled={isMonacoLocked}
+                      onChange={e => setMemoMode(e.target.value as any)}
+                      className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2.5 py-1.5 focus:outline-none disabled:opacity-50"
+                    >
+                      <option value="markdown">Markdownモード</option>
+                      <option value="plain">プレーンテキスト</option>
+                    </select>
+                  ) : (
+                    <span className="text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-lg text-xs font-mono font-bold flex items-center gap-1">
+                      <Code className="w-3 h-3" /> Monaco Editor
+                    </span>
+                  )}
 
                   {/* Memo AI Assistants */}
                   <div className="flex items-center gap-1">
@@ -2418,7 +2728,7 @@ export default function App() {
                     </div>
                   )}
                   <div
-                    className={`max-w-2xl rounded-2xl p-4 text-xs font-mono leading-relaxed shadow-lg ${
+                    className={`max-w-[85%] rounded-2xl p-4 text-xs font-mono leading-relaxed shadow-lg break-words min-w-0 overflow-hidden ${
                       msg.role === 'user'
                         ? 'bg-amber-500 text-black font-semibold'
                         : 'bg-[#14161C] border border-stone-800/80 text-stone-200'
@@ -2431,7 +2741,7 @@ export default function App() {
                     {msg.role === 'user' ? (
                       <div className="whitespace-pre-wrap">{msg.content}</div>
                     ) : (
-                      <div className="prose prose-invert prose-xs max-w-none">
+                      <div className="prose prose-invert prose-xs max-w-none overflow-x-auto">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
                           {msg.content}
                         </ReactMarkdown>
@@ -2451,10 +2761,11 @@ export default function App() {
                   </div>
                 </div>
               )}
+              <div ref={aiEndRef} />
             </div>
 
-            {/* Input Form */}
-            <div className="p-4 border-t border-stone-800/80 bg-[#111214]">
+            {/* Input Form: Fixed at bottom with shrink-0 */}
+            <div className="p-4 border-t border-stone-800/80 bg-[#111214] shrink-0">
               <form onSubmit={handleSendAiMessage} className="max-w-4xl mx-auto flex gap-2">
                 <input
                   type="text"
@@ -2604,7 +2915,7 @@ export default function App() {
                           <span className="font-bold text-white text-base">{item.title}</span>
                         </div>
 
-                        {/* ステータスセレクト */}
+                        {/* ステータスセレクト & 削除ボタン */}
                         <div className="flex items-center gap-2 font-mono text-xs">
                           <select
                             value={item.my_status}
@@ -2625,6 +2936,14 @@ export default function App() {
                             <option value="resubmit">再提出</option>
                             <option value="passed">合格</option>
                           </select>
+
+                          <button
+                            onClick={() => handleDeleteAssignment(item.id)}
+                            className="p-1.5 rounded-lg text-stone-500 hover:text-red-400 hover:bg-stone-800 transition"
+                            title="提出物を削除"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
                         </div>
                       </div>
 
@@ -2888,23 +3207,77 @@ export default function App() {
                 </button>
               </form>
 
-              {/* 一覧テーブル */}
+              {/* 一覧テーブル (ユーザー切り替え & 削除ボタン付き) */}
               <div className="bg-[#111214] border border-stone-800/80 rounded-2xl overflow-hidden font-mono text-xs">
-                <div className="px-4 py-3 border-b border-stone-800 text-stone-400 font-bold uppercase tracking-wider">
-                  記録一覧
+                <div className="px-4 py-3 border-b border-stone-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="text-stone-400 font-bold uppercase tracking-wider">
+                    記録一覧 {testScoreUserFilter === 'me' ? '(あなた)' : testScoreUserFilter === 'all' ? '(全員)' : `(ユーザーID: ${testScoreUserFilter})`}
+                  </div>
+
+                  {/* ユーザー切り替え */}
+                  <div className="flex items-center gap-1.5 bg-[#16181D] p-1 rounded-xl border border-stone-800">
+                    <button
+                      onClick={() => handleFetchTestScores('me')}
+                      className={`px-2.5 py-1 rounded-lg transition ${
+                        testScoreUserFilter === 'me' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                      }`}
+                    >
+                      自分の点数
+                    </button>
+                    <button
+                      onClick={() => handleFetchTestScores('all')}
+                      className={`px-2.5 py-1 rounded-lg transition ${
+                        testScoreUserFilter === 'all' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                      }`}
+                    >
+                      全員の点数
+                    </button>
+                    <select
+                      value={testScoreUserFilter}
+                      onChange={e => handleFetchTestScores(e.target.value)}
+                      className="bg-[#111214] border border-stone-800 text-stone-300 rounded-lg px-2 py-1 text-xs focus:outline-none"
+                    >
+                      <option value="me">自分</option>
+                      <option value="all">全員</option>
+                      {onlineUsers.map(u => (
+                        <option key={u.id} value={String(u.id)}>{u.username}</option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
+
                 <div className="divide-y divide-stone-800/60">
-                  {testScores.map(t => (
-                    <div key={t.id} className="px-4 py-3 flex items-center justify-between">
-                      <div>
-                        <span className="text-stone-500 mr-3">[{t.exam_name}]</span>
-                        <span className="font-bold text-white">{t.subject}</span>
+                  {testScores.length === 0 ? (
+                    <div className="p-6 text-center text-stone-600">記録された点数はありません</div>
+                  ) : (
+                    testScores.map(t => (
+                      <div key={t.id} className="px-4 py-3 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-stone-500">[{t.exam_name}]</span>
+                          <span className="font-bold text-white">{t.subject}</span>
+                          {(t as any).username && (
+                            <span className="text-[10px] text-amber-500/80 bg-amber-500/10 px-1.5 py-0.2 rounded font-mono">
+                              {(t as any).username}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <div className="font-bold text-amber-400">
+                            {t.score} / {t.max_score}点
+                          </div>
+                          {(t.user_id === currentUser?.id || currentUser?.role === 'admin') && (
+                            <button
+                              onClick={() => handleDeleteTestScore(t.id)}
+                              className="p-1 text-stone-500 hover:text-red-400 transition"
+                              title="記録を削除"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
                       </div>
-                      <div className="font-bold text-amber-400">
-                        {t.score} / {t.max_score}点
-                      </div>
-                    </div>
-                  ))}
+                    ))
+                  )}
                 </div>
               </div>
 
@@ -3072,20 +3445,28 @@ export default function App() {
                       {webhookStatus}
                     </div>
                   )}
-                  <div className="space-y-2">
+                  <div className="space-y-3">
                     <input
                       type="url"
                       placeholder="https://discord.com/api/webhooks/..."
                       value={webhookUrlInput}
                       onChange={e => setWebhookUrlInput(e.target.value)}
-                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
                     />
-                    <button
-                      onClick={handleTestWebhook}
-                      className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition uppercase"
-                    >
-                      テスト送信
-                    </button>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleSaveWebhookUrl}
+                        className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition uppercase"
+                      >
+                        設定を保存
+                      </button>
+                      <button
+                        onClick={handleTestWebhook}
+                        className="px-4 py-2 bg-stone-800 hover:bg-stone-700 text-stone-200 font-bold rounded-xl transition uppercase"
+                      >
+                        テスト送信
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
