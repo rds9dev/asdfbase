@@ -10,6 +10,7 @@ import sharp from 'sharp';
 import path from 'path';
 import fs from 'fs';
 import { pool, initDb } from './db.js';
+import { askGemini } from './gemini.js';
 
 dotenv.config();
 
@@ -31,13 +32,11 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 app.use('/uploads', express.static(UPLOAD_DIR));
 
-// Multer in-memory storage for sharp compression
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit before compression
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
 
-// Auth Middleware
 export interface AuthRequest extends Request {
   user?: { id: number; username: string; role: string };
 }
@@ -58,7 +57,6 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
   }
 }
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'asdfbase-api', timestamp: new Date().toISOString() });
 });
@@ -173,7 +171,6 @@ app.post('/api/upload', authMiddleware, upload.single('image'), async (req: Auth
     const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.webp`;
     const outputPath = path.join(UPLOAD_DIR, filename);
 
-    // 最大幅1600px、品質80%のWebPに自動圧縮
     await sharp(req.file.buffer)
       .resize({ width: 1600, withoutEnlargement: true })
       .webp({ quality: 80 })
@@ -216,7 +213,7 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
   }
 });
 
-// Post Message (REST fallback)
+// Post Message with AI @gemini & /ai command support
 app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const channelId = parseInt(req.params.channelId, 10);
@@ -231,14 +228,8 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
     );
 
     const savedMessage = { ...result.rows[0], sender_username: username };
+    broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
 
-    // WebSocketブロードキャスト
-    broadcast({
-      type: 'NEW_MESSAGE',
-      payload: savedMessage,
-    });
-
-    // Discord Webhook 中継（設定されている場合）
     if (DISCORD_WEBHOOK_URL) {
       fetch(DISCORD_WEBHOOK_URL, {
         method: 'POST',
@@ -250,6 +241,24 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
       }).catch(err => console.error('Discord webhook relay error:', err));
     }
 
+    // Check for @gemini or /ai trigger
+    const trimmed = content.trim();
+    if (trimmed.startsWith('/ai') || trimmed.includes('@gemini')) {
+      const prompt = trimmed.replace('/ai', '').replace('@gemini', '').trim();
+      if (prompt) {
+        setTimeout(async () => {
+          const aiResponse = await askGemini(prompt, 'あなたはasdfbaseのアシスタントAIです。簡潔で的確に回答してください。');
+          const botResult = await pool.query(
+            `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
+             VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
+            [channelId, aiResponse, savedMessage.id]
+          );
+          const aiMessage = { ...botResult.rows[0], sender_username: 'Gemini' };
+          broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
+        }, 100);
+      }
+    }
+
     res.json(savedMessage);
   } catch (err) {
     console.error('Post message error:', err);
@@ -257,7 +266,7 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
   }
 });
 
-// Reaction on Message
+// Reactions & Pin
 app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const messageId = parseInt(req.params.messageId, 10);
@@ -293,7 +302,6 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthR
   }
 });
 
-// Pin Message
 app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
   try {
     const messageId = parseInt(req.params.messageId, 10);
@@ -308,6 +316,158 @@ app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
     res.json(updated.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'ピン留め更新エラー' });
+  }
+});
+
+// Timetables API
+app.get('/api/timetables', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM timetables ORDER BY day_of_week ASC, period ASC`);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: '時間割取得エラー' });
+  }
+});
+
+app.post('/api/timetables', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { dayOfWeek, period, subject, scheduleType } = req.body;
+    const result = await pool.query(
+      `INSERT INTO timetables (day_of_week, period, subject, schedule_type) 
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [dayOfWeek, period, subject, scheduleType || 'normal']
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: '時間割登録エラー' });
+  }
+});
+
+// Assignments API
+app.get('/api/assignments', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const result = await pool.query(
+      `SELECT a.*, COALESCE(p.status, 'unstarted') as my_status 
+       FROM assignments a 
+       LEFT JOIN assignment_progress p ON a.id = p.assignment_id AND p.user_id = $1 
+       ORDER BY a.deadline ASC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: '提出物一覧取得エラー' });
+  }
+});
+
+app.post('/api/assignments', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { title, subject, description, deadline, resubmitDeadline } = req.body;
+    const result = await pool.query(
+      `INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [title, subject, description, deadline, resubmitDeadline || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: '提出物作成エラー' });
+  }
+});
+
+// Update Assignment Progress (未着手/進行中/提出済み/再提出/合格)
+app.put('/api/assignments/:id/progress', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const assignmentId = parseInt(req.params.id, 10);
+    const { status } = req.body;
+    const userId = req.user!.id;
+
+    await pool.query(
+      `INSERT INTO assignment_progress (assignment_id, user_id, status) 
+       VALUES ($1, $2, $3) 
+       ON CONFLICT (assignment_id, user_id) 
+       DO UPDATE SET status = EXCLUDED.status`,
+      [assignmentId, userId, status]
+    );
+
+    // 全員合格チェック
+    const usersCountRes = await pool.query(`SELECT COUNT(*) FROM users`);
+    const passedCountRes = await pool.query(
+      `SELECT COUNT(*) FROM assignment_progress WHERE assignment_id = $1 AND status = 'passed'`,
+      [assignmentId]
+    );
+
+    const totalUsers = parseInt(usersCountRes.rows[0].count, 10);
+    const passedUsers = parseInt(passedCountRes.rows[0].count, 10);
+
+    if (totalUsers > 0 && passedUsers >= totalUsers) {
+      await pool.query(`UPDATE assignments SET is_archived = TRUE WHERE id = $1`, [assignmentId]);
+    }
+
+    res.json({ success: true, status });
+  } catch (err) {
+    res.status(500).json({ error: '進捗更新エラー' });
+  }
+});
+
+// Gemini Summarize Assignment
+app.post('/api/assignments/summarize', authMiddleware, async (req, res) => {
+  try {
+    const { description } = req.body;
+    if (!description) return res.status(400).json({ error: '内容が空です' });
+
+    const prompt = `以下の学校の課題・提出物指示文を読み、重要なポイント、締め切り、持ち物、注意点をJSON形式で要約してください。\n\n【指示文】:\n${description}`;
+    const summary = await askGemini(prompt, '必ず有効なJSONまたは箇条書きの分かりやすい形式で回答してください。');
+    res.json({ summary });
+  } catch (err) {
+    res.status(500).json({ error: 'AI要約エラー' });
+  }
+});
+
+// Test Scores & AI Advice
+app.get('/api/test-scores', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const result = await pool.query(
+      `SELECT * FROM test_scores WHERE user_id = $1 ORDER BY exam_name ASC, subject ASC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'テスト点数取得エラー' });
+  }
+});
+
+app.post('/api/test-scores', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const { examName, subject, score, maxScore } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO test_scores (user_id, exam_name, subject, score, max_score) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [userId, examName, subject, score, maxScore || 100]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'テスト点数登録エラー' });
+  }
+});
+
+app.post('/api/test-scores/advice', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const scores = await pool.query(`SELECT subject, score, max_score FROM test_scores WHERE user_id = $1`, [userId]);
+    if (scores.rows.length === 0) {
+      return res.status(400).json({ error: 'テスト点数が記録されていません' });
+    }
+
+    const scoreSummary = scores.rows.map(s => `${s.subject}: ${s.score}/${s.max_score}点`).join(', ');
+    const prompt = `私のテスト結果は以下の通りです:\n${scoreSummary}\n合計点や得点傾向を分析し、今後の勉強方針や苦手克服のための具体的なアドバイスを教えてください。`;
+
+    const advice = await askGemini(prompt, '高校生・学生向けの親身で具体的な学習アドバイザーとして回答してください。');
+    res.json({ advice });
+  } catch (err) {
+    res.status(500).json({ error: 'アドバイス生成エラー' });
   }
 });
 
@@ -331,7 +491,6 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
     const currentNoteRes = await pool.query(`SELECT * FROM notes WHERE slot_index = $1`, [slotIndex]);
     const currentNote = currentNoteRes.rows[0];
 
-    // Monaco editor モードかつ専用ゾーン指定がある場合のロックチェック
     if (
       currentNote && 
       currentNote.mode === 'monaco' && 
@@ -341,7 +500,6 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
       return res.status(403).json({ error: 'このメモは他ユーザーの専用ゾーンです（閲覧専用）' });
     }
 
-    // 履歴保存
     if (currentNote && currentNote.content !== content) {
       await pool.query(
         `INSERT INTO note_history (slot_index, content, updated_by_id) VALUES ($1, $2, $3)`,
@@ -374,7 +532,7 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
-// Audit Logs
+// Audit Logs & Users List
 app.get('/api/audit-logs', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(`SELECT * FROM audit_logs ORDER BY id DESC LIMIT 50`);
@@ -384,7 +542,6 @@ app.get('/api/audit-logs', authMiddleware, async (req, res) => {
   }
 });
 
-// Users List
 app.get('/api/users', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -442,10 +599,7 @@ wss.on('connection', (ws: WebSocket) => {
         );
         const savedMessage = { ...result.rows[0], sender_username: clientInfo.username };
 
-        broadcast({
-          type: 'NEW_MESSAGE',
-          payload: savedMessage,
-        });
+        broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
 
         if (DISCORD_WEBHOOK_URL) {
           fetch(DISCORD_WEBHOOK_URL, {
@@ -457,15 +611,26 @@ wss.on('connection', (ws: WebSocket) => {
             }),
           }).catch(err => console.error('Discord webhook relay error:', err));
         }
-      }
 
-      if (msg.type === 'NOTE_SYNC') {
-        // メモのリアルタイムキーストローク共有
-        broadcast({
-          type: 'NOTE_SYNC',
-          payload: msg.payload, // { slotIndex, content, version }
-          sender: clientInfo.username,
-        }, ws);
+        // Handle AI reply via WS
+        const trimmed = content.trim();
+        if (trimmed.startsWith('/ai') || trimmed.includes('@gemini')) {
+          const prompt = trimmed.replace('/ai', '').replace('@gemini', '').trim();
+          if (prompt) {
+            setTimeout(async () => {
+              const aiResponse = await askGemini(prompt, 'あなたはasdfbaseのアシスタントAIです。簡潔で的確に回答してください。');
+              const botResult = await pool.query(
+                `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
+                 VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
+                [channelId, aiResponse, savedMessage.id]
+              );
+              broadcast({
+                type: 'NEW_MESSAGE',
+                payload: { ...botResult.rows[0], sender_username: 'Gemini' },
+              });
+            }, 100);
+          }
+        }
       }
 
       if (msg.type === 'SET_STATUS') {

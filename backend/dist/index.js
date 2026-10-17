@@ -16,6 +16,7 @@ const sharp_1 = __importDefault(require("sharp"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
 const db_js_1 = require("./db.js");
+const gemini_js_1 = require("./gemini.js");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const server = http_1.default.createServer(app);
@@ -31,10 +32,9 @@ if (!fs_1.default.existsSync(UPLOAD_DIR)) {
 app.use((0, cors_1.default)({ origin: '*' }));
 app.use(express_1.default.json({ limit: '10mb' }));
 app.use('/uploads', express_1.default.static(UPLOAD_DIR));
-// Multer in-memory storage for sharp compression
 const upload = (0, multer_1.default)({
     storage: multer_1.default.memoryStorage(),
-    limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit before compression
+    limits: { fileSize: 15 * 1024 * 1024 },
 });
 function authMiddleware(req, res, next) {
     const authHeader = req.headers.authorization;
@@ -51,7 +51,6 @@ function authMiddleware(req, res, next) {
         return res.status(401).json({ error: '無効または期限切れのトークンです' });
     }
 }
-// Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', service: 'asdfbase-api', timestamp: new Date().toISOString() });
 });
@@ -143,7 +142,6 @@ app.post('/api/upload', authMiddleware, upload.single('image'), async (req, res)
         }
         const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.webp`;
         const outputPath = path_1.default.join(UPLOAD_DIR, filename);
-        // 最大幅1600px、品質80%のWebPに自動圧縮
         await (0, sharp_1.default)(req.file.buffer)
             .resize({ width: 1600, withoutEnlargement: true })
             .webp({ quality: 80 })
@@ -182,7 +180,7 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
         res.status(500).json({ error: 'メッセージ取得エラー' });
     }
 });
-// Post Message (REST fallback)
+// Post Message with AI @gemini & /ai command support
 app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) => {
     try {
         const channelId = parseInt(req.params.channelId, 10);
@@ -192,12 +190,7 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, userId, username, content, JSON.stringify(attachments || []), replyToId || null]);
         const savedMessage = { ...result.rows[0], sender_username: username };
-        // WebSocketブロードキャスト
-        broadcast({
-            type: 'NEW_MESSAGE',
-            payload: savedMessage,
-        });
-        // Discord Webhook 中継（設定されている場合）
+        broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
         if (DISCORD_WEBHOOK_URL) {
             fetch(DISCORD_WEBHOOK_URL, {
                 method: 'POST',
@@ -208,6 +201,20 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
                 }),
             }).catch(err => console.error('Discord webhook relay error:', err));
         }
+        // Check for @gemini or /ai trigger
+        const trimmed = content.trim();
+        if (trimmed.startsWith('/ai') || trimmed.includes('@gemini')) {
+            const prompt = trimmed.replace('/ai', '').replace('@gemini', '').trim();
+            if (prompt) {
+                setTimeout(async () => {
+                    const aiResponse = await (0, gemini_js_1.askGemini)(prompt, 'あなたはasdfbaseのアシスタントAIです。簡潔で的確に回答してください。');
+                    const botResult = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
+             VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, aiResponse, savedMessage.id]);
+                    const aiMessage = { ...botResult.rows[0], sender_username: 'Gemini' };
+                    broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
+                }, 100);
+            }
+        }
         res.json(savedMessage);
     }
     catch (err) {
@@ -215,7 +222,7 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
         res.status(500).json({ error: 'メッセージ投稿エラー' });
     }
 });
-// Reaction on Message
+// Reactions & Pin
 app.post('/api/messages/:messageId/reactions', authMiddleware, async (req, res) => {
     try {
         const messageId = parseInt(req.params.messageId, 10);
@@ -245,7 +252,6 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req, res) 
         res.status(500).json({ error: 'リアクション更新エラー' });
     }
 });
-// Pin Message
 app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
     try {
         const messageId = parseInt(req.params.messageId, 10);
@@ -258,6 +264,129 @@ app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
     }
     catch (err) {
         res.status(500).json({ error: 'ピン留め更新エラー' });
+    }
+});
+// Timetables API
+app.get('/api/timetables', authMiddleware, async (req, res) => {
+    try {
+        const result = await db_js_1.pool.query(`SELECT * FROM timetables ORDER BY day_of_week ASC, period ASC`);
+        res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: '時間割取得エラー' });
+    }
+});
+app.post('/api/timetables', authMiddleware, async (req, res) => {
+    try {
+        const { dayOfWeek, period, subject, scheduleType } = req.body;
+        const result = await db_js_1.pool.query(`INSERT INTO timetables (day_of_week, period, subject, schedule_type) 
+       VALUES ($1, $2, $3, $4) RETURNING *`, [dayOfWeek, period, subject, scheduleType || 'normal']);
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ error: '時間割登録エラー' });
+    }
+});
+// Assignments API
+app.get('/api/assignments', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const result = await db_js_1.pool.query(`SELECT a.*, COALESCE(p.status, 'unstarted') as my_status 
+       FROM assignments a 
+       LEFT JOIN assignment_progress p ON a.id = p.assignment_id AND p.user_id = $1 
+       ORDER BY a.deadline ASC`, [userId]);
+        res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: '提出物一覧取得エラー' });
+    }
+});
+app.post('/api/assignments', authMiddleware, async (req, res) => {
+    try {
+        const { title, subject, description, deadline, resubmitDeadline } = req.body;
+        const result = await db_js_1.pool.query(`INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`, [title, subject, description, deadline, resubmitDeadline || null]);
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ error: '提出物作成エラー' });
+    }
+});
+// Update Assignment Progress (未着手/進行中/提出済み/再提出/合格)
+app.put('/api/assignments/:id/progress', authMiddleware, async (req, res) => {
+    try {
+        const assignmentId = parseInt(req.params.id, 10);
+        const { status } = req.body;
+        const userId = req.user.id;
+        await db_js_1.pool.query(`INSERT INTO assignment_progress (assignment_id, user_id, status) 
+       VALUES ($1, $2, $3) 
+       ON CONFLICT (assignment_id, user_id) 
+       DO UPDATE SET status = EXCLUDED.status`, [assignmentId, userId, status]);
+        // 全員合格チェック
+        const usersCountRes = await db_js_1.pool.query(`SELECT COUNT(*) FROM users`);
+        const passedCountRes = await db_js_1.pool.query(`SELECT COUNT(*) FROM assignment_progress WHERE assignment_id = $1 AND status = 'passed'`, [assignmentId]);
+        const totalUsers = parseInt(usersCountRes.rows[0].count, 10);
+        const passedUsers = parseInt(passedCountRes.rows[0].count, 10);
+        if (totalUsers > 0 && passedUsers >= totalUsers) {
+            await db_js_1.pool.query(`UPDATE assignments SET is_archived = TRUE WHERE id = $1`, [assignmentId]);
+        }
+        res.json({ success: true, status });
+    }
+    catch (err) {
+        res.status(500).json({ error: '進捗更新エラー' });
+    }
+});
+// Gemini Summarize Assignment
+app.post('/api/assignments/summarize', authMiddleware, async (req, res) => {
+    try {
+        const { description } = req.body;
+        if (!description)
+            return res.status(400).json({ error: '内容が空です' });
+        const prompt = `以下の学校の課題・提出物指示文を読み、重要なポイント、締め切り、持ち物、注意点をJSON形式で要約してください。\n\n【指示文】:\n${description}`;
+        const summary = await (0, gemini_js_1.askGemini)(prompt, '必ず有効なJSONまたは箇条書きの分かりやすい形式で回答してください。');
+        res.json({ summary });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'AI要約エラー' });
+    }
+});
+// Test Scores & AI Advice
+app.get('/api/test-scores', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const result = await db_js_1.pool.query(`SELECT * FROM test_scores WHERE user_id = $1 ORDER BY exam_name ASC, subject ASC`, [userId]);
+        res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'テスト点数取得エラー' });
+    }
+});
+app.post('/api/test-scores', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { examName, subject, score, maxScore } = req.body;
+        const result = await db_js_1.pool.query(`INSERT INTO test_scores (user_id, exam_name, subject, score, max_score) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`, [userId, examName, subject, score, maxScore || 100]);
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'テスト点数登録エラー' });
+    }
+});
+app.post('/api/test-scores/advice', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const scores = await db_js_1.pool.query(`SELECT subject, score, max_score FROM test_scores WHERE user_id = $1`, [userId]);
+        if (scores.rows.length === 0) {
+            return res.status(400).json({ error: 'テスト点数が記録されていません' });
+        }
+        const scoreSummary = scores.rows.map(s => `${s.subject}: ${s.score}/${s.max_score}点`).join(', ');
+        const prompt = `私のテスト結果は以下の通りです:\n${scoreSummary}\n合計点や得点傾向を分析し、今後の勉強方針や苦手克服のための具体的なアドバイスを教えてください。`;
+        const advice = await (0, gemini_js_1.askGemini)(prompt, '高校生・学生向けの親身で具体的な学習アドバイザーとして回答してください。');
+        res.json({ advice });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'アドバイス生成エラー' });
     }
 });
 // Notes (Slots 1-10) API
@@ -278,14 +407,12 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req, res) => {
         const username = req.user.username;
         const currentNoteRes = await db_js_1.pool.query(`SELECT * FROM notes WHERE slot_index = $1`, [slotIndex]);
         const currentNote = currentNoteRes.rows[0];
-        // Monaco editor モードかつ専用ゾーン指定がある場合のロックチェック
         if (currentNote &&
             currentNote.mode === 'monaco' &&
             currentNote.assigned_user_id &&
             currentNote.assigned_user_id !== userId) {
             return res.status(403).json({ error: 'このメモは他ユーザーの専用ゾーンです（閲覧専用）' });
         }
-        // 履歴保存
         if (currentNote && currentNote.content !== content) {
             await db_js_1.pool.query(`INSERT INTO note_history (slot_index, content, updated_by_id) VALUES ($1, $2, $3)`, [slotIndex, currentNote.content, userId]);
         }
@@ -309,7 +436,7 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'メモ更新エラー' });
     }
 });
-// Audit Logs
+// Audit Logs & Users List
 app.get('/api/audit-logs', authMiddleware, async (req, res) => {
     try {
         const result = await db_js_1.pool.query(`SELECT * FROM audit_logs ORDER BY id DESC LIMIT 50`);
@@ -319,7 +446,6 @@ app.get('/api/audit-logs', authMiddleware, async (req, res) => {
         res.status(500).json({ error: '監査ログ取得エラー' });
     }
 });
-// Users List
 app.get('/api/users', authMiddleware, async (req, res) => {
     try {
         const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, last_active_at FROM users ORDER BY username ASC`);
@@ -358,10 +484,7 @@ wss.on('connection', (ws) => {
                 const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, clientInfo.userId, clientInfo.username, content, JSON.stringify(attachments || []), replyToId || null]);
                 const savedMessage = { ...result.rows[0], sender_username: clientInfo.username };
-                broadcast({
-                    type: 'NEW_MESSAGE',
-                    payload: savedMessage,
-                });
+                broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
                 if (DISCORD_WEBHOOK_URL) {
                     fetch(DISCORD_WEBHOOK_URL, {
                         method: 'POST',
@@ -372,14 +495,22 @@ wss.on('connection', (ws) => {
                         }),
                     }).catch(err => console.error('Discord webhook relay error:', err));
                 }
-            }
-            if (msg.type === 'NOTE_SYNC') {
-                // メモのリアルタイムキーストローク共有
-                broadcast({
-                    type: 'NOTE_SYNC',
-                    payload: msg.payload, // { slotIndex, content, version }
-                    sender: clientInfo.username,
-                }, ws);
+                // Handle AI reply via WS
+                const trimmed = content.trim();
+                if (trimmed.startsWith('/ai') || trimmed.includes('@gemini')) {
+                    const prompt = trimmed.replace('/ai', '').replace('@gemini', '').trim();
+                    if (prompt) {
+                        setTimeout(async () => {
+                            const aiResponse = await (0, gemini_js_1.askGemini)(prompt, 'あなたはasdfbaseのアシスタントAIです。簡潔で的確に回答してください。');
+                            const botResult = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
+                 VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, aiResponse, savedMessage.id]);
+                            broadcast({
+                                type: 'NEW_MESSAGE',
+                                payload: { ...botResult.rows[0], sender_username: 'Gemini' },
+                            });
+                        }, 100);
+                    }
+                }
             }
             if (msg.type === 'SET_STATUS') {
                 const { status } = msg;

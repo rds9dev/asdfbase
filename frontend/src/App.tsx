@@ -18,12 +18,15 @@ import {
   Mic,
   Image,
   Pin,
-  Smile,
   Copy,
   Lock,
   History,
   CheckCircle2,
-  RefreshCw
+  RefreshCw,
+  Plus,
+  Sparkles,
+  TrendingUp,
+  Award
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -60,6 +63,33 @@ interface MemoSlot {
   updated_at: string;
 }
 
+interface TimetableItem {
+  id: number;
+  day_of_week: number;
+  period: number;
+  subject: string;
+  schedule_type: string;
+}
+
+interface Assignment {
+  id: number;
+  title: string;
+  subject: string;
+  description?: string;
+  deadline: string;
+  resubmit_deadline?: string;
+  my_status: 'unstarted' | 'in_progress' | 'submitted' | 'resubmit' | 'passed';
+  is_archived: boolean;
+}
+
+interface TestScore {
+  id: number;
+  exam_name: string;
+  subject: string;
+  score: number;
+  max_score: number;
+}
+
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('asdf_token'));
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -70,7 +100,7 @@ export default function App() {
   // Header Data
   const [currentTime, setCurrentTime] = useState<string>('');
   const [weather, setWeather] = useState<{ temp: number; desc: string }>({ temp: 21, desc: '晴れ' });
-  const [nextSubject] = useState<{ name: string; time: string }>({ name: '数学', time: '10:45~' });
+  const [nextSubject, setNextSubject] = useState<{ name: string; time: string }>({ name: '数学', time: '10:45~' });
   const [showCamera, setShowCamera] = useState<boolean>(false);
 
   // Auth Form State
@@ -104,10 +134,30 @@ export default function App() {
   const [memoAssignedUser, setMemoAssignedUser] = useState<number | null>(null);
   const [isSavingMemo, setIsSavingMemo] = useState(false);
 
+  // Phase 3 State: Timetables & Assignments
+  const [scheduleType, setScheduleType] = useState<'normal' | 'short' | 's_short'>('normal');
+  const [timetables, setTimetables] = useState<TimetableItem[]>([]);
+  const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [assignmentFilter, setAssignmentFilter] = useState<'all' | 'unstarted' | 'in_progress' | 'submitted' | 'passed'>('all');
+  const [newAssignTitle, setNewAssignTitle] = useState('');
+  const [newAssignSubject, setNewAssignSubject] = useState('数学');
+  const [newAssignDeadline, setNewAssignDeadline] = useState('');
+  const [newAssignDesc, setNewAssignDesc] = useState('');
+  const [isSummarizingAI, setIsSummarizingAI] = useState<number | null>(null);
+  const [summarizedTexts, setSummarizedTexts] = useState<Record<number, string>>({});
+
+  // Phase 3 State: Test Scores & AI
+  const [testScores, setTestScores] = useState<TestScore[]>([]);
+  const [newExamName, setNewExamName] = useState('中間考査');
+  const [newExamSubject, setNewExamSubject] = useState('英語');
+  const [newExamScore, setNewExamScore] = useState<number>(85);
+  const [newExamMaxScore, setNewExamMaxScore] = useState<number>(100);
+  const [aiAdvice, setAiAdvice] = useState<string>('');
+  const [isLoadingAdvice, setIsLoadingAdvice] = useState(false);
+
   // WebSocket Ref
   const wsRef = useRef<WebSocket | null>(null);
 
-  // Auto-scroll chat
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -167,7 +217,7 @@ export default function App() {
       });
   }, [token]);
 
-  // WebSocket Connection & Real-time Handlers
+  // WebSocket Setup
   useEffect(() => {
     if (!token) return;
 
@@ -210,7 +260,6 @@ export default function App() {
       }
     };
 
-    // Presence detection (online / away)
     const handleVisibilityChange = () => {
       if (ws.readyState === WebSocket.OPEN) {
         const status = document.hidden ? 'away' : 'online';
@@ -225,9 +274,10 @@ export default function App() {
     };
   }, [token, selectedSlotIndex]);
 
-  // Initial Load (Channels, Notes, Users)
+  // Initial Data Load
   useEffect(() => {
     if (!token) return;
+
     fetch('/api/channels', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setChannels(data))
@@ -252,9 +302,19 @@ export default function App() {
         }
       })
       .catch(console.error);
+
+    fetch('/api/assignments', { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.json())
+      .then(data => setAssignments(data))
+      .catch(console.error);
+
+    fetch('/api/test-scores', { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.json())
+      .then(data => setTestScores(data))
+      .catch(console.error);
   }, [token]);
 
-  // Load Channel Messages
+  // Messages Load
   useEffect(() => {
     if (!token || !activeChannelId) return;
     fetch(`/api/channels/${activeChannelId}/messages`, {
@@ -300,7 +360,7 @@ export default function App() {
     setCurrentUser(null);
   };
 
-  // Image Upload Handler
+  // Image Upload
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !token) return;
@@ -317,7 +377,6 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok && data.url) {
-        // 画像を添付メッセージとして即時送信
         await fetch(`/api/channels/${activeChannelId}/messages`, {
           method: 'POST',
           headers: {
@@ -338,7 +397,7 @@ export default function App() {
     }
   };
 
-  // Chat Send Handler
+  // Chat Send
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim() || !token) return;
@@ -346,7 +405,6 @@ export default function App() {
     const content = chatInput;
     setChatInput('');
 
-    // WebSocket 送信を優先
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'SEND_MESSAGE',
@@ -354,7 +412,6 @@ export default function App() {
         content,
       }));
     } else {
-      // フォールバック
       await fetch(`/api/channels/${activeChannelId}/messages`, {
         method: 'POST',
         headers: {
@@ -366,7 +423,6 @@ export default function App() {
     }
   };
 
-  // Reaction Handler
   const handleToggleReaction = async (messageId: number, emoji: string) => {
     if (!token) return;
     try {
@@ -383,7 +439,6 @@ export default function App() {
     }
   };
 
-  // Pin Handler
   const handleTogglePin = async (messageId: number) => {
     if (!token) return;
     try {
@@ -396,7 +451,6 @@ export default function App() {
     }
   };
 
-  // Copy Message Link
   const handleCopyMessageLink = (messageId: number) => {
     const url = `${window.location.origin}/#msg-${messageId}`;
     navigator.clipboard.writeText(url);
@@ -404,7 +458,6 @@ export default function App() {
     setTimeout(() => setCopiedLinkMessageId(null), 2000);
   };
 
-  // Save Memo
   const handleSaveMemo = async () => {
     if (!token) return;
     setIsSavingMemo(true);
@@ -436,9 +489,140 @@ export default function App() {
     }
   };
 
+  // Phase 3: Create Assignment
+  const handleCreateAssignment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newAssignTitle || !newAssignDeadline || !token) return;
+
+    try {
+      const res = await fetch('/api/assignments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          title: newAssignTitle,
+          subject: newAssignSubject,
+          deadline: newAssignDeadline,
+          description: newAssignDesc
+        })
+      });
+      if (res.ok) {
+        const created = await res.json();
+        setAssignments(prev => [...prev, { ...created, my_status: 'unstarted' }]);
+        setNewAssignTitle('');
+        setNewAssignDesc('');
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Phase 3: Update Assignment Status
+  const handleUpdateAssignmentStatus = async (id: number, status: string) => {
+    if (!token) return;
+    try {
+      const res = await fetch(`/api/assignments/${id}/progress`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ status })
+      });
+      if (res.ok) {
+        setAssignments(prev => prev.map(a => a.id === id ? { ...a, my_status: status as any } : a));
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Phase 3: Gemini Summarize Assignment
+  const handleSummarizeAssignment = async (assignment: Assignment) => {
+    if (!token || !assignment.description) return;
+    setIsSummarizingAI(assignment.id);
+    try {
+      const res = await fetch('/api/assignments/summarize', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ description: assignment.description })
+      });
+      const data = await res.json();
+      if (data.summary) {
+        setSummarizedTexts(prev => ({ ...prev, [assignment.id]: data.summary }));
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsSummarizingAI(null);
+    }
+  };
+
+  // Phase 3: Create Test Score
+  const handleCreateTestScore = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) return;
+
+    try {
+      const res = await fetch('/api/test-scores', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          examName: newExamName,
+          subject: newExamSubject,
+          score: newExamScore,
+          maxScore: newExamMaxScore
+        })
+      });
+      if (res.ok) {
+        const created = await res.json();
+        setTestScores(prev => [...prev, created]);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Phase 3: Get AI Advice on Test Scores
+  const handleGetAiAdvice = async () => {
+    if (!token) return;
+    setIsLoadingAdvice(true);
+    try {
+      const res = await fetch('/api/test-scores/advice', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (data.advice) {
+        setAiAdvice(data.advice);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsLoadingAdvice(false);
+    }
+  };
+
   const isMonacoLocked = memoMode === 'monaco' && memoAssignedUser !== null && memoAssignedUser !== currentUser?.id;
 
-  // 認証前画面
+  // Filtered assignments
+  const filteredAssignments = assignments.filter(a => {
+    if (assignmentFilter === 'all') return !a.is_archived;
+    return a.my_status === assignmentFilter && !a.is_archived;
+  });
+
+  // Test Scores Total calculation
+  const totalScore = testScores.reduce((acc, curr) => acc + Number(curr.score), 0);
+  const totalMaxScore = testScores.reduce((acc, curr) => acc + Number(curr.max_score), 0);
+
   if (!token || !currentUser) {
     return (
       <div className="min-h-screen bg-[#090A0C] flex flex-col items-center justify-center p-4">
@@ -619,7 +803,6 @@ export default function App() {
         {/* TAB 1: リアルタイムチャット (3ペイン) */}
         {activeTab === 'chat' && (
           <div className="flex-1 flex overflow-hidden">
-            {/* Left: チャンネル一覧 */}
             <aside className="w-56 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between">
               <div>
                 <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold">
@@ -662,16 +845,15 @@ export default function App() {
                   <span>{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
                 </div>
                 <div className="text-stone-500 text-[11px]">
-                  WebSocket + WebP圧縮 + Discord同期中
+                  WebSocket + WebP圧縮 + @gemini自動応答 + Discord中継
                 </div>
               </div>
 
-              {/* Message Feed */}
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
                 {messages.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-stone-600 font-mono text-xs space-y-2">
                     <MessageSquare className="w-8 h-8 opacity-40 text-amber-400" />
-                    <p>メッセージはありません。画像をクリップボード貼り付けまたは添付できます。</p>
+                    <p>メッセージはありません。@gemini や /ai コマンドでAIと会話できます。</p>
                   </div>
                 ) : (
                   messages.map((m) => (
@@ -682,13 +864,19 @@ export default function App() {
                         m.is_pinned ? 'bg-amber-500/5 border border-amber-500/20' : ''
                       }`}
                     >
-                      <div className="w-8 h-8 rounded-lg bg-stone-800 border border-stone-700 flex items-center justify-center text-xs font-mono font-bold text-amber-400 uppercase shrink-0">
-                        {(m.sender_username || m.username || 'U')[0]}
+                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-mono font-bold uppercase shrink-0 ${
+                        m.sender_username === 'Gemini' 
+                          ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40' 
+                          : 'bg-stone-800 border border-stone-700 text-stone-300'
+                      }`}>
+                        {m.sender_username === 'Gemini' ? 'AI' : (m.sender_username || m.username || 'U')[0]}
                       </div>
 
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-1">
-                          <span className="text-xs font-bold text-stone-200">{m.sender_username || m.username}</span>
+                          <span className={`text-xs font-bold ${m.sender_username === 'Gemini' ? 'text-amber-400 font-mono' : 'text-stone-200'}`}>
+                            {m.sender_username || m.username}
+                          </span>
                           <span className="text-[10px] text-stone-500 font-mono">
                             {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                           </span>
@@ -699,8 +887,11 @@ export default function App() {
                           )}
                         </div>
 
-                        {/* Message content */}
-                        <div className="text-sm text-stone-300 bg-[#111214] border border-stone-800/80 rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed">
+                        <div className={`text-sm rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed ${
+                          m.sender_username === 'Gemini' 
+                            ? 'bg-[#151720] border border-amber-500/30 text-amber-100' 
+                            : 'bg-[#111214] border border-stone-800/80 text-stone-300'
+                        }`}>
                           {m.content.startsWith('![image]') ? (
                             <img 
                               src={m.content.match(/\((.*?)\)/)?.[1]} 
@@ -712,7 +903,6 @@ export default function App() {
                           )}
                         </div>
 
-                        {/* Reactions Bar */}
                         {m.reactions && Object.keys(m.reactions).length > 0 && (
                           <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
                             {Object.entries(m.reactions).map(([emoji, userIds]) => (
@@ -733,7 +923,6 @@ export default function App() {
                         )}
                       </div>
 
-                      {/* Action buttons (hover overlay) */}
                       <div className="opacity-0 group-hover:opacity-100 transition absolute right-2 top-2 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-1 shadow-md">
                         <button
                           onClick={() => handleToggleReaction(m.id, '👍')}
@@ -770,7 +959,6 @@ export default function App() {
                 <div ref={messagesEndRef} />
               </div>
 
-              {/* Chat Input Bar */}
               <form onSubmit={handleSendMessage} className="p-3 border-t border-stone-800/80 bg-[#0C0D10]/50">
                 <div className="flex items-center gap-2 bg-[#14161C] border border-stone-800 rounded-xl px-3 py-2 focus-within:border-amber-500/60 transition">
                   <input
@@ -794,7 +982,7 @@ export default function App() {
                     type="text"
                     value={chatInput}
                     onChange={e => setChatInput(e.target.value)}
-                    placeholder="メッセージを入力... (/ai, /join vc1 等のコマンド対応)"
+                    placeholder="メッセージを入力... (@gemini, /ai, /join vc1 等のコマンド対応)"
                     className="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 font-mono"
                   />
                   <button
@@ -807,7 +995,6 @@ export default function App() {
               </form>
             </section>
 
-            {/* Right: メンバー一覧 */}
             <aside className="w-52 border-l border-stone-800/80 bg-[#0C0D10] p-3 hidden lg:flex flex-col">
               <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between">
                 <span>Members</span>
@@ -825,10 +1012,9 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: リアルタイムメモ (10スロット & Monaco / Markdown) */}
+        {/* TAB 2: リアルタイムメモ */}
         {activeTab === 'memo' && (
           <div className="flex-1 flex overflow-hidden">
-            {/* Slot Selector */}
             <aside className="w-64 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between">
               <div>
                 <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between">
@@ -866,7 +1052,6 @@ export default function App() {
               </div>
             </aside>
 
-            {/* Editor Container */}
             <section className="flex-1 flex flex-col bg-[#090A0C] p-4">
               <div className="flex items-center justify-between mb-3 border-b border-stone-800/80 pb-3">
                 <input
@@ -905,7 +1090,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Editor Workspace */}
               <div className="flex-1 flex gap-4 overflow-hidden rounded-2xl border border-stone-800/80 bg-[#111214]">
                 {memoMode === 'monaco' ? (
                   <div className="w-full h-full rounded-2xl overflow-hidden">
@@ -947,61 +1131,222 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: AI (Gemini) */}
+        {/* TAB 3: AI (Gemini Console) */}
         {activeTab === 'ai' && (
           <div className="flex-1 p-6 flex flex-col items-center justify-center">
-            <div className="max-w-xl w-full bg-[#111214] border border-stone-800/80 rounded-3xl p-8 text-center interactive-card">
+            <div className="max-w-2xl w-full bg-[#111214] border border-stone-800/80 rounded-3xl p-8 text-center interactive-card">
               <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-400 flex items-center justify-center mx-auto mb-4">
                 <Bot className="w-8 h-8" />
               </div>
               <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white mb-2">Gemini AI キープール連携</h2>
               <p className="text-stone-400 text-xs font-mono mb-6 leading-relaxed">
-                複数発行されたGemini APIキーの自動ローテーション管理、提出物の自動要約、チャットからの@gemini呼び出しに対応しています。
+                複数のGemini APIキーを自動ローテーション管理。レートリミットを回避しながら提出物の自動要約やアドバイスを生成します。
               </p>
-              <div className="bg-[#16181D] border border-stone-800 rounded-xl p-4 text-left font-mono text-xs text-stone-300 space-y-2">
-                <div>・チャット内メンション: <span className="text-amber-400">@gemini この問題解いて</span></div>
-                <div>・スラッシュコマンド: <span className="text-amber-400">/ai 要約して</span></div>
-                <div>・テスト点数アドバイス生成</div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-left font-mono text-xs">
+                <div className="p-3 bg-[#16181D] border border-stone-800 rounded-xl">
+                  <div className="text-amber-400 font-bold mb-1">💬 チャット連動</div>
+                  <div className="text-stone-400">@gemini や /ai でリアルタイムにチャット内で自動返信</div>
+                </div>
+                <div className="p-3 bg-[#16181D] border border-stone-800 rounded-xl">
+                  <div className="text-amber-400 font-bold mb-1">📝 提出物要約</div>
+                  <div className="text-stone-400">長い課題指示文を重要ポイント・持ち物・締切にJSON要約</div>
+                </div>
+                <div className="p-3 bg-[#16181D] border border-stone-800 rounded-xl">
+                  <div className="text-amber-400 font-bold mb-1">📊 テスト分析</div>
+                  <div className="text-stone-400">各教科の得点傾向からAIが学習アドバイスを提供</div>
+                </div>
               </div>
             </div>
           </div>
         )}
 
-        {/* TAB 4: 提出物 & 時間割 */}
+        {/* TAB 4: 提出物 & 時間割 (Phase 3 Full Feature) */}
         {activeTab === 'assignments' && (
           <div className="flex-1 p-6 overflow-y-auto">
             <div className="max-w-4xl mx-auto space-y-6">
-              <div className="flex items-center justify-between">
+              {/* Header & 時程切り替え */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-stone-800/80 pb-4">
                 <div>
                   <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">提出物 & 時間割</h2>
-                  <p className="text-xs text-stone-400 font-mono">未着手 / 進行中 / 提出済み / 再提出 / 合格（全員合格でアーカイブ）</p>
+                  <p className="text-xs text-stone-400 font-mono">
+                    締め切り管理・再提出締め切り・教科フィルター・全員合格アーカイブ機能
+                  </p>
                 </div>
-                <div className="flex gap-2 font-mono text-xs">
-                  <button className="px-3 py-1.5 bg-stone-900 border border-stone-800 rounded-lg text-stone-300 hover:text-white">通常時程</button>
-                  <button className="px-3 py-1.5 bg-stone-900 border border-stone-800 rounded-lg text-stone-300 hover:text-white">短縮時程</button>
-                  <button className="px-3 py-1.5 bg-stone-900 border border-stone-800 rounded-lg text-stone-300 hover:text-white">S短時程</button>
+
+                <div className="flex items-center gap-1.5 font-mono text-xs bg-[#111214] p-1 rounded-xl border border-stone-800">
+                  <button
+                    onClick={() => setScheduleType('normal')}
+                    className={`px-3 py-1.5 rounded-lg transition ${
+                      scheduleType === 'normal' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                    }`}
+                  >
+                    通常時程
+                  </button>
+                  <button
+                    onClick={() => setScheduleType('short')}
+                    className={`px-3 py-1.5 rounded-lg transition ${
+                      scheduleType === 'short' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                    }`}
+                  >
+                    短縮時程
+                  </button>
+                  <button
+                    onClick={() => setScheduleType('s_short')}
+                    className={`px-3 py-1.5 rounded-lg transition ${
+                      scheduleType === 's_short' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                    }`}
+                  >
+                    S短時程
+                  </button>
                 </div>
               </div>
 
-              <div className="space-y-3">
+              {/* 提出物作成フォーム */}
+              <form onSubmit={handleCreateAssignment} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 space-y-3 font-mono text-xs">
+                <div className="text-stone-300 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                  <Plus className="w-4 h-4 text-amber-400" /> 新規提出物の登録
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <input
+                    type="text"
+                    required
+                    placeholder="課題タイトル"
+                    value={newAssignTitle}
+                    onChange={e => setNewAssignTitle(e.target.value)}
+                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                  />
+                  <select
+                    value={newAssignSubject}
+                    onChange={e => setNewAssignSubject(e.target.value)}
+                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  >
+                    {['国語', '数学', '英語', '理科', '社会', '情報', '保健体育', 'その他'].map(s => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="date"
+                    required
+                    value={newAssignDeadline}
+                    onChange={e => setNewAssignDeadline(e.target.value)}
+                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                  />
+                </div>
+                <textarea
+                  placeholder="指示文・持ち物・注意事項（Geminiによる自動要約が使えます）"
+                  value={newAssignDesc}
+                  onChange={e => setNewAssignDesc(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-3 text-white focus:outline-none focus:border-amber-500/60 resize-none h-18"
+                />
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition interactive-btn uppercase"
+                >
+                  提出物を追加
+                </button>
+              </form>
+
+              {/* フィルター */}
+              <div className="flex items-center gap-2 font-mono text-xs">
+                <span className="text-stone-500">Filter:</span>
                 {[
-                  { title: '数学II 第3章 演習問題', subject: '数学', deadline: '2026/10/20', status: '進行中' },
-                  { title: '物理基礎 実験レポート', subject: '物理', deadline: '2026/10/22', status: '未着手' },
-                ].map((item, idx) => (
-                  <div key={idx} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 flex items-center justify-between interactive-card">
-                    <div>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20">{item.subject}</span>
-                        <span className="font-bold text-white text-sm">{item.title}</span>
-                      </div>
-                      <div className="text-xs text-stone-500 font-mono">締切: {item.deadline}</div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-mono px-3 py-1 bg-stone-800 text-stone-300 rounded-lg">{item.status}</span>
-                      <button className="text-xs font-mono px-3 py-1 bg-amber-500 text-black font-bold rounded-lg interactive-btn">更新</button>
-                    </div>
-                  </div>
+                  { id: 'all', label: 'すべて' },
+                  { id: 'unstarted', label: '未着手' },
+                  { id: 'in_progress', label: '進行中' },
+                  { id: 'submitted', label: '提出済み' },
+                  { id: 'passed', label: '合格' },
+                ].map(f => (
+                  <button
+                    key={f.id}
+                    onClick={() => setAssignmentFilter(f.id as any)}
+                    className={`px-2.5 py-1 rounded-lg border transition ${
+                      assignmentFilter === f.id
+                        ? 'bg-amber-500/10 text-amber-400 border-amber-500/40'
+                        : 'bg-[#111214] text-stone-400 border-stone-800 hover:border-stone-700'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
                 ))}
+              </div>
+
+              {/* 提出物カード一覧 */}
+              <div className="space-y-3">
+                {filteredAssignments.length === 0 ? (
+                  <div className="p-8 text-center text-stone-600 font-mono text-xs border border-dashed border-stone-800 rounded-2xl">
+                    表示できる提出物はありません。
+                  </div>
+                ) : (
+                  filteredAssignments.map((item) => (
+                    <div key={item.id} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4.5 interactive-card space-y-3">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <div className="flex items-center gap-2.5">
+                          <span className="px-2.5 py-0.5 rounded-lg text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 font-bold">
+                            {item.subject}
+                          </span>
+                          <span className="font-bold text-white text-base">{item.title}</span>
+                        </div>
+
+                        {/* ステータスセレクト */}
+                        <div className="flex items-center gap-2 font-mono text-xs">
+                          <select
+                            value={item.my_status}
+                            onChange={e => handleUpdateAssignmentStatus(item.id, e.target.value)}
+                            className={`px-3 py-1 rounded-lg border font-bold focus:outline-none ${
+                              item.my_status === 'passed'
+                                ? 'bg-emerald-950/40 border-emerald-800 text-emerald-400'
+                                : item.my_status === 'submitted'
+                                ? 'bg-sky-950/40 border-sky-800 text-sky-400'
+                                : item.my_status === 'in_progress'
+                                ? 'bg-amber-950/40 border-amber-800 text-amber-400'
+                                : 'bg-stone-900 border-stone-800 text-stone-400'
+                            }`}
+                          >
+                            <option value="unstarted">未着手</option>
+                            <option value="in_progress">進行中</option>
+                            <option value="submitted">提出済み</option>
+                            <option value="resubmit">再提出</option>
+                            <option value="passed">合格</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-4 text-xs font-mono text-stone-400">
+                        <div>締切: <span className="text-stone-200 font-bold">{new Date(item.deadline).toLocaleDateString()}</span></div>
+                        {item.resubmit_deadline && (
+                          <div>再提出締切: <span className="text-stone-200">{new Date(item.resubmit_deadline).toLocaleDateString()}</span></div>
+                        )}
+                      </div>
+
+                      {item.description && (
+                        <div className="bg-[#16181D] border border-stone-800/60 rounded-xl p-3 text-xs text-stone-300 font-sans leading-relaxed">
+                          {item.description}
+                        </div>
+                      )}
+
+                      {/* Gemini 要約ボタン & 要約表示 */}
+                      <div className="flex flex-col gap-2 pt-1 border-t border-stone-800/50">
+                        <div className="flex items-center justify-between">
+                          <button
+                            onClick={() => handleSummarizeAssignment(item)}
+                            disabled={isSummarizingAI === item.id || !item.description}
+                            className="text-xs font-mono flex items-center gap-1.5 text-amber-400 hover:text-amber-300 disabled:opacity-40 transition"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            <span>{isSummarizingAI === item.id ? 'Gemini 要約中...' : 'Geminiで要約・重要ポイント抽出'}</span>
+                          </button>
+                        </div>
+
+                        {summarizedTexts[item.id] && (
+                          <div className="bg-[#141720] border border-amber-500/30 rounded-xl p-3 text-xs text-amber-100 font-mono whitespace-pre-wrap leading-relaxed">
+                            <div className="text-[10px] text-amber-400 font-bold mb-1">AI要約結果:</div>
+                            {summarizedTexts[item.id]}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           </div>
@@ -1016,12 +1361,127 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 6: その他 */}
+        {/* TAB 6: その他 (テスト点数メモ & Gemini学習アドバイス) */}
         {activeTab === 'more' && (
-          <div className="flex-1 p-6">
-            <div className="max-w-2xl mx-auto bg-[#111214] border border-stone-800/80 rounded-2xl p-6">
-              <h3 className="text-lg font-bold font-['Space_Grotesk'] text-white mb-2">テスト点数メモ & AIアドバイス</h3>
-              <p className="text-xs font-mono text-stone-400 mb-4">テストの各教科点数を記録し、合計点算出とGeminiからの学習アドバイスを受け取れます。</p>
+          <div className="flex-1 p-6 overflow-y-auto">
+            <div className="max-w-3xl mx-auto space-y-6">
+              <div>
+                <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">テスト点数メモ & AIアドバイス</h2>
+                <p className="text-xs text-stone-400 font-mono">テスト結果の記録、合計点・平均点の集計、Geminiによる個別学習アドバイス</p>
+              </div>
+
+              {/* 点数サマリー */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 interactive-card">
+                  <div className="flex items-center gap-2 text-xs font-mono text-stone-400 mb-2">
+                    <Award className="w-4 h-4 text-amber-400" />
+                    <span>TOTAL SCORE</span>
+                  </div>
+                  <div className="text-3xl font-black font-['Space_Grotesk'] text-white">
+                    {totalScore} <span className="text-sm font-normal text-stone-500">/ {totalMaxScore}点</span>
+                  </div>
+                </div>
+
+                <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 interactive-card">
+                  <div className="flex items-center gap-2 text-xs font-mono text-stone-400 mb-2">
+                    <TrendingUp className="w-4 h-4 text-emerald-400" />
+                    <span>AVERAGE SCORE</span>
+                  </div>
+                  <div className="text-3xl font-black font-['Space_Grotesk'] text-white">
+                    {testScores.length > 0 ? (totalScore / testScores.length).toFixed(1) : 0} <span className="text-sm font-normal text-stone-500">点</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 点数登録フォーム */}
+              <form onSubmit={handleCreateTestScore} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 font-mono text-xs space-y-3">
+                <div className="text-stone-300 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                  <Plus className="w-4 h-4 text-amber-400" /> 点数の記録
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <input
+                    type="text"
+                    required
+                    placeholder="テスト名 (中間考査)"
+                    value={newExamName}
+                    onChange={e => setNewExamName(e.target.value)}
+                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  />
+                  <input
+                    type="text"
+                    required
+                    placeholder="教科名 (英語)"
+                    value={newExamSubject}
+                    onChange={e => setNewExamSubject(e.target.value)}
+                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  />
+                  <input
+                    type="number"
+                    required
+                    placeholder="得点"
+                    value={newExamScore}
+                    onChange={e => setNewExamScore(Number(e.target.value))}
+                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  />
+                  <input
+                    type="number"
+                    required
+                    placeholder="満点"
+                    value={newExamMaxScore}
+                    onChange={e => setNewExamMaxScore(Number(e.target.value))}
+                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition interactive-btn uppercase"
+                >
+                  点数を追加
+                </button>
+              </form>
+
+              {/* 一覧テーブル */}
+              <div className="bg-[#111214] border border-stone-800/80 rounded-2xl overflow-hidden font-mono text-xs">
+                <div className="px-4 py-3 border-b border-stone-800 text-stone-400 font-bold uppercase tracking-wider">
+                  記録一覧
+                </div>
+                <div className="divide-y divide-stone-800/60">
+                  {testScores.map(t => (
+                    <div key={t.id} className="px-4 py-3 flex items-center justify-between">
+                      <div>
+                        <span className="text-stone-500 mr-3">[{t.exam_name}]</span>
+                        <span className="font-bold text-white">{t.subject}</span>
+                      </div>
+                      <div className="font-bold text-amber-400">
+                        {t.score} / {t.max_score}点
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Gemini アドバイス生成エリア */}
+              <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-amber-400" />
+                    <span className="font-bold font-['Space_Grotesk'] text-white">Gemini 学習アドバイス</span>
+                  </div>
+                  <button
+                    onClick={handleGetAiAdvice}
+                    disabled={isLoadingAdvice || testScores.length === 0}
+                    className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black text-xs font-mono font-bold rounded-xl transition interactive-btn uppercase disabled:opacity-40"
+                  >
+                    {isLoadingAdvice ? 'AI分析中...' : 'アドバイスを生成'}
+                  </button>
+                </div>
+
+                {aiAdvice && (
+                  <div className="bg-[#16181D] border border-amber-500/30 rounded-xl p-4 text-xs font-mono text-amber-100 whitespace-pre-wrap leading-relaxed">
+                    {aiAdvice}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}
