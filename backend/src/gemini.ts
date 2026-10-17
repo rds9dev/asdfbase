@@ -29,7 +29,13 @@ export async function askGemini(prompt: string, systemInstruction?: string): Pro
     return '【Gemini連携】APIキーが設定されていません。.env に GEMINI_API_KEY_1 などを登録してください。';
   }
 
-  const models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+  const models = [
+    'gemini-3.5-flash-lite',
+    'gemini-flash-lite-latest',
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash'
+  ];
   let lastError: any = null;
 
   // 登録されている全キーを順番に試行
