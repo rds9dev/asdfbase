@@ -287,36 +287,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Stealth / Camouflage Mode (for Chromebook / School monitoring bypass)
-  const [stealthMode, setStealthMode] = useState<'none' | 'classroom' | 'docs' | 'portal'>('none');
-  const [isPanicked, setIsPanicked] = useState<boolean>(false);
 
-  useEffect(() => {
-    if (isPanicked) {
-      document.title = 'ホーム - Google Classroom';
-      return;
-    }
-    if (stealthMode === 'classroom') {
-      document.title = 'ホーム - Google Classroom';
-    } else if (stealthMode === 'docs') {
-      document.title = '情報基礎まとめノート - Google ドキュメント';
-    } else if (stealthMode === 'portal') {
-      document.title = '文部科学省 学習支援ポータルサイト';
-    } else {
-      document.title = 'asdfbase';
-    }
-  }, [stealthMode, isPanicked]);
-
-  // Esc key panic listener (Press Esc to immediately disguise screen)
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setIsPanicked(prev => !prev);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
 
   // Weather (Takamatsu - via internal backend API to bypass external domain filters)
   useEffect(() => {
@@ -1439,30 +1410,7 @@ export default function App() {
             <span>{currentTime || 'Loading...'}</span>
           </div>
 
-          {/* カモフラージュ偽装セレクター */}
-          <div className="hidden lg:flex items-center gap-1 bg-stone-900/60 px-2 py-1 rounded-lg border border-stone-800/70 text-[10px]">
-            <span className="text-stone-500">偽装:</span>
-            <select
-              value={stealthMode}
-              onChange={e => setStealthMode(e.target.value as any)}
-              className="bg-transparent text-stone-300 focus:outline-none cursor-pointer"
-            >
-              <option value="none" className="bg-[#111214]">通常</option>
-              <option value="classroom" className="bg-[#111214]">Google Classroom</option>
-              <option value="docs" className="bg-[#111214]">Google Docs</option>
-              <option value="portal" className="bg-[#111214]">学習ポータル</option>
-            </select>
-          </div>
 
-          {/* 緊急パニックボタン (Boss Key) */}
-          <button
-            onClick={() => setIsPanicked(true)}
-            title="緊急カモフラージュ画面 (Escキーでも発動)"
-            className="px-2 py-1 rounded-lg bg-stone-900/80 border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-amber-500/50 transition flex items-center gap-1 text-[10px]"
-          >
-            <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden xl:inline text-stone-400">緊急偽装(Esc)</span>
-          </button>
 
           <button
             onClick={() => setShowCamera(!showCamera)}
@@ -2825,49 +2773,6 @@ export default function App() {
         </div>
       )}
 
-      {/* 緊急カモフラージュ画面 (Boss Key / Escキーで瞬時に切替) */}
-      {isPanicked && (
-        <div className="fixed inset-0 z-[9999] bg-[#202124] text-[#E8EAED] flex flex-col font-sans select-none">
-          <header className="h-16 border-b border-[#3c4043] px-6 flex items-center justify-between bg-[#202124]">
-            <div className="flex items-center gap-3">
-              <span className="text-xl font-bold text-[#E8EAED]">Google Classroom</span>
-              <span className="text-xs text-[#9aa0a6] bg-[#303134] px-2.5 py-1 rounded">情報科学演習 第2学年</span>
-            </div>
-            <div className="flex items-center gap-3 text-xs text-[#9aa0a6]">
-              <span>提出期限: 明日 23:59</span>
-              <button 
-                onClick={() => setIsPanicked(false)} 
-                className="opacity-40 hover:opacity-100 text-[11px] text-[#9aa0a6] hover:text-white border border-[#5f6368] px-3 py-1 rounded transition"
-                title="復帰 (Esc)"
-              >
-                解除 (Esc)
-              </button>
-            </div>
-          </header>
-          <div className="flex-1 max-w-4xl w-full mx-auto p-8 space-y-6 overflow-y-auto">
-            <div className="bg-[#303134] border border-[#3c4043] rounded-2xl p-6 shadow-lg">
-              <div className="flex items-center justify-between mb-4">
-                <h1 className="text-xl font-medium text-white">第5回 情報セキュリティとネットワーク基礎演習</h1>
-                <span className="text-xs text-[#8ab4f8] bg-[#1a73e8]/20 px-3 py-1 rounded-full border border-[#1a73e8]/40">割り当て済み</span>
-              </div>
-              <p className="text-sm text-[#bdc1c6] leading-relaxed mb-4">
-                教科書 p.48〜p.55 を読み、以下の設問に解答してレポートを作成してください。<br/>
-                1. 公開鍵暗号方式と共通鍵暗号方式の仕組みの違いについてまとめよ。<br/>
-                2. ファイアウォールとパケットフィルタリングの役割を説明せよ。
-              </p>
-              <div className="border-t border-[#3c4043] pt-4 flex items-center justify-between text-xs text-[#9aa0a6]">
-                <span>添付資料: 授業用スライド_第5回.pdf</span>
-                <span className="text-[#81c995]">提出状況: 未提出 (期限内)</span>
-              </div>
-            </div>
-
-            <div className="bg-[#303134] border border-[#3c4043] rounded-2xl p-6 shadow-lg">
-              <h2 className="text-base font-medium text-white mb-2">クラスの連絡事項</h2>
-              <p className="text-xs text-[#9aa0a6]">次回の授業では、各自の端末で演習課題の確認を行います。教科書を持参してください。</p>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

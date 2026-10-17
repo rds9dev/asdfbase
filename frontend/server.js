@@ -10,36 +10,29 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Cloudflare Tunnel URL or VPS API Target
-// (e.g. https://api-asdf.rds9.net)
 const BACKEND_TARGET = process.env.BACKEND_TARGET || process.env.BACKEND_INTERNAL_URL || 'https://api-asdf.rds9.net';
 
 console.log(`[Render Proxy Server] Proxy target: ${BACKEND_TARGET}`);
 
-// 1. API Reverse Proxy
-app.use(
-  '/api',
-  createProxyMiddleware({
-    target: BACKEND_TARGET,
-    changeOrigin: true,
-    secure: true,
-    ws: false,
-    logLevel: 'warn',
-    onProxyReq: (proxyReq) => {
-      // Clean headers if necessary
-      proxyReq.setHeader('x-forwarded-host', new URL(BACKEND_TARGET).host);
-    },
-  })
-);
+// 1. API Reverse Proxy (Preserve /api prefix)
+const apiProxy = createProxyMiddleware({
+  target: BACKEND_TARGET,
+  changeOrigin: true,
+  secure: true,
+  pathFilter: '/api/**',
+  logLevel: 'debug',
+});
+app.use(apiProxy);
 
-// 2. Uploads Reverse Proxy
-app.use(
-  '/uploads',
-  createProxyMiddleware({
-    target: BACKEND_TARGET,
-    changeOrigin: true,
-    secure: true,
-  })
-);
+// 2. Uploads Reverse Proxy (Preserve /uploads prefix)
+const uploadsProxy = createProxyMiddleware({
+  target: BACKEND_TARGET,
+  changeOrigin: true,
+  secure: true,
+  pathFilter: '/uploads/**',
+  logLevel: 'warn',
+});
+app.use(uploadsProxy);
 
 // 3. WebSocket Reverse Proxy (/ws)
 const wsProxy = createProxyMiddleware({
@@ -47,16 +40,17 @@ const wsProxy = createProxyMiddleware({
   changeOrigin: true,
   ws: true,
   secure: true,
+  pathFilter: '/ws',
   logLevel: 'warn',
 });
-app.use('/ws', wsProxy);
+app.use(wsProxy);
 
 // 4. Static Files (Vite Production Build)
 const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
 
-// 5. SPA Fallback
-app.get('*', (req, res) => {
+// 5. SPA Fallback (compatible with Express 5)
+app.use((req, res) => {
   res.sendFile(path.join(distPath, 'index.html'));
 });
 
