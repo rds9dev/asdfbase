@@ -10,7 +10,7 @@ import sharp from 'sharp';
 import path from 'path';
 import fs from 'fs';
 import { pool, initDb } from './db.js';
-import { askGemini } from './gemini.js';
+import { askGemini, chatWithGemini, getAvailableKeyCount } from './gemini.js';
 
 dotenv.config();
 
@@ -615,6 +615,97 @@ app.post('/api/test-scores/advice', authMiddleware, async (req: AuthRequest, res
     res.json({ advice });
   } catch (err) {
     res.status(500).json({ error: 'アドバイス生成エラー' });
+  }
+});
+
+// AI Chat Endpoint (for AI Tab)
+app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { messages, contextData, systemInstruction } = req.body;
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: '会話履歴（messages）が必要です' });
+    }
+
+    const reply = await chatWithGemini(messages, contextData, systemInstruction);
+    res.json({ reply, keyCount: getAvailableKeyCount() });
+  } catch (err: any) {
+    console.error('AI chat error:', err);
+    res.status(500).json({ error: 'AI応答エラー' });
+  }
+});
+
+// Memo AI Assistant (Summarize, Proofread, Explain Code)
+app.post('/api/ai/memo-assist', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { content, type, customPrompt } = req.body;
+    if (!content && !customPrompt) {
+      return res.status(400).json({ error: '対象のテキストがありません' });
+    }
+
+    let prompt = '';
+    let instruction = 'あなたは的確で簡潔なアシスタントです。余計な前置きを省いて結果のみを返してください。';
+
+    if (type === 'summarize') {
+      prompt = `以下のメモ内容を3行以内の重要ポイントに箇条書きで要約してください:\n\n${content}`;
+    } else if (type === 'proofread') {
+      prompt = `以下の文章の誤字脱字、表現の不自然さを校正し、改善後の文章を提示してください:\n\n${content}`;
+    } else if (type === 'explain_code') {
+      prompt = `以下のプログラムコードの処理内容、引数、戻り値、改善点を分かりやすく解説してください:\n\n${content}`;
+      instruction = 'プログラミング講師として簡潔かつ明快に解説してください。';
+    } else if (type === 'continue') {
+      prompt = `以下のメモの文脈に続けて、自然な続きの文章や実装を生成してください:\n\n${content}`;
+    } else {
+      prompt = `${customPrompt || '以下のテキストを改善してください'}:\n\n${content}`;
+    }
+
+    const result = await askGemini(prompt, instruction);
+    res.json({ result });
+  } catch (err) {
+    console.error('Memo assist error:', err);
+    res.status(500).json({ error: 'メモAIアシストエラー' });
+  }
+});
+
+// Timetables API
+app.get('/api/timetables', authMiddleware, async (req, res) => {
+  try {
+    const scheduleType = (req.query.scheduleType as string) || 'normal';
+    const result = await pool.query(
+      `SELECT * FROM timetables WHERE schedule_type = $1 ORDER BY day_of_week ASC, period ASC`,
+      [scheduleType]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: '時間割取得エラー' });
+  }
+});
+
+app.post('/api/timetables', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { dayOfWeek, period, subject, scheduleType } = req.body;
+    if (dayOfWeek === undefined || !period || !subject) {
+      return res.status(400).json({ error: '曜日、時限、教科名は必須です' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO timetables (day_of_week, period, subject, schedule_type)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [dayOfWeek, period, subject, scheduleType || 'normal']
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: '時間割登録エラー' });
+  }
+});
+
+app.delete('/api/timetables/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    await pool.query(`DELETE FROM timetables WHERE id = $1`, [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: '時間割削除エラー' });
   }
 });
 

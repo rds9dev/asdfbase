@@ -48,7 +48,10 @@ import {
   Command,
   Calculator,
   Trash2,
-  Share2
+  Share2,
+  Link,
+  Subtitles,
+  Headphones
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -129,13 +132,41 @@ export default function App() {
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [cameraError, setCameraError] = useState<string>('');
 
-  // Voice Chat (VC) State
+  // Voice Chat (VC) State & WebRTC Refs
   const [inVoiceChannel, setInVoiceChannel] = useState<boolean>(false);
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
   const [isDeafened, setIsDeafened] = useState<boolean>(false);
   const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false);
   const [vcSubtitles, setVcSubtitles] = useState<string>('');
+  const [isTtsEnabled, setIsTtsEnabled] = useState<boolean>(false);
   const [activeVcUsers, setActiveVcUsers] = useState<{ userId: number; username: string; isMuted?: boolean; isScreenSharing?: boolean }[]>([]);
+  const localAudioStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const screenVideoRef = useRef<HTMLVideoElement | null>(null);
+  const speechRecognitionRef = useRef<any>(null);
+
+  // AI Tab State
+  const [aiMessages, setAiMessages] = useState<{ id: number; role: 'user' | 'model'; content: string; timestamp: string }[]>([
+    {
+      id: 1,
+      role: 'model',
+      content: 'こんにちは！asdfbaseのAIアシスタントです。学校生活、課題の要約、勉強の質問、プログラミングの質問など何でも聞いてください。',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    }
+  ]);
+  const [aiInput, setAiInput] = useState('');
+  const [isLoadingAi, setIsLoadingAi] = useState(false);
+  const [includeContextInAi, setIncludeContextInAi] = useState(true);
+
+  // Memo AI State
+  const [isMemoAiLoading, setIsMemoAiLoading] = useState(false);
+  const [memoAiResultModal, setMemoAiResultModal] = useState<string | null>(null);
+
+  // Timetables State & Modal
+  const [isTimetableModalOpen, setIsTimetableModalOpen] = useState(false);
+  const [newTtDay, setNewTtDay] = useState(1);
+  const [newTtPeriod, setNewTtPeriod] = useState(1);
+  const [newTtSubject, setNewTtSubject] = useState('');
 
   // Chat UI State (Mention, Search, Edit, Member Panel)
   const [chatSearchQuery, setChatSearchQuery] = useState('');
@@ -224,7 +255,7 @@ export default function App() {
   const [brushWidth, setBrushWidth] = useState<number>(3);
   const [isDrawing, setIsDrawing] = useState(false);
   const [currentStrokePoints, setCurrentStrokePoints] = useState<{ x: number; y: number }[]>([]);
-  const [boardMode, setBoardMode] = useState<'draw' | 'text'>('draw');
+  const [boardMode, setBoardMode] = useState<'draw' | 'eraser' | 'text'>('draw');
   const [newBoardText, setNewBoardText] = useState('');
   const [isTimelapsePlaying, setIsTimelapsePlaying] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -777,6 +808,259 @@ export default function App() {
     }
   };
 
+  // AI Tab Send Handler (with context JSON support)
+  const handleSendAiMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!aiInput.trim() || !token || isLoadingAi) return;
+
+    const userText = aiInput.trim();
+    const newMsg = {
+      id: Date.now(),
+      role: 'user' as const,
+      content: userText,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    };
+
+    const nextMessages = [...aiMessages, newMsg];
+    setAiMessages(nextMessages);
+    setAiInput('');
+    setIsLoadingAi(true);
+
+    try {
+      let contextData: any = undefined;
+      if (includeContextInAi) {
+        contextData = {
+          current_user: currentUser?.username,
+          active_tab: activeTab,
+          channels: channels.map(c => ({ id: c.id, name: c.name, type: c.type })),
+          memo_slots: memoSlots.map(m => ({ slot: m.slot_index, title: m.title, mode: m.mode })),
+          assignments: assignments.map(a => ({ title: a.title, subject: a.subject, deadline: a.deadline })),
+          weather: weather,
+          next_subject: nextSubject,
+        };
+      }
+
+      const res = await safeFetch(`${API_BASE_URL}/api/ai/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          messages: nextMessages.map(m => ({ role: m.role, content: m.content })),
+          contextData
+        })
+      });
+
+      const data = await res.json();
+      if (data.reply) {
+        setAiMessages(prev => [
+          ...prev,
+          {
+            id: Date.now() + 1,
+            role: 'model',
+            content: data.reply,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          }
+        ]);
+      }
+    } catch (err) {
+      console.error(err);
+      setAiMessages(prev => [
+        ...prev,
+        {
+          id: Date.now() + 1,
+          role: 'model',
+          content: '申し訳ありません。AIの応答中にエラーが発生しました。',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        }
+      ]);
+    } finally {
+      setIsLoadingAi(false);
+    }
+  };
+
+  // Memo AI Assistant Handler
+  const handleMemoAiAssist = async (type: 'summarize' | 'proofread' | 'explain_code' | 'continue') => {
+    if (!token || !memoContent.trim() || isMemoAiLoading) return;
+    setIsMemoAiLoading(true);
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/ai/memo-assist`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          content: memoContent,
+          type
+        })
+      });
+      const data = await res.json();
+      if (data.result) {
+        setMemoAiResultModal(data.result);
+      }
+    } catch (err) {
+      console.error('Memo AI error:', err);
+      alert('AIアシストの実行に失敗しました');
+    } finally {
+      setIsMemoAiLoading(false);
+    }
+  };
+
+  // VC Join / Leave with MediaStream and SpeechRecognition
+  const handleToggleVoiceChannel = async () => {
+    if (inVoiceChannel) {
+      if (localAudioStreamRef.current) {
+        localAudioStreamRef.current.getTracks().forEach(t => t.stop());
+        localAudioStreamRef.current = null;
+      }
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(t => t.stop());
+        screenStreamRef.current = null;
+      }
+      if (speechRecognitionRef.current) {
+        try { speechRecognitionRef.current.stop(); } catch {}
+        speechRecognitionRef.current = null;
+      }
+      setIsScreenSharing(false);
+      setInVoiceChannel(false);
+      setVcSubtitles('');
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'VC_LEAVE' }));
+      }
+    } else {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        localAudioStreamRef.current = stream;
+        setInVoiceChannel(true);
+        setIsMicMuted(false);
+
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'VC_JOIN' }));
+        }
+
+        // VC字幕化 (SpeechRecognition)
+        const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (SpeechRec) {
+          const rec = new SpeechRec();
+          rec.continuous = true;
+          rec.interimResults = true;
+          rec.lang = 'ja-JP';
+          rec.onresult = (e: any) => {
+            let transcript = '';
+            for (let i = e.resultIndex; i < e.results.length; i++) {
+              transcript += e.results[i][0].transcript;
+            }
+            setVcSubtitles(transcript);
+          };
+          rec.onerror = () => {};
+          try {
+            rec.start();
+            speechRecognitionRef.current = rec;
+          } catch {}
+        }
+      } catch (err) {
+        console.warn('Audio permission denied or device unavailable:', err);
+        setInVoiceChannel(true);
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'VC_JOIN' }));
+        }
+      }
+    }
+  };
+
+  const handleToggleScreenShare = async () => {
+    if (isScreenSharing) {
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(t => t.stop());
+        screenStreamRef.current = null;
+      }
+      setIsScreenSharing(false);
+    } else {
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        screenStreamRef.current = stream;
+        setIsScreenSharing(true);
+        if (screenVideoRef.current) {
+          screenVideoRef.current.srcObject = stream;
+        }
+        stream.getVideoTracks()[0].onended = () => {
+          setIsScreenSharing(false);
+          screenStreamRef.current = null;
+        };
+      } catch (err) {
+        console.warn('Screen share canceled or error:', err);
+      }
+    }
+  };
+
+  const handleToggleMicMute = () => {
+    const next = !isMicMuted;
+    setIsMicMuted(next);
+    if (localAudioStreamRef.current) {
+      localAudioStreamRef.current.getAudioTracks().forEach(t => {
+        t.enabled = !next;
+      });
+    }
+  };
+
+  const handleFetchTimetables = async () => {
+    if (!token) return;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/timetables?scheduleType=${scheduleType}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setTimetables(data);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleCreateTimetableEntry = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTtSubject.trim() || !token) return;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/timetables`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          dayOfWeek: newTtDay,
+          period: newTtPeriod,
+          subject: newTtSubject.trim(),
+          scheduleType
+        })
+      });
+      if (res.ok) {
+        setNewTtSubject('');
+        handleFetchTimetables();
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleDeleteTimetableEntry = async (id: number) => {
+    if (!token) return;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/timetables/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setTimetables(prev => prev.filter(t => t.id !== id));
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!token || !currentPasswordInput || !newPasswordInput) return;
@@ -1046,16 +1330,31 @@ export default function App() {
     // Draw strokes
     for (const stroke of strokes) {
       if (!stroke.points || stroke.points.length < 2) continue;
-      ctx.strokeStyle = stroke.color || '#f59e0b';
-      ctx.lineWidth = stroke.width || 3;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.beginPath();
-      ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-      for (let i = 1; i < stroke.points.length; i++) {
-        ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+      if (stroke.color === 'eraser') {
+        ctx.save();
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.lineWidth = stroke.width || 9;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        for (let i = 1; i < stroke.points.length; i++) {
+          ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+        }
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.strokeStyle = stroke.color || '#f59e0b';
+        ctx.lineWidth = stroke.width || 3;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        for (let i = 1; i < stroke.points.length; i++) {
+          ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
     }
 
     // Draw texts
@@ -1085,32 +1384,44 @@ export default function App() {
   };
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (boardMode !== 'draw') return;
+    if (boardMode !== 'draw' && boardMode !== 'eraser') return;
     const { x, y } = getCanvasCoords(e);
     setIsDrawing(true);
     setCurrentStrokePoints([{ x, y }]);
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!isDrawing || boardMode !== 'draw') return;
+    if (!isDrawing || (boardMode !== 'draw' && boardMode !== 'eraser')) return;
     const { x, y } = getCanvasCoords(e);
     const newPoints = [...currentStrokePoints, { x, y }];
     setCurrentStrokePoints(newPoints);
 
     const ctx = canvasRef.current?.getContext('2d');
     if (ctx && newPoints.length >= 2) {
-      ctx.strokeStyle = drawColor;
-      ctx.lineWidth = brushWidth;
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.moveTo(newPoints[newPoints.length - 2].x, newPoints[newPoints.length - 2].y);
-      ctx.lineTo(x, y);
-      ctx.stroke();
+      if (boardMode === 'eraser') {
+        ctx.save();
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.lineWidth = brushWidth * 3;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(newPoints[newPoints.length - 2].x, newPoints[newPoints.length - 2].y);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.strokeStyle = drawColor;
+        ctx.lineWidth = brushWidth;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(newPoints[newPoints.length - 2].x, newPoints[newPoints.length - 2].y);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+      }
     }
   };
 
   const handleCanvasMouseUp = async () => {
-    if (!isDrawing || boardMode !== 'draw') return;
+    if (!isDrawing || (boardMode !== 'draw' && boardMode !== 'eraser')) return;
     setIsDrawing(false);
 
     if (currentStrokePoints.length >= 2 && token) {
@@ -1122,8 +1433,8 @@ export default function App() {
             Authorization: `Bearer ${token}`
           },
           body: JSON.stringify({
-            color: drawColor,
-            width: brushWidth,
+            color: boardMode === 'eraser' ? 'eraser' : drawColor,
+            width: boardMode === 'eraser' ? brushWidth * 3 : brushWidth,
             points: currentStrokePoints
           })
         });
@@ -1167,7 +1478,7 @@ export default function App() {
 
   // タイムラプス再生 (履歴を最初から順次描画)
   const handlePlayTimelapse = () => {
-    if (boardStrokes.length === 0 || isTimelapsePlaying) return;
+    if ((boardStrokes.length === 0 && boardTexts.length === 0) || isTimelapsePlaying) return;
     setIsTimelapsePlaying(true);
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1180,24 +1491,43 @@ export default function App() {
     const interval = setInterval(() => {
       if (i >= boardStrokes.length) {
         clearInterval(interval);
+        // テキストも描画して終了
+        for (const t of boardTexts) {
+          ctx.font = '14px "JetBrains Mono", monospace';
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(t.text, t.x, t.y);
+        }
         setIsTimelapsePlaying(false);
-        redrawCanvas(boardStrokes, boardTexts);
         return;
       }
       const stroke = boardStrokes[i];
       if (stroke.points && stroke.points.length >= 2) {
-        ctx.strokeStyle = stroke.color || '#f59e0b';
-        ctx.lineWidth = stroke.width || 3;
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-        for (let p = 1; p < stroke.points.length; p++) {
-          ctx.lineTo(stroke.points[p].x, stroke.points[p].y);
+        if (stroke.color === 'eraser') {
+          ctx.save();
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.lineWidth = stroke.width || 9;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+          for (let p = 1; p < stroke.points.length; p++) {
+            ctx.lineTo(stroke.points[p].x, stroke.points[p].y);
+          }
+          ctx.stroke();
+          ctx.restore();
+        } else {
+          ctx.strokeStyle = stroke.color || '#f59e0b';
+          ctx.lineWidth = stroke.width || 3;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+          for (let p = 1; p < stroke.points.length; p++) {
+            ctx.lineTo(stroke.points[p].x, stroke.points[p].y);
+          }
+          ctx.stroke();
         }
-        ctx.stroke();
       }
       i++;
-    }, 120);
+    }, 100);
   };
 
   // Phase 4: Shared Clipboard Handlers
@@ -1391,9 +1721,12 @@ export default function App() {
         {/* Right Header Block */}
         <div className="flex items-center gap-2 sm:gap-3 font-mono text-xs">
           <button
-            onClick={() => setActiveTab('assignments')}
-            title="時間割 / 提出物に移動"
-            className="flex items-center gap-1.5 bg-amber-500/15 border border-amber-500/30 text-amber-300 px-2.5 py-1 rounded-lg hover:bg-amber-500/25 transition interactive-btn"
+            onClick={() => {
+              handleFetchTimetables();
+              setIsTimetableModalOpen(true);
+            }}
+            title="クリックで時間割・時程の管理を開く"
+            className="flex items-center gap-1.5 bg-amber-500/15 border border-amber-500/30 text-amber-300 px-2.5 py-1 rounded-lg hover:bg-amber-500/25 transition interactive-btn cursor-pointer"
           >
             <BookOpen className="w-3.5 h-3.5 text-amber-400" />
             <span className="font-bold">Next: {nextSubject.name}</span>
@@ -1496,7 +1829,7 @@ export default function App() {
                   <div className="space-y-2">
                     <div className="flex items-center justify-between gap-1 pt-1">
                       <button
-                        onClick={() => setIsMicMuted(!isMicMuted)}
+                        onClick={handleToggleMicMute}
                         className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
                           isMicMuted ? 'bg-red-950/40 border-red-800 text-red-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
                         }`}
@@ -1516,18 +1849,28 @@ export default function App() {
                       </button>
 
                       <button
-                        onClick={() => setIsScreenSharing(!isScreenSharing)}
+                        onClick={handleToggleScreenShare}
                         className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
-                          isScreenSharing ? 'bg-amber-500/20 border-amber-500/40 text-amber-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
+                          isScreenSharing ? 'bg-amber-500 text-black border-amber-400 font-bold' : 'bg-stone-800/80 border-stone-700 text-stone-200'
                         }`}
                         title="画面共有"
                       >
                         <Monitor className="w-3.5 h-3.5" />
                       </button>
+
+                      <button
+                        onClick={() => setIsTtsEnabled(!isTtsEnabled)}
+                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                          isTtsEnabled ? 'bg-amber-500/20 border-amber-500/40 text-amber-400' : 'bg-stone-800/80 border-stone-700 text-stone-400'
+                        }`}
+                        title="聞き専モード（チャット読み上げ）"
+                      >
+                        <Headphones className="w-3.5 h-3.5" />
+                      </button>
                     </div>
 
                     <button
-                      onClick={() => setInVoiceChannel(false)}
+                      onClick={handleToggleVoiceChannel}
                       className="w-full py-1 text-xs bg-red-950/50 hover:bg-red-900/60 border border-red-800/80 text-red-400 rounded-lg font-mono transition"
                     >
                       切断
@@ -1535,7 +1878,7 @@ export default function App() {
                   </div>
                 ) : (
                   <button
-                    onClick={() => setInVoiceChannel(true)}
+                    onClick={handleToggleVoiceChannel}
                     className="w-full py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg font-mono transition"
                   >
                     参加する
@@ -1587,6 +1930,32 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+              {/* 画面共有プレビュー */}
+              {isScreenSharing && (
+                <div className="p-3 bg-[#111214] border-b border-stone-800 flex flex-col items-center justify-center">
+                  <div className="w-full max-w-xl aspect-video bg-black rounded-xl overflow-hidden border border-stone-800 relative">
+                    <video
+                      ref={screenVideoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="w-full h-full object-contain"
+                    />
+                    <div className="absolute top-2 left-2 bg-black/70 backdrop-blur-sm text-[10px] font-mono px-2 py-0.5 rounded text-amber-400 border border-amber-500/30">
+                      LIVE 画面共有中
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* VC字幕化バー */}
+              {inVoiceChannel && vcSubtitles && (
+                <div className="px-4 py-2 bg-amber-500/10 border-b border-amber-500/20 text-xs font-mono text-amber-300 flex items-center gap-2">
+                  <Subtitles className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="truncate">{vcSubtitles}</span>
+                </div>
+              )}
 
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
                 {messages.filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
@@ -1902,6 +2271,37 @@ export default function App() {
                     <option value="monaco">Monaco Editor (専用枠)</option>
                   </select>
 
+                  {/* Memo AI Assistants */}
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => handleMemoAiAssist('summarize')}
+                      disabled={isMemoAiLoading || !memoContent.trim()}
+                      className="px-2.5 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 rounded-lg transition disabled:opacity-40 flex items-center gap-1 text-[11px]"
+                      title="メモの内容を要約"
+                    >
+                      <Sparkles className="w-3 h-3 text-amber-400" />
+                      <span>{isMemoAiLoading ? '要約中...' : 'AI要約'}</span>
+                    </button>
+                    <button
+                      onClick={() => handleMemoAiAssist('proofread')}
+                      disabled={isMemoAiLoading || !memoContent.trim()}
+                      className="px-2.5 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 rounded-lg transition disabled:opacity-40 flex items-center gap-1 text-[11px]"
+                      title="誤字脱字・表現の校正"
+                    >
+                      <CheckCircle2 className="w-3 h-3 text-amber-400" />
+                      <span>AI校正</span>
+                    </button>
+                    <button
+                      onClick={() => handleMemoAiAssist('explain_code')}
+                      disabled={isMemoAiLoading || !memoContent.trim()}
+                      className="px-2.5 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 rounded-lg transition disabled:opacity-40 flex items-center gap-1 text-[11px]"
+                      title="コードの解説"
+                    >
+                      <Bot className="w-3 h-3 text-amber-400" />
+                      <span>コード解説</span>
+                    </button>
+                  </div>
+
                   <button
                     onClick={handleSaveMemo}
                     disabled={isSavingMemo || isMonacoLocked}
@@ -1955,29 +2355,109 @@ export default function App() {
 
         {/* TAB 3: AI (Gemini Console) */}
         {activeTab === 'ai' && (
-          <div className="flex-1 p-6 flex flex-col items-center justify-center">
-            <div className="max-w-2xl w-full bg-[#111214] border border-stone-800/80 rounded-3xl p-8 text-center interactive-card">
-              <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-400 flex items-center justify-center mx-auto mb-4">
-                <Bot className="w-8 h-8" />
+          <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#0C0D10]/50">
+            {/* Header / Config Bar */}
+            <div className="h-12 border-b border-stone-800/80 px-4 flex items-center justify-between font-mono text-xs bg-[#111214]">
+              <div className="flex items-center gap-2">
+                <Bot className="w-4 h-4 text-amber-400" />
+                <span className="font-bold text-white">Gemini AI Console</span>
+                <span className="text-[10px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/60 px-2 py-0.5 rounded-full">
+                  キープール稼働中
+                </span>
               </div>
-              <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white mb-2">Gemini AI キープール連携</h2>
-              <p className="text-stone-400 text-xs font-mono mb-6 leading-relaxed">
-                複数のGemini APIキーを自動ローテーション管理。レートリミットを回避しながら提出物の自動要約やアドバイスを生成します。
-              </p>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-left font-mono text-xs">
-                <div className="p-3 bg-[#16181D] border border-stone-800 rounded-xl">
-                  <div className="text-amber-400 font-bold mb-1">💬 チャット連動</div>
-                  <div className="text-stone-400">@gemini や /ai でリアルタイムにチャット内で自動返信</div>
-                </div>
-                <div className="p-3 bg-[#16181D] border border-stone-800 rounded-xl">
-                  <div className="text-amber-400 font-bold mb-1">📝 提出物要約</div>
-                  <div className="text-stone-400">長い課題指示文を重要ポイント・持ち物・締切にJSON要約</div>
-                </div>
-                <div className="p-3 bg-[#16181D] border border-stone-800 rounded-xl">
-                  <div className="text-amber-400 font-bold mb-1">📊 テスト分析</div>
-                  <div className="text-stone-400">各教科の得点傾向からAIが学習アドバイスを提供</div>
-                </div>
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-1.5 cursor-pointer text-stone-400 hover:text-stone-200">
+                  <input
+                    type="checkbox"
+                    checked={includeContextInAi}
+                    onChange={e => setIncludeContextInAi(e.target.checked)}
+                    className="accent-amber-500 rounded"
+                  />
+                  <span className="text-[11px]">システム情報(JSON)を渡す</span>
+                </label>
+                <button
+                  onClick={() => setAiMessages([{
+                    id: Date.now(),
+                    role: 'model',
+                    content: '会話履歴をリセットしました。何かお手伝いできることはありますか？',
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                  }])}
+                  className="p-1 hover:text-amber-400 text-stone-500 rounded transition"
+                  title="履歴をクリア"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                </button>
               </div>
+            </div>
+
+            {/* AI Messages Stream */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-4xl w-full mx-auto">
+              {aiMessages.map(msg => (
+                <div
+                  key={msg.id}
+                  className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  {msg.role === 'model' && (
+                    <div className="w-7 h-7 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0 mt-0.5">
+                      <Bot className="w-4 h-4" />
+                    </div>
+                  )}
+                  <div
+                    className={`max-w-2xl rounded-2xl p-4 text-xs font-mono leading-relaxed shadow-lg ${
+                      msg.role === 'user'
+                        ? 'bg-amber-500 text-black font-semibold'
+                        : 'bg-[#14161C] border border-stone-800/80 text-stone-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-4 mb-1.5 opacity-60 text-[10px]">
+                      <span>{msg.role === 'user' ? 'あなた' : 'Gemini AI'}</span>
+                      <span>{msg.timestamp}</span>
+                    </div>
+                    {msg.role === 'user' ? (
+                      <div className="whitespace-pre-wrap">{msg.content}</div>
+                    ) : (
+                      <div className="prose prose-invert prose-xs max-w-none">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {isLoadingAi && (
+                <div className="flex gap-3 justify-start">
+                  <div className="w-7 h-7 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0 mt-0.5">
+                    <Bot className="w-4 h-4 animate-spin" />
+                  </div>
+                  <div className="bg-[#14161C] border border-stone-800/80 rounded-2xl p-4 text-xs font-mono text-stone-400 flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-amber-400 animate-pulse" />
+                    <span>Geminiが回答を生成中...</span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Input Form */}
+            <div className="p-4 border-t border-stone-800/80 bg-[#111214]">
+              <form onSubmit={handleSendAiMessage} className="max-w-4xl mx-auto flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Geminiに質問を入力 (例: 次の数学のテスト対策どうすればいい？、この課題の要約して)..."
+                  value={aiInput}
+                  onChange={e => setAiInput(e.target.value)}
+                  disabled={isLoadingAi}
+                  className="flex-1 bg-[#16181D] border border-stone-800 rounded-xl px-4 py-2.5 text-xs text-stone-200 font-mono focus:outline-none focus:border-amber-500/50"
+                />
+                <button
+                  type="submit"
+                  disabled={isLoadingAi || !aiInput.trim()}
+                  className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-bold rounded-xl text-xs font-mono transition flex items-center gap-1.5"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>送信</span>
+                </button>
+              </form>
             </div>
           </div>
         )}
@@ -2191,6 +2671,16 @@ export default function App() {
                 </button>
 
                 <button
+                  onClick={() => setBoardMode('eraser')}
+                  className={`px-3 py-1.5 rounded-xl flex items-center gap-1.5 transition ${
+                    boardMode === 'eraser' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
+                  }`}
+                >
+                  <Eraser className="w-3.5 h-3.5" />
+                  <span>消しゴム</span>
+                </button>
+
+                <button
                   onClick={() => setBoardMode('text')}
                   className={`px-3 py-1.5 rounded-xl flex items-center gap-1.5 transition ${
                     boardMode === 'text' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
@@ -2199,22 +2689,26 @@ export default function App() {
                   <span>付箋/文章</span>
                 </button>
 
-                {boardMode === 'draw' && (
+                {(boardMode === 'draw' || boardMode === 'eraser') && (
                   <div className="flex items-center gap-2 pl-2 border-l border-stone-800">
-                    <span className="text-stone-500">Color:</span>
-                    {['#f59e0b', '#ef4444', '#10b981', '#3b82f6', '#ffffff'].map(c => (
-                      <button
-                        key={c}
-                        onClick={() => setDrawColor(c)}
-                        style={{ backgroundColor: c }}
-                        className={`w-5 h-5 rounded-full border-2 transition ${
-                          drawColor === c ? 'border-white scale-110' : 'border-transparent'
-                        }`}
-                      />
-                    ))}
+                    {boardMode === 'draw' && (
+                      <>
+                        <span className="text-stone-500">Color:</span>
+                        {['#f59e0b', '#ef4444', '#10b981', '#3b82f6', '#ffffff'].map(c => (
+                          <button
+                            key={c}
+                            onClick={() => setDrawColor(c)}
+                            style={{ backgroundColor: c }}
+                            className={`w-5 h-5 rounded-full border-2 transition ${
+                              drawColor === c ? 'border-white scale-110' : 'border-transparent'
+                            }`}
+                          />
+                        ))}
+                      </>
+                    )}
 
                     <span className="text-stone-500 ml-2">Size:</span>
-                    {[2, 4, 8].map(w => (
+                    {[2, 4, 8, 16].map(w => (
                       <button
                         key={w}
                         onClick={() => setBrushWidth(w)}
@@ -2768,6 +3262,180 @@ export default function App() {
                   <span className="text-stone-500 text-[10px]">{cmd.desc}</span>
                 </button>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 時間割管理モーダル (ヘッダーの「次の教科」クリック時など) */}
+      {isTimetableModalOpen && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div 
+            onClick={e => e.stopPropagation()} 
+            className="w-full max-w-2xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs max-h-[90vh] flex flex-col"
+          >
+            <div className="p-4 border-b border-stone-800 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <BookOpen className="w-4 h-4 text-amber-400" />
+                <span className="font-bold text-white text-sm">時間割・時程の管理</span>
+              </div>
+              <button 
+                onClick={() => setIsTimetableModalOpen(false)}
+                className="text-stone-500 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-4 overflow-y-auto flex-1">
+              {/* 時程選択 */}
+              <div className="flex items-center gap-2 bg-[#16181D] border border-stone-800 p-2.5 rounded-xl">
+                <span className="text-stone-400 font-bold">時程タイプ:</span>
+                <div className="flex gap-1.5 flex-1">
+                  {[
+                    { id: 'normal', label: '通常時程' },
+                    { id: 'short', label: '短縮時程' },
+                    { id: 's_short', label: 'S短時程' }
+                  ].map(t => (
+                    <button
+                      key={t.id}
+                      onClick={() => setScheduleType(t.id as any)}
+                      className={`px-3 py-1 rounded-lg border transition ${
+                        scheduleType === t.id
+                          ? 'bg-amber-500 text-black font-bold border-amber-500'
+                          : 'border-stone-800 text-stone-400 hover:text-white'
+                      }`}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* 時間割登録フォーム */}
+              <form onSubmit={handleCreateTimetableEntry} className="bg-[#16181D] border border-stone-800 p-3 rounded-xl space-y-3">
+                <div className="text-[11px] font-bold text-stone-300">新しいコマを登録</div>
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="text-[10px] text-stone-500 block mb-1">曜日</label>
+                    <select
+                      value={newTtDay}
+                      onChange={e => setNewTtDay(Number(e.target.value))}
+                      className="w-full bg-[#111214] border border-stone-800 rounded-lg px-2 py-1.5 text-white focus:outline-none"
+                    >
+                      <option value={1}>月曜日</option>
+                      <option value={2}>火曜日</option>
+                      <option value={3}>水曜日</option>
+                      <option value={4}>木曜日</option>
+                      <option value={5}>金曜日</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-stone-500 block mb-1">時限</label>
+                    <select
+                      value={newTtPeriod}
+                      onChange={e => setNewTtPeriod(Number(e.target.value))}
+                      className="w-full bg-[#111214] border border-stone-800 rounded-lg px-2 py-1.5 text-white focus:outline-none"
+                    >
+                      {[1, 2, 3, 4, 5, 6, 7].map(p => (
+                        <option key={p} value={p}>{p}限</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-stone-500 block mb-1">教科名</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="数学、物理など"
+                      value={newTtSubject}
+                      onChange={e => setNewTtSubject(e.target.value)}
+                      className="w-full bg-[#111214] border border-stone-800 rounded-lg px-2 py-1.5 text-white focus:outline-none"
+                    />
+                  </div>
+                </div>
+                <button
+                  type="submit"
+                  className="w-full py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition"
+                >
+                  コマを追加
+                </button>
+              </form>
+
+              {/* 登録済み時間割一覧 */}
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-stone-300">登録済みコマ一覧 ({scheduleType})</div>
+                {timetables.length === 0 ? (
+                  <div className="text-center py-6 text-stone-600">登録されたコマはありません</div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {timetables.map((tt: any) => {
+                      const dayNames = ['', '月', '火', '水', '木', '金'];
+                      return (
+                        <div key={tt.id} className="flex items-center justify-between p-2.5 bg-[#16181D] border border-stone-800 rounded-xl">
+                          <div className="flex items-center gap-2">
+                            <span className="w-6 h-6 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 flex items-center justify-center font-bold">
+                              {dayNames[tt.day_of_week] || '月'}
+                            </span>
+                            <span className="text-stone-400">{tt.period}限</span>
+                            <span className="text-white font-bold">{tt.subject}</span>
+                          </div>
+                          <button
+                            onClick={() => handleDeleteTimetableEntry(tt.id)}
+                            className="p-1 text-stone-500 hover:text-red-400 transition"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* メモAI処理結果モーダル */}
+      {memoAiResultModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div 
+            onClick={e => e.stopPropagation()} 
+            className="w-full max-w-xl bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[80vh]"
+          >
+            <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-amber-500/10">
+              <div className="flex items-center gap-2 text-amber-300 font-bold">
+                <Sparkles className="w-4 h-4 text-amber-400" />
+                <span>Gemini AI による処理結果</span>
+              </div>
+              <button 
+                onClick={() => setMemoAiResultModal(null)}
+                className="text-stone-500 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 text-stone-200 whitespace-pre-wrap leading-relaxed select-text">
+              {memoAiResultModal}
+            </div>
+            <div className="p-3 border-t border-stone-800 flex justify-end gap-2 bg-[#16181D]">
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(memoAiResultModal);
+                  alert('クリップボードにコピーしました！');
+                }}
+                className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-white rounded-lg transition flex items-center gap-1.5"
+              >
+                <Copy className="w-3.5 h-3.5 text-amber-400" />
+                <span>結果をコピー</span>
+              </button>
+              <button
+                onClick={() => setMemoAiResultModal(null)}
+                className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition"
+              >
+                閉じる
+              </button>
             </div>
           </div>
         </div>
