@@ -4,11 +4,11 @@ services:
     name: asdfbase
     env: node
     plan: free
+    rootDir: frontend
     buildCommand: npm install && npm run build
     startCommand: npm run start
     envVars:
       - key: NODE_ENV
         value: production
-      - key: BACKEND_INTERNAL_URL
-        # Cloudflare Tunnel経由の内部APIエンドポイントまたはVPSプロキシURL
-        value: http://127.0.0.1:8091
+      - key: BACKEND_TARGET
+        value: https://api-asdf.rds9.net

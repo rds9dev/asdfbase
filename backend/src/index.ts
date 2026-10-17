@@ -194,6 +194,46 @@ app.get('/api/channels', authMiddleware, async (req, res) => {
   }
 });
 
+app.post('/api/channels', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { name, type } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'チャンネル名を入力してください' });
+    }
+    const cleanName = name.trim().toLowerCase().replace(/\s+/g, '-');
+    const chType = type === 'voice' ? 'voice' : 'text';
+
+    const result = await pool.query(
+      `INSERT INTO channels (name, type) VALUES ($1, $2) RETURNING *`,
+      [cleanName, chType]
+    );
+    const newChannel = result.rows[0];
+    broadcast({ type: 'CHANNEL_CREATED', payload: newChannel });
+    res.json(newChannel);
+  } catch (err) {
+    console.error('Channel create error:', err);
+    res.status(500).json({ error: 'チャンネル作成に失敗しました' });
+  }
+});
+
+app.delete('/api/channels/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    // Don't allow deleting id 1 or last channel
+    const countRes = await pool.query(`SELECT COUNT(*) FROM channels`);
+    if (parseInt(countRes.rows[0].count, 10) <= 1) {
+      return res.status(400).json({ error: '最後のチャンネルは削除できません' });
+    }
+
+    await pool.query(`DELETE FROM channels WHERE id = $1`, [id]);
+    broadcast({ type: 'CHANNEL_DELETED', payload: { id } });
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('Channel delete error:', err);
+    res.status(500).json({ error: 'チャンネル削除に失敗しました' });
+  }
+});
+
 // Messages API
 app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) => {
   try {
@@ -213,7 +253,62 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
   }
 });
 
-// Post Message with AI @gemini & /ai command support
+app.delete('/api/messages/:messageId', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId, 10);
+    const userId = req.user!.id;
+    const userRole = req.user!.role;
+
+    const msgRes = await pool.query(`SELECT * FROM messages WHERE id = $1`, [messageId]);
+    if (msgRes.rows.length === 0) {
+      return res.status(404).json({ error: 'メッセージが見つかりません' });
+    }
+
+    const msg = msgRes.rows[0];
+    if (userRole !== 'admin' && msg.user_id !== userId) {
+      return res.status(403).json({ error: '削除権限がありません' });
+    }
+
+    await pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
+    broadcast({ type: 'MESSAGE_DELETED', payload: { messageId, channelId: msg.channel_id } });
+    res.json({ success: true, messageId });
+  } catch (err) {
+    console.error('Message delete error:', err);
+    res.status(500).json({ error: 'メッセージ削除エラー' });
+  }
+});
+
+app.put('/api/messages/:messageId', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId, 10);
+    const { content } = req.body;
+    const userId = req.user!.id;
+
+    const msgRes = await pool.query(`SELECT * FROM messages WHERE id = $1`, [messageId]);
+    if (msgRes.rows.length === 0) {
+      return res.status(404).json({ error: 'メッセージが見つかりません' });
+    }
+
+    const msg = msgRes.rows[0];
+    if (msg.user_id !== userId) {
+      return res.status(403).json({ error: '編集権限がありません' });
+    }
+
+    const updated = await pool.query(
+      `UPDATE messages SET content = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [content, messageId]
+    );
+
+    const updatedMessage = { ...updated.rows[0], sender_username: req.user!.username };
+    broadcast({ type: 'MESSAGE_UPDATED', payload: updatedMessage });
+    res.json(updatedMessage);
+  } catch (err) {
+    console.error('Message update error:', err);
+    res.status(500).json({ error: 'メッセージ編集エラー' });
+  }
+});
+
+// Post Message with AI @gemini mention support (commands like /ai removed)
 app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const channelId = parseInt(req.params.channelId, 10);
@@ -241,13 +336,13 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
       }).catch(err => console.error('Discord webhook relay error:', err));
     }
 
-    // Check for @gemini or /ai trigger
+    // Check for @gemini mention trigger
     const trimmed = content.trim();
-    if (trimmed.startsWith('/ai') || trimmed.includes('@gemini')) {
-      const prompt = trimmed.replace('/ai', '').replace('@gemini', '').trim();
+    if (trimmed.includes('@gemini')) {
+      const prompt = trimmed.replace(/@gemini/g, '').trim();
       if (prompt) {
         setTimeout(async () => {
-          const aiResponse = await askGemini(prompt, 'あなたはasdfbaseのアシスタントAIです。簡潔で的確に回答してください。');
+          const aiResponse = await askGemini(prompt, '簡潔に答えてください。');
           const botResult = await pool.query(
             `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
              VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
@@ -636,6 +731,91 @@ app.get('/api/audit-logs', authMiddleware, async (req, res) => {
   }
 });
 
+app.post('/api/audit-logs/:id/restore', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const logRes = await pool.query(`SELECT * FROM audit_logs WHERE id = $1`, [id]);
+    if (logRes.rows.length === 0) {
+      return res.status(404).json({ error: 'ログが見つかりません' });
+    }
+
+    const log = logRes.rows[0];
+    if (!log.can_restore || log.restored) {
+      return res.status(400).json({ error: '復元できないか、すでに復元済みです' });
+    }
+
+    if (log.target_type === 'note' && log.details) {
+      const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
+      if (details.slot_index) {
+        await pool.query(
+          `UPDATE notes SET title = $1, content = $2, updated_at = NOW() WHERE slot_index = $3`,
+          [details.title || '復元メモ', details.content || '', details.slot_index]
+        );
+      }
+    } else if (log.target_type === 'assignment' && log.details) {
+      const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
+      await pool.query(
+        `INSERT INTO assignments (title, subject, description, deadline) VALUES ($1, $2, $3, $4)`,
+        [details.title, details.subject, details.description, details.deadline || new Date()]
+      );
+    }
+
+    await pool.query(`UPDATE audit_logs SET restored = TRUE WHERE id = $1`, [id]);
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('Restore error:', err);
+    res.status(500).json({ error: '復元に失敗しました' });
+  }
+});
+
+// Discord Webhook Test & Relay
+app.post('/api/webhook/test', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { webhookUrl } = req.body;
+    const targetUrl = webhookUrl || DISCORD_WEBHOOK_URL;
+    if (!targetUrl) {
+      return res.status(400).json({ error: 'Discord Webhook URLが指定されていません' });
+    }
+
+    const response = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'asdfbase Notification',
+        content: `【asdfbase 通知テスト】ユーザー: ${req.user!.username} より通知テストが送信されました。`,
+      }),
+    });
+
+    if (!response.ok) {
+      return res.status(400).json({ error: 'Discordへの送信に失敗しました' });
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || '送信エラー' });
+  }
+});
+
+// Change Password
+app.post('/api/auth/change-password', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const userId = req.user!.id;
+
+    const userRes = await pool.query(`SELECT password_hash FROM users WHERE id = $1`, [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+
+    const isMatch = await bcrypt.compare(currentPassword, userRes.rows[0].password_hash);
+    if (!isMatch) return res.status(400).json({ error: '現在のパスワードが正しくありません' });
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await pool.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [newHash, userId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'パスワード変更エラー' });
+  }
+});
+
 app.get('/api/users', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -644,6 +824,39 @@ app.get('/api/users', authMiddleware, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'ユーザー一覧取得エラー' });
+  }
+});
+
+// Delete user account (self or admin)
+app.delete('/api/users/:userId', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const targetUserId = parseInt(req.params.userId, 10);
+    const requesterId = req.user!.id;
+    const requesterRole = req.user!.role;
+
+    if (requesterRole !== 'admin' && requesterId !== targetUserId) {
+      return res.status(403).json({ error: 'アカウント削除の権限がありません' });
+    }
+
+    // Check if target is admin
+    const targetUser = await pool.query(`SELECT id, username, role FROM users WHERE id = $1`, [targetUserId]);
+    if (targetUser.rows.length === 0) {
+      return res.status(404).json({ error: 'ユーザーが見つかりません' });
+    }
+
+    if (targetUser.rows[0].role === 'admin') {
+      const adminCount = await pool.query(`SELECT COUNT(*) FROM users WHERE role = 'admin'`);
+      if (parseInt(adminCount.rows[0].count, 10) <= 1) {
+        return res.status(400).json({ error: '最後の管理者は削除できません' });
+      }
+    }
+
+    await pool.query(`DELETE FROM users WHERE id = $1`, [targetUserId]);
+    broadcast({ type: 'USER_DELETED', payload: { userId: targetUserId } });
+    res.json({ success: true, userId: targetUserId });
+  } catch (err) {
+    console.error('User delete error:', err);
+    res.status(500).json({ error: 'アカウント削除に失敗しました' });
   }
 });
 
@@ -708,11 +921,11 @@ wss.on('connection', (ws: WebSocket) => {
 
         // Handle AI reply via WS
         const trimmed = content.trim();
-        if (trimmed.startsWith('/ai') || trimmed.includes('@gemini')) {
-          const prompt = trimmed.replace('/ai', '').replace('@gemini', '').trim();
+        if (trimmed.includes('@gemini')) {
+          const prompt = trimmed.replace(/@gemini/g, '').trim();
           if (prompt) {
             setTimeout(async () => {
-              const aiResponse = await askGemini(prompt, 'あなたはasdfbaseのアシスタントAIです。簡潔で的確に回答してください。');
+              const aiResponse = await askGemini(prompt, '簡潔に答えてください。');
               const botResult = await pool.query(
                 `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
                  VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
@@ -725,6 +938,66 @@ wss.on('connection', (ws: WebSocket) => {
             }, 100);
           }
         }
+      }
+
+      // Realtime text/markdown note sync
+      if (msg.type === 'NOTE_CONTENT_SYNC') {
+        const { slotIndex, content, title } = msg;
+        broadcast({
+          type: 'NOTE_CONTENT_SYNC',
+          payload: { slotIndex, content, title, senderId: clientInfo.userId, senderUsername: clientInfo.username },
+        }, ws);
+      }
+
+      // WebRTC Signaling for Voice Chat & Screen Share
+      if (msg.type === 'WEBRTC_SIGNAL') {
+        const { targetUserId, signal, channelId } = msg;
+        // Direct to target user
+        for (const [targetWs, info] of clients.entries()) {
+          if (info.userId === targetUserId && targetWs.readyState === WebSocket.OPEN) {
+            targetWs.send(JSON.stringify({
+              type: 'WEBRTC_SIGNAL',
+              payload: {
+                fromUserId: clientInfo.userId,
+                fromUsername: clientInfo.username,
+                signal,
+                channelId,
+              }
+            }));
+            break;
+          }
+        }
+      }
+
+      if (msg.type === 'VC_JOIN') {
+        const { channelId } = msg;
+        broadcast({
+          type: 'VC_USER_JOINED',
+          payload: { userId: clientInfo.userId, username: clientInfo.username, channelId }
+        });
+      }
+
+      if (msg.type === 'VC_LEAVE') {
+        const { channelId } = msg;
+        broadcast({
+          type: 'VC_USER_LEFT',
+          payload: { userId: clientInfo.userId, username: clientInfo.username, channelId }
+        });
+      }
+
+      if (msg.type === 'VC_STATE_CHANGE') {
+        const { channelId, isMuted, isDeafened, isScreenSharing } = msg;
+        broadcast({
+          type: 'VC_STATE_CHANGED',
+          payload: {
+            userId: clientInfo.userId,
+            username: clientInfo.username,
+            channelId,
+            isMuted,
+            isDeafened,
+            isScreenSharing,
+          }
+        });
       }
 
       if (msg.type === 'SET_STATUS') {

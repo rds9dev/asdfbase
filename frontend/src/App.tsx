@@ -1,5 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
+  Volume2,
+  VolumeX,
+  MicOff,
+  Monitor,
+  Search,
+  Edit3,
+  X,
+  ChevronRight,
+  ChevronLeft,
+  Bell,
+  BellOff,
+  Key,
+  
   CloudSun, 
   CalendarClock, 
   BookOpen, 
@@ -112,6 +125,45 @@ export default function App() {
   const [weather, setWeather] = useState<{ temp: number; desc: string }>({ temp: 21, desc: '晴れ' });
   const [nextSubject, setNextSubject] = useState<{ name: string; time: string }>({ name: '数学', time: '10:45~' });
   const [showCamera, setShowCamera] = useState<boolean>(false);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [cameraError, setCameraError] = useState<string>('');
+
+  // Voice Chat (VC) State
+  const [inVoiceChannel, setInVoiceChannel] = useState<boolean>(false);
+  const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
+  const [isDeafened, setIsDeafened] = useState<boolean>(false);
+  const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false);
+  const [vcSubtitles, setVcSubtitles] = useState<string>('');
+  const [activeVcUsers, setActiveVcUsers] = useState<{ userId: number; username: string; isMuted?: boolean; isScreenSharing?: boolean }[]>([]);
+
+  // Chat UI State (Mention, Search, Edit, Member Panel)
+  const [chatSearchQuery, setChatSearchQuery] = useState('');
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
+  const [editingContent, setEditingContent] = useState('');
+  const [replyToMessage, setReplyToMessage] = useState<Message | null>(null);
+  const [showMentionSuggestions, setShowMentionSuggestions] = useState(false);
+  const [mentionFilter, setMentionFilter] = useState('');
+  const [isMembersCollapsed, setIsMembersCollapsed] = useState(false);
+  const [isNewChannelModalOpen, setIsNewChannelModalOpen] = useState(false);
+  const [newChannelName, setNewChannelName] = useState('');
+  const [newChannelType, setNewChannelType] = useState<'text' | 'voice'>('text');
+
+  // Settings State (Account, Notifications, Webhook, Audit Logs)
+  const [settingsSection, setSettingsSection] = useState<'account' | 'notifications' | 'webhook' | 'audit'>('account');
+  const [currentPasswordInput, setCurrentPasswordInput] = useState('');
+  const [newPasswordInput, setNewPasswordInput] = useState('');
+  const [passwordChangeStatus, setPasswordChangeStatus] = useState('');
+  const [isNotificationEnabled, setIsNotificationEnabled] = useState(true);
+  const [webhookUrlInput, setWebhookUrlInput] = useState('');
+  const [webhookStatus, setWebhookStatus] = useState('');
+  const [auditLogs, setAuditLogs] = useState<any[]>([]);
+
+  // Timetable Customization & Live Class State
+  const [isClassActive, setIsClassActive] = useState<boolean>(false);
+  const [classStartTime, setClassStartTime] = useState<string>('');
+  const [memoSearchQuery, setMemoSearchQuery] = useState('');
 
   // Auth Form State
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
@@ -186,6 +238,30 @@ export default function App() {
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
   const [calcResult, setCalcResult] = useState<string | null>(null);
+
+  
+  // Camera Stream Toggle
+  useEffect(() => {
+    if (showCamera) {
+      setCameraError('');
+      navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false })
+        .then(stream => {
+          setCameraStream(stream);
+          if (cameraVideoRef.current) {
+            cameraVideoRef.current.srcObject = stream;
+          }
+        })
+        .catch(err => {
+          console.warn('Camera access denied or unavailable:', err);
+          setCameraError('カメラが利用できないか許可されていません');
+        });
+    } else {
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(track => track.stop());
+        setCameraStream(null);
+      }
+    }
+  }, [showCamera]);
 
   // WebSocket Ref
   const wsRef = useRef<WebSocket | null>(null);
@@ -294,6 +370,25 @@ export default function App() {
         } else if (msg.type === 'CLIPBOARD_UPDATED') {
           setClipboardText(msg.payload.content);
           setClipboardUpdatedBy(msg.payload.updated_by);
+        } else if (msg.type === 'CHANNEL_CREATED') {
+          setChannels(prev => prev.some(c => c.id === msg.payload.id) ? prev : [...prev, msg.payload]);
+        } else if (msg.type === 'CHANNEL_DELETED') {
+          setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
+        } else if (msg.type === 'MESSAGE_DELETED') {
+          setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
+        } else if (msg.type === 'MESSAGE_UPDATED') {
+          setMessages(prev => prev.map(m => m.id === msg.payload.id ? { ...m, content: msg.payload.content } : m));
+        } else if (msg.type === 'NOTE_CONTENT_SYNC') {
+          if (msg.payload.slotIndex === selectedSlotIndex) {
+            setMemoContent(msg.payload.content);
+            if (msg.payload.title) setMemoTitle(msg.payload.title);
+          }
+        } else if (msg.type === 'USER_DELETED') {
+          setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
+        } else if (msg.type === 'VC_USER_JOINED') {
+          setActiveVcUsers(prev => prev.some(u => u.userId === msg.payload.userId) ? prev : [...prev, msg.payload]);
+        } else if (msg.type === 'VC_USER_LEFT') {
+          setActiveVcUsers(prev => prev.filter(u => u.userId !== msg.payload.userId));
         }
       } catch (err) {
         console.error('WS parse error:', err);
@@ -531,6 +626,189 @@ export default function App() {
     setTimeout(() => setCopiedLinkMessageId(null), 2000);
   };
 
+  const handleDeleteMessage = async (messageId: number) => {
+    if (!token) return;
+    try {
+      await fetch(`${API_BASE_URL}/api/messages/${messageId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setMessages(prev => prev.filter(m => m.id !== messageId));
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleEditMessage = async (messageId: number) => {
+    if (!token || !editingContent.trim()) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/messages/${messageId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ content: editingContent })
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setMessages(prev => prev.map(m => m.id === messageId ? { ...m, content: updated.content } : m));
+        setEditingMessageId(null);
+        setEditingContent('');
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleCreateChannel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newChannelName.trim() || !token) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/channels`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ name: newChannelName, type: newChannelType })
+      });
+      if (res.ok) {
+        const created = await res.json();
+        setChannels(prev => [...prev, created]);
+        setActiveChannelId(created.id);
+        setIsNewChannelModalOpen(false);
+        setNewChannelName('');
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleDeleteChannel = async (channelId: number) => {
+    if (!token || channels.length <= 1) return;
+    if (!confirm('このチャンネルを削除しますか？')) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/channels/${channelId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setChannels(prev => prev.filter(c => c.id !== channelId));
+        if (activeChannelId === channelId) {
+          const remaining = channels.filter(c => c.id !== channelId);
+          if (remaining.length > 0) setActiveChannelId(remaining[0].id);
+        }
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !currentPasswordInput || !newPasswordInput) return;
+    setPasswordChangeStatus('変更中...');
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/auth/change-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ currentPassword: currentPasswordInput, newPassword: newPasswordInput })
+      });
+      if (res.ok) {
+        setPasswordChangeStatus('パスワードを変更しました');
+        setCurrentPasswordInput('');
+        setNewPasswordInput('');
+      } else {
+        const d = await res.json();
+        setPasswordChangeStatus(d.error || '失敗しました');
+      }
+    } catch (err) {
+      setPasswordChangeStatus('通信エラー');
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!token || !currentUser) return;
+    if (!confirm('本当にアカウントを削除しますか？この操作は元に戻せません。')) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/users/${currentUser.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        handleLogout();
+      } else {
+        const d = await res.json();
+        alert(d.error || '削除できませんでした');
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleTestWebhook = async () => {
+    if (!token) return;
+    setWebhookStatus('テスト送信中...');
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/webhook/test`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ webhookUrl: webhookUrlInput })
+      });
+      if (res.ok) {
+        setWebhookStatus('Discordへ送信成功！');
+      } else {
+        const d = await res.json();
+        setWebhookStatus(d.error || '送信失敗');
+      }
+    } catch (err) {
+      setWebhookStatus('通信エラー');
+    }
+  };
+
+  const handleRestoreAuditLog = async (logId: number) => {
+    if (!token) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/audit-logs/${logId}/restore`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        alert('復元が完了しました');
+        fetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
+          .then(r => r.json())
+          .then(data => setAuditLogs(data))
+          .catch(console.error);
+      } else {
+        const d = await res.json();
+        alert(d.error || '復元に失敗しました');
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+
+  const handleMemoContentChange = (newVal: string) => {
+    setMemoContent(newVal);
+    // Realtime broadcast to other users
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'NOTE_CONTENT_SYNC',
+        slotIndex: selectedSlotIndex,
+        content: newVal,
+        title: memoTitle
+      }));
+    }
+  };
+
   const handleSaveMemo = async () => {
     if (!token) return;
     setIsSavingMemo(true);
@@ -722,30 +1000,32 @@ export default function App() {
     }
   }, [activeTab, boardStrokes, boardTexts, isTimelapsePlaying]);
 
+  const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY
+    };
+  };
+
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (boardMode !== 'draw') return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
+    const { x, y } = getCanvasCoords(e);
     setIsDrawing(true);
     setCurrentStrokePoints([{ x, y }]);
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!isDrawing || boardMode !== 'draw') return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
+    const { x, y } = getCanvasCoords(e);
     const newPoints = [...currentStrokePoints, { x, y }];
     setCurrentStrokePoints(newPoints);
 
-    const ctx = canvas.getContext('2d');
+    const ctx = canvasRef.current?.getContext('2d');
     if (ctx && newPoints.length >= 2) {
       ctx.strokeStyle = drawColor;
       ctx.lineWidth = brushWidth;
@@ -784,11 +1064,7 @@ export default function App() {
 
   const handleAddBoardText = async (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (boardMode !== 'text' || !newBoardText.trim() || !token) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const { x, y } = getCanvasCoords(e);
 
     try {
       await fetch(`${API_BASE_URL}/api/board/text`, {
@@ -1041,7 +1317,27 @@ export default function App() {
         </div>
 
         {/* Right Header Block */}
-        <div className="flex items-center gap-3 sm:gap-4 font-mono text-xs">
+        <div className="flex items-center gap-2 sm:gap-3 font-mono text-xs">
+          <button
+            onClick={() => setActiveTab('assignments')}
+            title="時間割 / 提出物に移動"
+            className="flex items-center gap-1.5 bg-amber-500/15 border border-amber-500/30 text-amber-300 px-2.5 py-1 rounded-lg hover:bg-amber-500/25 transition interactive-btn"
+          >
+            <BookOpen className="w-3.5 h-3.5 text-amber-400" />
+            <span className="font-bold">Next: {nextSubject.name}</span>
+            <span className="text-stone-400 text-[10px]">({nextSubject.time})</span>
+          </button>
+
+          <div className="flex items-center gap-1.5 text-stone-300 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70">
+            <CloudSun className="w-3.5 h-3.5 text-amber-400" />
+            <span>高松 {weather.temp}℃ ({weather.desc})</span>
+          </div>
+
+          <div className="hidden md:flex items-center gap-1.5 text-stone-400 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70">
+            <CalendarClock className="w-3.5 h-3.5 text-stone-500" />
+            <span>{currentTime || 'Loading...'}</span>
+          </div>
+
           <button
             onClick={() => setShowCamera(!showCamera)}
             title="カメラ小窓"
@@ -1052,26 +1348,6 @@ export default function App() {
             }`}
           >
             <Camera className="w-3.5 h-3.5" />
-          </button>
-
-          <div className="hidden md:flex items-center gap-1.5 text-stone-400 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70">
-            <CalendarClock className="w-3.5 h-3.5 text-stone-500" />
-            <span>{currentTime || 'Loading...'}</span>
-          </div>
-
-          <div className="flex items-center gap-1.5 text-stone-300 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70">
-            <CloudSun className="w-3.5 h-3.5 text-amber-400" />
-            <span>高松 {weather.temp}℃ ({weather.desc})</span>
-          </div>
-
-          <button
-            onClick={() => setActiveTab('assignments')}
-            title="時間割 / 提出物に移動"
-            className="flex items-center gap-1.5 bg-amber-500/15 border border-amber-500/30 text-amber-300 px-2.5 py-1 rounded-lg hover:bg-amber-500/25 transition interactive-btn"
-          >
-            <BookOpen className="w-3.5 h-3.5 text-amber-400" />
-            <span className="font-bold">Next: {nextSubject.name}</span>
-            <span className="text-stone-400 text-[10px]">({nextSubject.time})</span>
           </button>
 
           <button
@@ -1091,35 +1367,106 @@ export default function App() {
           <div className="flex-1 flex overflow-hidden">
             <aside className="w-56 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between">
               <div>
-                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold">
-                  Channels
+                <div className="flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold">
+                  <span>Channels</span>
+                  <button
+                    onClick={() => setIsNewChannelModalOpen(true)}
+                    className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800 transition"
+                    title="チャンネルを作成"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                  </button>
                 </div>
                 <div className="space-y-1">
                   {channels.map(ch => (
-                    <button
+                    <div
                       key={ch.id}
-                      onClick={() => setActiveChannelId(ch.id)}
-                      className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-mono transition text-left ${
+                      className={`group flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-mono transition ${
                         activeChannelId === ch.id
                           ? 'bg-amber-500/10 text-amber-400 font-bold border border-amber-500/30'
                           : 'text-stone-400 hover:bg-stone-900/60 hover:text-stone-200'
                       }`}
                     >
-                      <Hash className="w-3.5 h-3.5 text-stone-500" />
-                      <span>{ch.name}</span>
-                    </button>
+                      <button
+                        onClick={() => setActiveChannelId(ch.id)}
+                        className="flex items-center gap-2 flex-1 text-left truncate"
+                      >
+                        {ch.type === 'voice' ? <Mic className="w-3.5 h-3.5 text-stone-500" /> : <Hash className="w-3.5 h-3.5 text-stone-500" />}
+                        <span className="truncate">{ch.name}</span>
+                      </button>
+                      {channels.length > 1 && currentUser?.role === 'admin' && (
+                        <button
+                          onClick={() => handleDeleteChannel(ch.id)}
+                          className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600 transition"
+                          title="チャンネル削除"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
                   ))}
                 </div>
               </div>
 
-              <div className="bg-[#111214] border border-stone-800 rounded-xl p-2.5">
-                <div className="flex items-center justify-between text-[11px] font-mono text-stone-400 mb-1">
-                  <span className="flex items-center gap-1"><Mic className="w-3 h-3 text-emerald-400" /> VC & 画面共有</span>
-                  <span className="text-[9px] text-stone-500">VOICEVOX</span>
+              {/* VC コントロール & 画面共有 */}
+              <div className="bg-[#111214] border border-stone-800 rounded-xl p-2.5 space-y-2">
+                <div className="flex items-center justify-between text-[11px] font-mono text-stone-400">
+                  <span className="flex items-center gap-1.5 font-bold text-white">
+                    <Mic className={`w-3.5 h-3.5 ${inVoiceChannel ? 'text-emerald-400 animate-pulse' : 'text-stone-500'}`} />
+                    ボイスチャット
+                  </span>
+                  <span className="text-[10px] text-stone-500">{inVoiceChannel ? '接続中' : '未接続'}</span>
                 </div>
-                <button className="w-full py-1 text-[11px] bg-stone-800 hover:bg-stone-700 text-stone-300 rounded font-mono transition">
-                  /join vc1
-                </button>
+
+                {inVoiceChannel ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-1 pt-1">
+                      <button
+                        onClick={() => setIsMicMuted(!isMicMuted)}
+                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                          isMicMuted ? 'bg-red-950/40 border-red-800 text-red-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
+                        }`}
+                        title={isMicMuted ? 'ミュート解除' : 'マイクミュート'}
+                      >
+                        {isMicMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                      </button>
+
+                      <button
+                        onClick={() => setIsDeafened(!isDeafened)}
+                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                          isDeafened ? 'bg-red-950/40 border-red-800 text-red-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
+                        }`}
+                        title={isDeafened ? 'スピーカー有効化' : 'スピーカーミュート'}
+                      >
+                        {isDeafened ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                      </button>
+
+                      <button
+                        onClick={() => setIsScreenSharing(!isScreenSharing)}
+                        className={`p-2 rounded-lg border text-xs flex-1 flex items-center justify-center gap-1 transition ${
+                          isScreenSharing ? 'bg-amber-500/20 border-amber-500/40 text-amber-400' : 'bg-stone-800/80 border-stone-700 text-stone-200'
+                        }`}
+                        title="画面共有"
+                      >
+                        <Monitor className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    <button
+                      onClick={() => setInVoiceChannel(false)}
+                      className="w-full py-1 text-xs bg-red-950/50 hover:bg-red-900/60 border border-red-800/80 text-red-400 rounded-lg font-mono transition"
+                    >
+                      切断
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setInVoiceChannel(true)}
+                    className="w-full py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg font-mono transition"
+                  >
+                    参加する
+                  </button>
+                )}
               </div>
             </aside>
 
@@ -1130,23 +1477,57 @@ export default function App() {
                   <Hash className="w-4 h-4 text-amber-400" />
                   <span>{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
                 </div>
-                <div className="text-stone-500 text-[11px]">
-                  WebSocket + WebP圧縮 + @gemini自動応答 + Discord中継
+
+                <div className="flex items-center gap-2">
+                  {isSearchOpen ? (
+                    <div className="flex items-center gap-1.5 bg-[#16181D] border border-stone-800 px-2 py-1 rounded-lg">
+                      <Search className="w-3.5 h-3.5 text-stone-500" />
+                      <input
+                        type="text"
+                        autoFocus
+                        placeholder="メッセージを検索..."
+                        value={chatSearchQuery}
+                        onChange={e => setChatSearchQuery(e.target.value)}
+                        className="bg-transparent text-white focus:outline-none w-36 sm:w-48 text-[11px]"
+                      />
+                      <button onClick={() => { setIsSearchOpen(false); setChatSearchQuery(''); }} className="text-stone-500 hover:text-white">
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setIsSearchOpen(true)}
+                      className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white transition"
+                      title="検索"
+                    >
+                      <Search className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+
+                  <button
+                    onClick={() => setIsMembersCollapsed(!isMembersCollapsed)}
+                    className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white transition"
+                    title={isMembersCollapsed ? 'メンバー一覧を表示' : 'メンバー一覧を隠す'}
+                  >
+                    {isMembersCollapsed ? <ChevronLeft className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                  </button>
                 </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                {messages.length === 0 ? (
+                {messages.filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-stone-600 font-mono text-xs space-y-2">
                     <MessageSquare className="w-8 h-8 opacity-40 text-amber-400" />
-                    <p>メッセージはありません。@gemini や /ai コマンドでAIと会話できます。</p>
+                    <p>メッセージはありません。@gemini でAIと会話できます。</p>
                   </div>
                 ) : (
-                  messages.map((m) => (
+                  messages
+                    .filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase()))
+                    .map((m) => (
                     <div 
                       key={m.id} 
                       id={`msg-${m.id}`}
-                      className={`flex items-start gap-3 group relative p-1 rounded-xl transition ${
+                      className={`flex items-start gap-3 group relative p-1.5 rounded-xl transition ${
                         m.is_pinned ? 'bg-amber-500/5 border border-amber-500/20' : ''
                       }`}
                     >
@@ -1173,21 +1554,44 @@ export default function App() {
                           )}
                         </div>
 
-                        <div className={`text-sm rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed ${
-                          m.sender_username === 'Gemini' 
-                            ? 'bg-[#151720] border border-amber-500/30 text-amber-100' 
-                            : 'bg-[#111214] border border-stone-800/80 text-stone-300'
-                        }`}>
-                          {m.content.startsWith('![image]') ? (
-                            <img 
-                              src={m.content.match(/\((.*?)\)/)?.[1]} 
-                              alt="attachment" 
-                              className="max-h-72 rounded-lg object-contain my-1 border border-stone-800"
+                        {editingMessageId === m.id ? (
+                          <div className="flex items-center gap-2 mt-1">
+                            <input
+                              type="text"
+                              value={editingContent}
+                              onChange={e => setEditingContent(e.target.value)}
+                              className="flex-1 bg-[#16181D] border border-amber-500 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none"
                             />
-                          ) : (
-                            <span>{m.content}</span>
-                          )}
-                        </div>
+                            <button
+                              onClick={() => handleEditMessage(m.id)}
+                              className="px-2.5 py-1 bg-amber-500 text-black font-bold rounded-lg text-xs"
+                            >
+                              保存
+                            </button>
+                            <button
+                              onClick={() => setEditingMessageId(null)}
+                              className="px-2.5 py-1 bg-stone-800 text-stone-400 rounded-lg text-xs"
+                            >
+                              キャンセル
+                            </button>
+                          </div>
+                        ) : (
+                          <div className={`text-sm rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed ${
+                            m.sender_username === 'Gemini' 
+                              ? 'bg-[#151720] border border-amber-500/30 text-amber-100' 
+                              : 'bg-[#111214] border border-stone-800/80 text-stone-300'
+                          }`}>
+                            {m.content.startsWith('![image]') ? (
+                              <img 
+                                src={m.content.match(/\((.*?)\)/)?.[1]} 
+                                alt="attachment" 
+                                className="max-h-72 rounded-lg object-contain my-1 border border-stone-800"
+                              />
+                            ) : (
+                              <span>{m.content}</span>
+                            )}
+                          </div>
+                        )}
 
                         {m.reactions && Object.keys(m.reactions).length > 0 && (
                           <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
@@ -1238,6 +1642,26 @@ export default function App() {
                         >
                           {copiedLinkMessageId === m.id ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
                         </button>
+                        {(m.user_id === currentUser.id || currentUser.role === 'admin') && (
+                          <>
+                            {m.user_id === currentUser.id && (
+                              <button
+                                onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content); }}
+                                title="編集"
+                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
+                              >
+                                <Edit3 className="w-3 h-3" />
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleDeleteMessage(m.id)}
+                              title="削除"
+                              className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </>
+                        )}
                       </div>
                     </div>
                   ))
@@ -1245,56 +1669,94 @@ export default function App() {
                 <div ref={messagesEndRef} />
               </div>
 
-              <form onSubmit={handleSendMessage} className="p-3 border-t border-stone-800/80 bg-[#0C0D10]/50">
-                <div className="flex items-center gap-2 bg-[#14161C] border border-stone-800 rounded-xl px-3 py-2 focus-within:border-amber-500/60 transition">
-                  <input
-                    type="file"
-                    accept="image/*"
-                    ref={fileInputRef}
-                    onChange={handleImageUpload}
-                    className="hidden"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={isUploading}
-                    title="画像添付 (自動WebP圧縮)"
-                    className="p-1 rounded-lg text-stone-400 hover:text-amber-400 transition"
-                  >
-                    {isUploading ? <RefreshCw className="w-4 h-4 animate-spin text-amber-400" /> : <Image className="w-4 h-4" />}
-                  </button>
+              {/* Chat Input with @mention suggestions */}
+              <div className="relative p-3 border-t border-stone-800/80 bg-[#0C0D10]/50">
+                {showMentionSuggestions && (
+                  <div className="absolute bottom-full left-4 mb-2 w-64 bg-[#111214] border border-stone-800 rounded-xl shadow-2xl p-2 font-mono text-xs space-y-1 z-30">
+                    <div className="text-[10px] text-stone-500 uppercase px-2 font-bold">メンバー補完</div>
+                    {[{ id: 0, username: 'gemini' }, ...onlineUsers]
+                      .filter(u => u.username.toLowerCase().includes(mentionFilter.toLowerCase()))
+                      .map(u => (
+                        <button
+                          key={u.id}
+                          onClick={() => {
+                            const lastAt = chatInput.lastIndexOf('@');
+                            const prefix = chatInput.substring(0, lastAt);
+                            setChatInput(`${prefix}@${u.username} `);
+                            setShowMentionSuggestions(false);
+                          }}
+                          className="w-full px-2 py-1.5 rounded-lg flex items-center gap-2 hover:bg-stone-800 text-stone-300 hover:text-white transition text-left"
+                        >
+                          <span className="text-amber-400">@{u.username}</span>
+                        </button>
+                      ))}
+                  </div>
+                )}
 
-                  <input
-                    type="text"
-                    value={chatInput}
-                    onChange={e => setChatInput(e.target.value)}
-                    placeholder="メッセージを入力... (@gemini, /ai, /join vc1 等のコマンド対応)"
-                    className="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 font-mono"
-                  />
-                  <button
-                    type="submit"
-                    className="p-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black transition interactive-btn"
-                  >
-                    <Send className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </form>
+                <form onSubmit={handleSendMessage}>
+                  <div className="flex items-center gap-2 bg-[#14161C] border border-stone-800 rounded-xl px-3 py-2 focus-within:border-amber-500/60 transition">
+                    <input
+                      type="file"
+                      accept="image/*"
+                      ref={fileInputRef}
+                      onChange={handleImageUpload}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isUploading}
+                      title="画像添付 (自動WebP圧縮)"
+                      className="p-1 rounded-lg text-stone-400 hover:text-amber-400 transition"
+                    >
+                      {isUploading ? <RefreshCw className="w-4 h-4 animate-spin text-amber-400" /> : <Image className="w-4 h-4" />}
+                    </button>
+
+                    <input
+                      type="text"
+                      value={chatInput}
+                      onChange={e => {
+                        const val = e.target.value;
+                        setChatInput(val);
+                        const lastAt = val.lastIndexOf('@');
+                        if (lastAt !== -1 && !val.substring(lastAt).includes(' ')) {
+                          setShowMentionSuggestions(true);
+                          setMentionFilter(val.substring(lastAt + 1));
+                        } else {
+                          setShowMentionSuggestions(false);
+                        }
+                      }}
+                      placeholder="メッセージを入力... (@gemini でAI応答)"
+                      className="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 font-mono"
+                    />
+                    <button
+                      type="submit"
+                      className="p-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black transition interactive-btn"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </form>
+              </div>
             </section>
 
-            <aside className="w-52 border-l border-stone-800/80 bg-[#0C0D10] p-3 hidden lg:flex flex-col">
-              <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between">
-                <span>Members</span>
-                <span className="text-amber-400 font-normal">{onlineUsers.length}</span>
-              </div>
-              <div className="space-y-1">
-                {onlineUsers.map(u => (
-                  <div key={u.id} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-stone-900/60 text-xs font-mono text-stone-300">
-                    <span className={`w-2 h-2 rounded-full ${u.status === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-stone-600'}`} />
-                    <span className="truncate">{u.username}</span>
-                  </div>
-                ))}
-              </div>
-            </aside>
+            {/* Right: Members Sidebar (Collapsible) */}
+            {!isMembersCollapsed && (
+              <aside className="w-52 border-l border-stone-800/80 bg-[#0C0D10] p-3 hidden lg:flex flex-col">
+                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between">
+                  <span>Members</span>
+                  <span className="text-amber-400 font-normal">{onlineUsers.length}</span>
+                </div>
+                <div className="space-y-1">
+                  {onlineUsers.map(u => (
+                    <div key={u.id} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-stone-900/60 text-xs font-mono text-stone-300">
+                      <span className={`w-2 h-2 rounded-full ${u.status === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-stone-600'}`} />
+                      <span className="truncate">{u.username}</span>
+                    </div>
+                  ))}
+                </div>
+              </aside>
+            )}
           </div>
         )}
 
@@ -1391,14 +1853,14 @@ export default function App() {
                         fontFamily: "'JetBrains Mono', monospace",
                         automaticLayout: true,
                       }}
-                      onChange={val => setMemoContent(val || '')}
+                      onChange={val => handleMemoContentChange(val || '')}
                     />
                   </div>
                 ) : (
                   <div className="flex-1 flex gap-4 p-4 overflow-hidden">
                     <textarea
                       value={memoContent}
-                      onChange={e => setMemoContent(e.target.value)}
+                      onChange={e => handleMemoContentChange(e.target.value)}
                       placeholder="Markdownテキストを入力..."
                       className="flex-1 h-full bg-[#16181D] border border-stone-800 rounded-xl p-3.5 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
                     />
@@ -1889,41 +2351,289 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 7: 設定 */}
+        {/* TAB 7: 設定 (アカウント・通知・Webhook・監査ログ) */}
         {activeTab === 'settings' && (
           <div className="flex-1 p-6 overflow-y-auto">
             <div className="max-w-3xl mx-auto space-y-6">
-              <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">設定</h2>
-
-              <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
-                <div className="text-stone-400 uppercase font-bold tracking-wider">Account Information</div>
-                <div className="text-stone-200">ユーザー名: <span className="text-amber-400 font-bold">{currentUser.username}</span></div>
-                <div className="text-stone-200">権限: <span className="text-stone-400">{currentUser.role}</span></div>
-              </div>
-
-              <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
-                <div className="text-stone-400 uppercase font-bold tracking-wider">監査ログ & 復元</div>
-                <div className="space-y-2 text-stone-300">
-                  <div className="flex items-center justify-between border-b border-stone-800/60 pb-2">
-                    <span>2026/10/17 09:50 ユーザー登録 (by {currentUser.username})</span>
-                    <span className="text-stone-500">SYSTEM</span>
-                  </div>
+              <div className="flex items-center justify-between border-b border-stone-800/80 pb-4">
+                <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">設定</h2>
+                <div className="flex gap-1.5 font-mono text-xs bg-[#111214] p-1 rounded-xl border border-stone-800">
+                  {[
+                    { id: 'account', label: 'アカウント' },
+                    { id: 'notifications', label: '通知設定' },
+                    { id: 'webhook', label: 'Webhook' },
+                    { id: 'audit', label: '監査ログ' },
+                  ].map(sec => (
+                    <button
+                      key={sec.id}
+                      onClick={() => {
+                        setSettingsSection(sec.id as any);
+                        if (sec.id === 'audit' && token) {
+                          fetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
+                            .then(r => r.json())
+                            .then(data => setAuditLogs(data))
+                            .catch(console.error);
+                        }
+                      }}
+                      className={`px-3 py-1.5 rounded-lg transition ${
+                        settingsSection === sec.id
+                          ? 'bg-amber-500 text-black font-bold'
+                          : 'text-stone-400 hover:text-white'
+                      }`}
+                    >
+                      {sec.label}
+                    </button>
+                  ))}
                 </div>
               </div>
+
+              {/* 1. アカウント設定 */}
+              {settingsSection === 'account' && (
+                <div className="space-y-4">
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
+                    <div className="text-stone-400 uppercase font-bold tracking-wider">Account Information</div>
+                    <div className="text-stone-200">ユーザー名: <span className="text-amber-400 font-bold">{currentUser.username}</span></div>
+                    <div className="text-stone-200">権限: <span className="text-stone-400">{currentUser.role}</span></div>
+                  </div>
+
+                  {/* パスワード変更 */}
+                  <form onSubmit={handleChangePassword} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
+                    <div className="text-stone-400 uppercase font-bold tracking-wider flex items-center gap-1.5">
+                      <Key className="w-3.5 h-3.5 text-amber-400" /> パスワード変更
+                    </div>
+                    {passwordChangeStatus && (
+                      <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 text-amber-300 rounded-xl">
+                        {passwordChangeStatus}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <input
+                        type="password"
+                        required
+                        placeholder="現在のパスワード"
+                        value={currentPasswordInput}
+                        onChange={e => setCurrentPasswordInput(e.target.value)}
+                        className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                      />
+                      <input
+                        type="password"
+                        required
+                        placeholder="新しいパスワード"
+                        value={newPasswordInput}
+                        onChange={e => setNewPasswordInput(e.target.value)}
+                        className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition uppercase"
+                    >
+                      変更を保存
+                    </button>
+                  </form>
+
+                  {/* アカウント削除 */}
+                  <div className="bg-red-950/20 border border-red-900/40 rounded-2xl p-6 font-mono text-xs space-y-3">
+                    <div className="text-red-400 uppercase font-bold tracking-wider flex items-center gap-1.5">
+                      <ShieldAlert className="w-3.5 h-3.5 text-red-400" /> アカウント削除
+                    </div>
+                    <p className="text-stone-400">
+                      アカウントを削除すると、チャットやメモの割り当てを含むすべての権限が削除されます。
+                    </p>
+                    <button
+                      onClick={handleDeleteAccount}
+                      className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl transition uppercase"
+                    >
+                      アカウントを完全に削除する
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* 2. 通知設定 */}
+              {settingsSection === 'notifications' && (
+                <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4">
+                  <div className="text-stone-400 uppercase font-bold tracking-wider flex items-center gap-1.5">
+                    <Bell className="w-3.5 h-3.5 text-amber-400" /> 通知設定
+                  </div>
+                  <div className="flex items-center justify-between p-3 bg-[#16181D] border border-stone-800 rounded-xl">
+                    <div>
+                      <div className="text-white font-bold">チャット・提出物通知</div>
+                      <div className="text-stone-500 text-[11px]">新着メッセージや提出物リマインドを受信します</div>
+                    </div>
+                    <button
+                      onClick={() => setIsNotificationEnabled(!isNotificationEnabled)}
+                      className={`px-3 py-1.5 rounded-lg border font-bold transition ${
+                        isNotificationEnabled
+                          ? 'bg-emerald-950/40 border-emerald-800 text-emerald-400'
+                          : 'bg-stone-800 border-stone-700 text-stone-500'
+                      }`}
+                    >
+                      {isNotificationEnabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* 3. Webhook設定 */}
+              {settingsSection === 'webhook' && (
+                <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4">
+                  <div className="text-stone-400 uppercase font-bold tracking-wider flex items-center gap-1.5">
+                    <Share2 className="w-3.5 h-3.5 text-amber-400" /> Discord Webhook 連携
+                  </div>
+                  <p className="text-stone-400 leading-relaxed">
+                    DiscordのチャンネルWebhook URLを設定すると、asdfbaseのメッセージや重要な通知がDiscordに自動転送されます。
+                  </p>
+                  {webhookStatus && (
+                    <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 text-amber-300 rounded-xl">
+                      {webhookStatus}
+                    </div>
+                  )}
+                  <div className="space-y-2">
+                    <input
+                      type="url"
+                      placeholder="https://discord.com/api/webhooks/..."
+                      value={webhookUrlInput}
+                      onChange={e => setWebhookUrlInput(e.target.value)}
+                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                    />
+                    <button
+                      onClick={handleTestWebhook}
+                      className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition uppercase"
+                    >
+                      テスト送信
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* 4. 監査ログ & 復元 */}
+              {settingsSection === 'audit' && (
+                <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
+                  <div className="text-stone-400 uppercase font-bold tracking-wider flex items-center justify-between">
+                    <span>監査ログ & 復元</span>
+                    <button
+                      onClick={() => {
+                        if (token) {
+                          fetch(`${API_BASE_URL}/api/audit-logs`, { headers: { Authorization: `Bearer ${token}` } })
+                            .then(r => r.json())
+                            .then(data => setAuditLogs(data))
+                            .catch(console.error);
+                        }
+                      }}
+                      className="text-stone-400 hover:text-white"
+                      title="更新"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                    </button>
+                  </div>
+                  <div className="space-y-2 text-stone-300 divide-y divide-stone-800/60">
+                    {auditLogs.length === 0 ? (
+                      <div className="py-4 text-center text-stone-500">監査ログはありません</div>
+                    ) : (
+                      auditLogs.map(log => (
+                        <div key={log.id} className="pt-2 flex items-center justify-between">
+                          <div>
+                            <span className="text-stone-500 mr-2">[{new Date(log.created_at).toLocaleDateString()}]</span>
+                            <span>{log.action} ({log.target_type}) by <span className="text-amber-400">{log.username || 'system'}</span></span>
+                          </div>
+                          {log.can_restore && (
+                            <button
+                              onClick={() => handleRestoreAuditLog(log.id)}
+                              disabled={log.restored}
+                              className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded-lg text-[10px] disabled:opacity-40 transition"
+                            >
+                              {log.restored ? '復元済み' : '復元'}
+                            </button>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
       </main>
 
-      {/* カメラ小窓 */}
+      {/* カメラ小窓 (実機WebRTCカメラプレビュー) */}
       {showCamera && (
         <div className="fixed bottom-4 right-4 w-72 bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden z-50">
-          <div className="p-2 border-b border-stone-800 flex items-center justify-between text-xs font-mono text-stone-400">
-            <span className="flex items-center gap-1.5"><Camera className="w-3.5 h-3.5 text-amber-400" /> カメラプレビュー</span>
+          <div className="p-2.5 border-b border-stone-800 flex items-center justify-between text-xs font-mono text-stone-400">
+            <span className="flex items-center gap-1.5 font-bold text-white">
+              <Camera className="w-3.5 h-3.5 text-amber-400" /> カメラプレビュー
+            </span>
             <button onClick={() => setShowCamera(false)} className="text-stone-500 hover:text-white">&times;</button>
           </div>
-          <div className="h-44 bg-black flex items-center justify-center text-stone-600 text-xs font-mono">
-            Camera Active (WebRTC Stream)
+          <div className="h-48 bg-black flex items-center justify-center relative overflow-hidden">
+            {cameraError ? (
+              <div className="p-4 text-center text-red-400 font-mono text-xs">
+                {cameraError}
+              </div>
+            ) : (
+              <video
+                ref={cameraVideoRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-cover"
+              />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* チャンネル作成モーダル */}
+      {isNewChannelModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="w-full max-w-sm bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl font-mono text-xs space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-white text-sm">新規チャンネル作成</span>
+              <button onClick={() => setIsNewChannelModalOpen(false)} className="text-stone-500 hover:text-white">&times;</button>
+            </div>
+            <form onSubmit={handleCreateChannel} className="space-y-3">
+              <div>
+                <label className="block text-stone-400 mb-1">チャンネル名</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="例: study-room"
+                  value={newChannelName}
+                  onChange={e => setNewChannelName(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                />
+              </div>
+              <div>
+                <label className="block text-stone-400 mb-1">タイプ</label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setNewChannelType('text')}
+                    className={`flex-1 py-1.5 rounded-lg border transition ${
+                      newChannelType === 'text' ? 'bg-amber-500/20 border-amber-500 text-amber-300 font-bold' : 'border-stone-800 text-stone-400'
+                    }`}
+                  >
+                    テキスト
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setNewChannelType('voice')}
+                    className={`flex-1 py-1.5 rounded-lg border transition ${
+                      newChannelType === 'voice' ? 'bg-amber-500/20 border-amber-500 text-amber-300 font-bold' : 'border-stone-800 text-stone-400'
+                    }`}
+                  >
+                    ボイス
+                  </button>
+                </div>
+              </div>
+              <button
+                type="submit"
+                className="w-full py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition"
+              >
+                作成
+              </button>
+            </form>
           </div>
         </div>
       )}
