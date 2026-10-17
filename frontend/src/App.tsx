@@ -40,6 +40,7 @@ import {
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { API_BASE_URL, getWsUrl } from './config';
 
 interface User {
   id: number;
@@ -234,7 +235,7 @@ export default function App() {
   // Fetch Current User
   useEffect(() => {
     if (!token) return;
-    fetch('/api/auth/me', {
+    fetch(`${API_BASE_URL}/api/auth/me`, {
       headers: { Authorization: `Bearer ${token}` }
     })
       .then(res => {
@@ -252,9 +253,7 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ws`;
+    const wsUrl = getWsUrl();
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -319,17 +318,17 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
 
-    fetch('/api/channels', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API_BASE_URL}/api/channels`, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setChannels(data))
       .catch(console.error);
 
-    fetch('/api/users', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API_BASE_URL}/api/users`, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setOnlineUsers(data))
       .catch(console.error);
 
-    fetch('/api/notes', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API_BASE_URL}/api/notes`, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => {
         setMemoSlots(data);
@@ -344,17 +343,17 @@ export default function App() {
       })
       .catch(console.error);
 
-    fetch('/api/assignments', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API_BASE_URL}/api/assignments`, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setAssignments(data))
       .catch(console.error);
 
-    fetch('/api/test-scores', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API_BASE_URL}/api/test-scores`, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setTestScores(data))
       .catch(console.error);
 
-    fetch('/api/board', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API_BASE_URL}/api/board`, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => {
         if (data.strokes) setBoardStrokes(data.strokes);
@@ -362,7 +361,7 @@ export default function App() {
       })
       .catch(console.error);
 
-    fetch('/api/clipboard', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API_BASE_URL}/api/clipboard`, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => {
         if (data.content) {
@@ -391,7 +390,7 @@ export default function App() {
   // Messages Load
   useEffect(() => {
     if (!token || !activeChannelId) return;
-    fetch(`/api/channels/${activeChannelId}/messages`, {
+    fetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
       headers: { Authorization: `Bearer ${token}` }
     })
       .then(res => res.json())
@@ -403,7 +402,7 @@ export default function App() {
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
-    const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+    const endpoint = `${API_BASE_URL}/api/auth/${authMode === 'login' ? 'login' : 'register'}`;
     const body: any = { username: authUsername, password: authPassword };
     if (authMode === 'register') {
       body.inviteCode = authInviteCode;
@@ -444,22 +443,22 @@ export default function App() {
     formData.append('image', file);
 
     try {
-      const res = await fetch('/api/upload', {
+      const res = await fetch(`${API_BASE_URL}/api/upload`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
         body: formData,
       });
       const data = await res.json();
       if (res.ok && data.url) {
-        await fetch(`/api/channels/${activeChannelId}/messages`, {
+        await fetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`
           },
           body: JSON.stringify({
-            content: `![image](${data.url})`,
-            attachments: [data.url]
+            content: `![image](${API_BASE_URL}${data.url})`,
+            attachments: [`${API_BASE_URL}${data.url}`]
           })
         });
       }
@@ -486,7 +485,7 @@ export default function App() {
         content,
       }));
     } else {
-      await fetch(`/api/channels/${activeChannelId}/messages`, {
+      await fetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -500,7 +499,7 @@ export default function App() {
   const handleToggleReaction = async (messageId: number, emoji: string) => {
     if (!token) return;
     try {
-      await fetch(`/api/messages/${messageId}/reactions`, {
+      await fetch(`${API_BASE_URL}/api/messages/${messageId}/reactions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -516,7 +515,7 @@ export default function App() {
   const handleTogglePin = async (messageId: number) => {
     if (!token) return;
     try {
-      await fetch(`/api/messages/${messageId}/pin`, {
+      await fetch(`${API_BASE_URL}/api/messages/${messageId}/pin`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -536,7 +535,7 @@ export default function App() {
     if (!token) return;
     setIsSavingMemo(true);
     try {
-      const res = await fetch(`/api/notes/${selectedSlotIndex}`, {
+      const res = await fetch(`${API_BASE_URL}/api/notes/${selectedSlotIndex}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -569,7 +568,7 @@ export default function App() {
     if (!newAssignTitle || !newAssignDeadline || !token) return;
 
     try {
-      const res = await fetch('/api/assignments', {
+      const res = await fetch(`${API_BASE_URL}/api/assignments`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -597,7 +596,7 @@ export default function App() {
   const handleUpdateAssignmentStatus = async (id: number, status: string) => {
     if (!token) return;
     try {
-      const res = await fetch(`/api/assignments/${id}/progress`, {
+      const res = await fetch(`${API_BASE_URL}/api/assignments/${id}/progress`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -618,7 +617,7 @@ export default function App() {
     if (!token || !assignment.description) return;
     setIsSummarizingAI(assignment.id);
     try {
-      const res = await fetch('/api/assignments/summarize', {
+      const res = await fetch(`${API_BASE_URL}/api/assignments/summarize`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -643,7 +642,7 @@ export default function App() {
     if (!token) return;
 
     try {
-      const res = await fetch('/api/test-scores', {
+      const res = await fetch(`${API_BASE_URL}/api/test-scores`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -670,7 +669,7 @@ export default function App() {
     if (!token) return;
     setIsLoadingAdvice(true);
     try {
-      const res = await fetch('/api/test-scores/advice', {
+      const res = await fetch(`${API_BASE_URL}/api/test-scores/advice`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -764,7 +763,7 @@ export default function App() {
 
     if (currentStrokePoints.length >= 2 && token) {
       try {
-        await fetch('/api/board/stroke', {
+        await fetch(`${API_BASE_URL}/api/board/stroke`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -792,7 +791,7 @@ export default function App() {
     const y = e.clientY - rect.top;
 
     try {
-      await fetch('/api/board/text', {
+      await fetch(`${API_BASE_URL}/api/board/text`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -809,7 +808,7 @@ export default function App() {
   const handleClearBoard = async () => {
     if (!token || !confirm('ホワイトボードを全員分クリアしますか？')) return;
     try {
-      await fetch('/api/board/clear', {
+      await fetch(`${API_BASE_URL}/api/board/clear`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -858,7 +857,7 @@ export default function App() {
     setClipboardText(newText);
     if (!token) return;
     try {
-      await fetch('/api/clipboard', {
+      await fetch(`${API_BASE_URL}/api/clipboard`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -980,7 +979,7 @@ export default function App() {
                   required
                   value={authInviteCode}
                   onChange={e => setAuthInviteCode(e.target.value)}
-                  placeholder="招待コード (ASDF)"
+                  placeholder="招待コード"
                   className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-4 py-2.5 text-white placeholder-stone-600 focus:outline-none focus:border-amber-500/80 transition"
                 />
               </div>
