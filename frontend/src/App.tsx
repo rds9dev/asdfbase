@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { 
   Volume2,
   VolumeX,
@@ -52,7 +52,15 @@ import {
   Link,
   Code,
   Subtitles,
-  Headphones
+  Headphones,
+  Eye,
+  Book,
+  Check,
+  User,
+  Users,
+  ArrowDown,
+  HelpCircle,
+  SwitchCamera
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -78,13 +86,58 @@ interface Message {
   reactions?: Record<string, number[]>;
   is_pinned?: boolean;
   created_at: string;
+  client_nonce?: string | null;
+  pending?: boolean;
+  failed?: boolean;
+}
+
+// 楽観的送信メッセージ(負のID)を確定メッセージで置換しつつ、重複を排除してマージ
+function mergeIncomingMessage(prev: Message[], msg: Message): Message[] {
+  const exists = prev.some(m => m.id === msg.id);
+  const nonceIdx = msg.client_nonce ? prev.findIndex(m => m.id < 0 && m.client_nonce === msg.client_nonce) : -1;
+  if (nonceIdx >= 0) {
+    const next = [...prev];
+    if (exists) next.splice(nonceIdx, 1);
+    else next[nonceIdx] = msg;
+    return next;
+  }
+  if (exists) return prev;
+  // 送信中メッセージは常に末尾に保つ
+  const firstPending = prev.findIndex(m => m.id < 0);
+  if (firstPending === -1) return [...prev, msg];
+  return [...prev.slice(0, firstPending), msg, ...prev.slice(firstPending)];
+}
+
+const AVATAR_COLORS = [
+  'bg-sky-500/20 text-sky-300 border-sky-500/40',
+  'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+  'bg-violet-500/20 text-violet-300 border-violet-500/40',
+  'bg-rose-500/20 text-rose-300 border-rose-500/40',
+  'bg-cyan-500/20 text-cyan-300 border-cyan-500/40',
+  'bg-lime-500/20 text-lime-300 border-lime-500/40',
+  'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/40',
+  'bg-orange-500/20 text-orange-300 border-orange-500/40',
+];
+function avatarColorFor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+
+function formatDateSeparator(d: Date): string {
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return '今日';
+  if (d.toDateString() === yesterday.toDateString()) return '昨日';
+  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
 }
 
 interface MemoSlot {
   slot_index: number;
   title: string;
   content: string;
-  mode: 'markdown' | 'monaco';
+  mode: 'markdown' | 'monaco' | 'plain';
   assigned_user_id?: number | null;
   version: number;
   updated_at: string;
@@ -210,8 +263,8 @@ export default function App() {
   const [newChannelName, setNewChannelName] = useState('');
   const [newChannelType, setNewChannelType] = useState<'text' | 'voice'>('text');
 
-  // Settings State (Account, Notifications, Webhook, Audit Logs)
-  const [settingsSection, setSettingsSection] = useState<'account' | 'notifications' | 'webhook' | 'audit'>('account');
+  // Settings State (Account, Notifications, Webhook, Audit Logs, Appearance)
+  const [settingsSection, setSettingsSection] = useState<'account' | 'notifications' | 'webhook' | 'audit' | 'appearance'>('account');
   const [currentPasswordInput, setCurrentPasswordInput] = useState('');
   const [newPasswordInput, setNewPasswordInput] = useState('');
   const [passwordChangeStatus, setPasswordChangeStatus] = useState('');
@@ -240,7 +293,19 @@ export default function App() {
   ]);
   const [activeChannelId, setActiveChannelId] = useState<number>(1);
   const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
-  const [lastReadMessageIds, setLastReadMessageIds] = useState<Record<number, number>>({});
+  const [lastReadMessageIds, setLastReadMessageIds] = useState<Record<number, number>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('asdf_last_read') || '{}');
+    } catch {
+      return {};
+    }
+  });
+  const lastReadMessageIdsRef = useRef<Record<number, number>>(lastReadMessageIds);
+  lastReadMessageIdsRef.current = lastReadMessageIds;
+  // チャンネルを開いた時点の既読位置 (未読ラインの表示用)
+  const [unreadAnchor, setUnreadAnchor] = useState<{ channelId: number; lastReadId: number } | null>(null);
+  const [newBelowCount, setNewBelowCount] = useState(0);
+  const [wsStatus, setWsStatus] = useState<'connecting' | 'online' | 'reconnecting' | 'offline'>('connecting');
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
@@ -256,7 +321,7 @@ export default function App() {
   const [selectedSlotIndex, setSelectedSlotIndex] = useState<number>(1);
   const [memoTitle, setMemoTitle] = useState('');
   const [memoContent, setMemoContent] = useState('');
-  const [memoMode, setMemoMode] = useState<'markdown' | 'monaco'>('markdown');
+  const [memoMode, setMemoMode] = useState<'markdown' | 'monaco' | 'plain'>('markdown');
   const [memoAssignedUser, setMemoAssignedUser] = useState<number | null>(null);
   const [isSavingMemo, setIsSavingMemo] = useState(false);
 
@@ -268,6 +333,7 @@ export default function App() {
   const [newAssignTitle, setNewAssignTitle] = useState('');
   const [newAssignSubject, setNewAssignSubject] = useState('数学');
   const [newAssignDeadline, setNewAssignDeadline] = useState('');
+  const [newAssignResubmitDeadline, setNewAssignResubmitDeadline] = useState('');
   const [newAssignDesc, setNewAssignDesc] = useState('');
   const [isSummarizingAI, setIsSummarizingAI] = useState<number | null>(null);
   const [summarizedTexts, setSummarizedTexts] = useState<Record<number, string>>({});
@@ -305,11 +371,97 @@ export default function App() {
   const [calcResult, setCalcResult] = useState<string | null>(null);
 
   
-  // Camera Stream Toggle
+  // Camera Facing Mode ('user' or 'environment')
+  const [cameraFacingMode, setCameraFacingMode] = useState<'user' | 'environment'>('user');
+
+  // Memo View Mode ('split' or 'view_only') & Auto-save status
+  const [memoViewMode, setMemoViewMode] = useState<'split' | 'view_only'>('split');
+  const [autoSaveStatus, setAutoSaveStatus] = useState<'saved' | 'saving' | 'dirty'>('saved');
+  const memoAutoSaveTimerRef = useRef<any>(null);
+  const selectedSlotIndexRef = useRef<number>(selectedSlotIndex);
+  selectedSlotIndexRef.current = selectedSlotIndex;
+
+  // Assignment Editing & Member Progress State
+  const [editingAssignment, setEditingAssignment] = useState<Assignment | null>(null);
+  const [assignmentMembersProgress, setAssignmentMembersProgress] = useState<Record<number, { userId: number; username: string; status: string }[]>>({});
+  const [showMemberProgressModalId, setShowMemberProgressModalId] = useState<number | null>(null);
+  const [floatingAiSummary, setFloatingAiSummary] = useState<{ id: number; title: string; summary: string } | null>(null);
+
+  // Chat Ergonomics & Pagination & Cursor Following
+  const [hasMoreMessages, setHasMoreMessages] = useState<boolean>(true);
+  const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState<boolean>(false);
+  const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const unreadMessageRef = useRef<HTMLDivElement | null>(null);
+
+  // User Settings State (Persisted in localStorage)
+  const [uiScale, setUiScale] = useState<number>(() => {
+    const saved = localStorage.getItem('asdf_ui_scale');
+    return saved ? parseFloat(saved) : 100;
+  });
+  const [chatAutoScrollMode, setChatAutoScrollMode] = useState<'always' | 'unread_anchor' | 'off'>(() => {
+    return (localStorage.getItem('asdf_chat_scroll_mode') as any) || 'always';
+  });
+  const [memoAutoSaveInterval, setMemoAutoSaveInterval] = useState<number>(() => {
+    const saved = localStorage.getItem('asdf_memo_autosave_interval');
+    return saved ? parseInt(saved, 10) : 3;
+  });
+
+  // Realtime refs (WS/ポーリングのコールバックから最新値を参照するため)
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const chatAutoScrollModeRef = useRef(chatAutoScrollMode);
+  chatAutoScrollModeRef.current = chatAutoScrollMode;
+  const lastSeenMessageIdRef = useRef<number>(0);
+  const processedMessageIdsRef = useRef<Set<number>>(new Set());
+  const syncReadyRef = useRef(false);
+  const isSyncingRef = useRef(false);
+  const isNearBottomRef = useRef(true);
+  const pendingScrollRestoreRef = useRef<{ height: number; top: number } | null>(null);
+
+  const scheduleScrollToBottom = (smooth = true) => {
+    requestAnimationFrame(() => {
+      const el = chatScrollContainerRef.current;
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+      isNearBottomRef.current = true;
+      setNewBelowCount(0);
+    });
+  };
+
+  const markChannelRead = (channelId: number, messageId: number) => {
+    setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
+    if (messageId > 0 && (lastReadMessageIdsRef.current[channelId] || 0) < messageId) {
+      setLastReadMessageIds(prev => ({ ...prev, [channelId]: messageId }));
+    }
+  };
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('asdf_last_read', JSON.stringify(lastReadMessageIds));
+    } catch (_) {}
+  }, [lastReadMessageIds]);
+
+  // 総未読数をタブタイトルに表示
+  const totalUnread = Object.values(unreadCounts).reduce((a, b) => a + (b || 0), 0);
+  useEffect(() => {
+    document.title = totalUnread > 0 ? `(${totalUnread}) asdfbase` : 'asdfbase';
+  }, [totalUnread]);
+
   useEffect(() => {
     if (showCamera) {
       setCameraError('');
-      navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false })
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(track => track.stop());
+      }
+      navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: cameraFacingMode,
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        },
+        audio: false
+      })
         .then(stream => {
           setCameraStream(stream);
           if (cameraVideoRef.current) {
@@ -326,17 +478,21 @@ export default function App() {
         setCameraStream(null);
       }
     }
-  }, [showCamera]);
+  }, [showCamera, cameraFacingMode]);
 
   // WebSocket Ref
   const wsRef = useRef<WebSocket | null>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  const scrollToBottom = () => scheduleScrollToBottom();
 
-  useEffect(() => {
-    scrollToBottom();
+  // 過去ログ読み込み後にスクロール位置を維持
+  useLayoutEffect(() => {
+    const restore = pendingScrollRestoreRef.current;
+    const el = chatScrollContainerRef.current;
+    if (restore && el) {
+      el.scrollTop = restore.top + (el.scrollHeight - restore.height);
+      pendingScrollRestoreRef.current = null;
+    }
   }, [messages]);
 
   // Live Clock
@@ -418,74 +574,238 @@ export default function App() {
       });
   }, [token]);
 
-  // WebSocket Setup with Auto-Reconnect & Heartbeat
+  // ===== Realtime Chat Core =====
+  // 新着メッセージは WS / ポーリング / 送信レスポンス のどこから来ても必ずここを通す
+  const ingestNewMessage = (newMsg: Message) => {
+    if (!newMsg || typeof newMsg.id !== 'number') return;
+    if (newMsg.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = newMsg.id;
+    if (processedMessageIdsRef.current.has(newMsg.id)) return;
+    processedMessageIdsRef.current.add(newMsg.id);
+
+    const me = currentUserRef.current;
+    const isMine = Boolean(me && newMsg.user_id === me.id);
+    const isActiveChannel = newMsg.channel_id === activeChannelIdRef.current;
+    const isViewing = isActiveChannel && activeTabRef.current === 'chat' && !document.hidden;
+
+    // メンション検知 & 通知音・通知
+    if (me && !isMine && newMsg.sender_username !== me.username) {
+      const isMentioned = newMsg.content?.includes(`@${me.username}`) || newMsg.content?.includes('@everyone');
+      if (isMentioned) {
+        playNotificationSound();
+        if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
+          try {
+            new Notification(`asdfbase - ${newMsg.sender_username} からのメンション`, {
+              body: newMsg.content,
+            });
+          } catch (_) {}
+        }
+      }
+    }
+
+    if (isActiveChannel) {
+      setMessages(prev => mergeIncomingMessage(prev, newMsg));
+      if (isMine || (isNearBottomRef.current && chatAutoScrollModeRef.current !== 'off')) {
+        scheduleScrollToBottom();
+      } else {
+        setNewBelowCount(c => c + 1);
+      }
+    }
+
+    if (isViewing || isMine) {
+      markChannelRead(newMsg.channel_id, newMsg.id);
+    } else {
+      setUnreadCounts(prev => ({
+        ...prev,
+        [newMsg.channel_id]: (prev[newMsg.channel_id] || 0) + 1,
+      }));
+    }
+  };
+  const ingestNewMessageRef = useRef(ingestNewMessage);
+  ingestNewMessageRef.current = ingestNewMessage;
+
+  // 取りこぼし同期 (WS再接続時 / ポーリングフォールバック / タブ復帰時)
+  const syncMissedMessages = async () => {
+    const tk = tokenRef.current;
+    if (!tk || !syncReadyRef.current || isSyncingRef.current) return;
+    isSyncingRef.current = true;
+    try {
+      // 200件ずつ追いつくまで取得
+      for (let i = 0; i < 5; i++) {
+        const res = await safeFetch(`/api/messages/since?afterId=${lastSeenMessageIdRef.current}`, {
+          headers: { Authorization: `Bearer ${tk}` },
+        });
+        if (!res.ok) break;
+        const rows: Message[] = await res.json();
+        rows.forEach(m => ingestNewMessageRef.current(m));
+        if (rows.length < 200) break;
+      }
+    } catch (_) {
+      // network hiccup: 次のサイクルで再試行
+    } finally {
+      isSyncingRef.current = false;
+    }
+  };
+  const syncMissedMessagesRef = useRef(syncMissedMessages);
+  syncMissedMessagesRef.current = syncMissedMessages;
+
+  // 再接続時: 表示中チャンネルの直近ログを取り直して編集/削除/リアクションの取りこぼしを補正
+  const refreshActiveChannel = async () => {
+    const tk = tokenRef.current;
+    const channelId = activeChannelIdRef.current;
+    if (!tk || !channelId) return;
+    try {
+      const res = await safeFetch(`/api/channels/${channelId}/messages?limit=50`, {
+        headers: { Authorization: `Bearer ${tk}` },
+      });
+      if (!res.ok || channelId !== activeChannelIdRef.current) return;
+      const fresh: Message[] = await res.json();
+      if (fresh.length === 0) return;
+      const minId = fresh[0].id;
+      setMessages(prev => {
+        const older = prev.filter(m => m.id > 0 && m.id < minId);
+        const pending = prev.filter(m => m.id < 0 && !fresh.some(f => f.client_nonce && f.client_nonce === m.client_nonce));
+        return [...older, ...fresh, ...pending];
+      });
+      fresh.forEach(m => {
+        processedMessageIdsRef.current.add(m.id);
+        if (m.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = m.id;
+      });
+    } catch (_) {}
+  };
+  const refreshActiveChannelRef = useRef(refreshActiveChannel);
+  refreshActiveChannelRef.current = refreshActiveChannel;
+
+  // 未読数 & 同期起点の初期化
+  useEffect(() => {
+    if (!token) return;
+    syncReadyRef.current = false;
+    safeFetch('/api/channels/unread-counts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ lastRead: lastReadMessageIdsRef.current }),
+    })
+      .then(res => (res.ok ? res.json() : []))
+      .then((rows: { channelId: number; lastMessageId: number; unread: number }[]) => {
+        const counts: Record<number, number> = {};
+        const initRead: Record<number, number> = {};
+        let maxId = 0;
+        for (const r of rows) {
+          maxId = Math.max(maxId, r.lastMessageId);
+          if (lastReadMessageIdsRef.current[r.channelId] === undefined) {
+            // 初回はそれまでの履歴を既読扱い
+            initRead[r.channelId] = r.lastMessageId;
+          } else if (r.channelId !== activeChannelIdRef.current && r.unread > 0) {
+            counts[r.channelId] = r.unread;
+          }
+        }
+        if (Object.keys(initRead).length > 0) {
+          setLastReadMessageIds(prev => ({ ...initRead, ...prev }));
+        }
+        setUnreadCounts(counts);
+        lastSeenMessageIdRef.current = Math.max(lastSeenMessageIdRef.current, maxId);
+        syncReadyRef.current = true;
+        // 初期化中に届いた分を補完
+        syncMissedMessagesRef.current();
+      })
+      .catch(() => {
+        syncReadyRef.current = true;
+      });
+  }, [token]);
+
+  // WebSocket Setup: Auto-Reconnect (backoff) + Heartbeat watchdog + Catch-up sync
   useEffect(() => {
     if (!token) return;
 
     let isUnmounted = false;
     let reconnectTimeout: any = null;
     let heartbeatInterval: any = null;
+    let connectTimeout: any = null;
+    let attempts = 0;
+    let hasConnectedOnce = false;
+    let lastActivity = Date.now();
 
-    const connectWs = () => {
+    const cleanupSocket = (ws: WebSocket | null) => {
+      if (!ws) return;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      try { ws.close(); } catch (_) {}
+    };
+
+    const scheduleReconnect = (immediate = false) => {
       if (isUnmounted) return;
-      const wsUrl = getWsUrl();
-      const ws = new WebSocket(wsUrl);
+      clearTimeout(reconnectTimeout);
+      clearInterval(heartbeatInterval);
+      clearTimeout(connectTimeout);
+      setWsStatus('reconnecting');
+      const delay = immediate ? 0 : Math.min(1000 * 2 ** attempts, 10000) + Math.random() * 500;
+      attempts++;
+      reconnectTimeout = setTimeout(connectWs, delay);
+    };
+
+    const forceReconnect = () => {
+      const old = wsRef.current;
+      wsRef.current = null;
+      cleanupSocket(old);
+      scheduleReconnect(true);
+    };
+
+    function connectWs() {
+      if (isUnmounted) return;
+      cleanupSocket(wsRef.current);
+      const ws = new WebSocket(getWsUrl());
       wsRef.current = ws;
+      if (!hasConnectedOnce) setWsStatus('connecting');
+
+      // プロキシ/フィルタでハンドシェイクが詰まった場合に備えた接続タイムアウト
+      connectTimeout = setTimeout(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          wsRef.current = null;
+          cleanupSocket(ws);
+          scheduleReconnect();
+        }
+      }, 8000);
 
       ws.onopen = () => {
+        clearTimeout(connectTimeout);
+        lastActivity = Date.now();
         ws.send(JSON.stringify({ type: 'AUTH', token }));
-        // Heartbeat every 25s
+        clearInterval(heartbeatInterval);
         heartbeatInterval = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'PING' }));
+          if (ws.readyState !== WebSocket.OPEN) return;
+          // 40秒間なにも届かなければ半死にの接続とみなして張り直す
+          if (Date.now() - lastActivity > 40000) {
+            forceReconnect();
+            return;
           }
-        }, 25000);
+          ws.send(JSON.stringify({ type: 'PING', t: Date.now() }));
+        }, 15000);
       };
 
       ws.onmessage = (event) => {
+        lastActivity = Date.now();
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === 'NEW_MESSAGE') {
-            const newMsg = msg.payload;
-            const currentActive = activeChannelIdRef.current;
-            const me = currentUserRef.current;
-
-            // メンション検知 & 通知音・通知
-            if (me && newMsg.sender_username !== me.username) {
-              const isMentioned = newMsg.content?.includes(`@${me.username}`) || newMsg.content?.includes('@everyone');
-              if (isMentioned) {
-                playNotificationSound();
-                if ('Notification' in window && Notification.permission === 'granted') {
-                  try {
-                    new Notification(`asdfbase - ${newMsg.sender_username} からのメンション`, {
-                      body: newMsg.content,
-                    });
-                  } catch (_) {}
-                }
-              }
+          if (msg.type === 'PONG') {
+            return;
+          } else if (msg.type === 'AUTH_OK') {
+            attempts = 0;
+            setWsStatus('online');
+            if (hasConnectedOnce) {
+              syncMissedMessagesRef.current();
+              refreshActiveChannelRef.current();
             }
-
-            if (newMsg.channel_id === currentActive) {
-              setMessages(prev => {
-                if (prev.some(m => m.id === newMsg.id)) return prev;
-                return [...prev, newMsg];
-              });
-              setTimeout(() => {
-                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-              }, 50);
-            } else {
-              setUnreadCounts(prev => ({
-                ...prev,
-                [newMsg.channel_id]: (prev[newMsg.channel_id] || 0) + 1,
-              }));
-            }
+            hasConnectedOnce = true;
+          } else if (msg.type === 'NEW_MESSAGE') {
+            ingestNewMessageRef.current(msg.payload);
           } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
             setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
           } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
             setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
           } else if (msg.type === 'NOTE_UPDATED') {
             setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? msg.payload : n));
-            if (msg.payload.slot_index === selectedSlotIndex) {
+            if (msg.payload.slot_index === selectedSlotIndexRef.current) {
               setMemoTitle(msg.payload.title);
               setMemoContent(msg.payload.content);
               setMemoMode(msg.payload.mode);
@@ -509,14 +829,31 @@ export default function App() {
             setChannels(msg.payload);
           } else if (msg.type === 'CHANNEL_DELETED') {
             setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
+          } else if (msg.type === 'ASSIGNMENT_UPDATED') {
+            setAssignments(prev => prev.map(a => a.id === msg.payload.id ? { ...a, ...msg.payload } : a));
           } else if (msg.type === 'ASSIGNMENT_DELETED') {
             setAssignments(prev => prev.filter(a => a.id !== msg.payload.id));
+          } else if (msg.type === 'ASSIGNMENT_PROGRESS_UPDATED') {
+            const { assignmentId, userId, username, status, isArchived } = msg.payload;
+            if (currentUserRef.current?.id === userId) {
+              setAssignments(prev => prev.map(a => a.id === assignmentId ? { ...a, my_status: status, is_archived: isArchived || a.is_archived } : a));
+            } else if (isArchived) {
+              setAssignments(prev => prev.map(a => a.id === assignmentId ? { ...a, is_archived: true } : a));
+            }
+            setAssignmentMembersProgress(prev => {
+              const currentList = prev[assignmentId] || [];
+              const exists = currentList.some(p => p.userId === userId);
+              const updated = exists 
+                ? currentList.map(p => p.userId === userId ? { ...p, status } : p)
+                : [...currentList, { userId, username, status }];
+              return { ...prev, [assignmentId]: updated };
+            });
           } else if (msg.type === 'MESSAGE_DELETED') {
             setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
           } else if (msg.type === 'MESSAGE_UPDATED') {
             setMessages(prev => prev.map(m => m.id === msg.payload.id ? { ...m, content: msg.payload.content } : m));
           } else if (msg.type === 'NOTE_CONTENT_SYNC') {
-            if (msg.payload.slotIndex === selectedSlotIndex) {
+            if (msg.payload.slotIndex === selectedSlotIndexRef.current) {
               setMemoContent(msg.payload.content);
               if (msg.payload.title) setMemoTitle(msg.payload.title);
             }
@@ -534,34 +871,62 @@ export default function App() {
 
       ws.onclose = () => {
         clearInterval(heartbeatInterval);
-        if (!isUnmounted) {
-          reconnectTimeout = setTimeout(connectWs, 2000);
-        }
+        clearTimeout(connectTimeout);
+        if (wsRef.current === ws) wsRef.current = null;
+        scheduleReconnect();
       };
 
       ws.onerror = () => {
-        ws.close();
+        // onclose が続いて呼ばれるのでそちらで再接続
+        try { ws.close(); } catch (_) {}
       };
-    };
+    }
 
     connectWs();
 
     const handleVisibilityChange = () => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        const status = document.hidden ? 'away' : 'online';
-        wsRef.current.send(JSON.stringify({ type: 'SET_STATUS', status }));
+      const ws = wsRef.current;
+      if (!document.hidden) {
+        // スリープ/タブ復帰: 接続を確認し、取りこぼしを即同期
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          forceReconnect();
+        } else {
+          ws.send(JSON.stringify({ type: 'PING', t: Date.now() }));
+          syncMissedMessagesRef.current();
+        }
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'SET_STATUS', status: document.hidden ? 'away' : 'online' }));
       }
     };
+    const handleOnline = () => forceReconnect();
+    const handleOffline = () => setWsStatus('offline');
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
 
     return () => {
       isUnmounted = true;
       clearInterval(heartbeatInterval);
       clearTimeout(reconnectTimeout);
+      clearTimeout(connectTimeout);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      if (wsRef.current) wsRef.current.close();
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      cleanupSocket(wsRef.current);
+      wsRef.current = null;
     };
-  }, [token, selectedSlotIndex]);
+  }, [token]);
+
+  // ポーリング: WS不調時は3秒ごと、正常時も20秒ごとに保険として同期
+  useEffect(() => {
+    if (!token) return;
+    const interval = setInterval(() => {
+      if (document.hidden && wsStatus === 'online') return;
+      syncMissedMessagesRef.current();
+    }, wsStatus === 'online' ? 20000 : 3000);
+    return () => clearInterval(interval);
+  }, [token, wsStatus]);
 
   // Initial Data Load
   useEffect(() => {
@@ -595,6 +960,22 @@ export default function App() {
     safeFetch('/api/assignments', { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.json())
       .then(data => setAssignments(data))
+      .catch(console.error);
+
+    safeFetch('/api/assignments/progress/all', { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.json())
+      .then((data: { assignment_id: number; user_id: number; status: string; username: string }[]) => {
+        const grouped: Record<number, { userId: number; username: string; status: string }[]> = {};
+        for (const row of data) {
+          if (!grouped[row.assignment_id]) grouped[row.assignment_id] = [];
+          grouped[row.assignment_id].push({
+            userId: row.user_id,
+            username: row.username,
+            status: row.status
+          });
+        }
+        setAssignmentMembersProgress(grouped);
+      })
       .catch(console.error);
 
     safeFetch('/api/test-scores', { headers: { Authorization: `Bearer ${token}` } })
@@ -660,16 +1041,96 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Messages Load
+  // Messages Load & Channel Switch with unread line tracking
   useEffect(() => {
     if (!token || !activeChannelId) return;
-    safeFetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages`, {
+    const channelId = activeChannelId;
+    const anchorId = lastReadMessageIdsRef.current[channelId] || 0;
+    setUnreadAnchor({ channelId, lastReadId: anchorId });
+    setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
+    setNewBelowCount(0);
+    setMessages([]);
+    setHasMoreMessages(true);
+    safeFetch(`${API_BASE_URL}/api/channels/${channelId}/messages?limit=50`, {
       headers: { Authorization: `Bearer ${token}` }
     })
       .then(res => res.json())
-      .then(data => setMessages(data))
+      .then((data: Message[]) => {
+        if (channelId !== activeChannelIdRef.current) return;
+        const maxId = data.length > 0 ? data[data.length - 1].id : 0;
+        // 読み込み中に WS で届いた分は保持
+        setMessages(prev => [...data, ...prev.filter(m => m.channel_id === channelId && (m.id > maxId || m.id < 0))]);
+        data.forEach(m => {
+          processedMessageIdsRef.current.add(m.id);
+          if (m.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = m.id;
+        });
+        if (data.length < 50) {
+          setHasMoreMessages(false);
+        }
+        if (maxId > 0) markChannelRead(channelId, maxId);
+        // Scroll behavior based on unread position and user preference
+        setTimeout(() => {
+          const hasUnread = anchorId > 0 && maxId > anchorId;
+          if ((chatAutoScrollMode === 'unread_anchor' || chatAutoScrollMode === 'always') && hasUnread && unreadMessageRef.current) {
+            unreadMessageRef.current.scrollIntoView({ behavior: 'auto', block: 'center' });
+          } else if (chatAutoScrollMode !== 'off') {
+            scheduleScrollToBottom(false);
+          }
+        }, 50);
+      })
       .catch(console.error);
   }, [token, activeChannelId]);
+
+  // チャットタブに戻った時: 表示中チャンネルを既読化
+  useEffect(() => {
+    if (activeTab !== 'chat') return;
+    const realMsgs = messages.filter(m => m.id > 0);
+    const last = realMsgs[realMsgs.length - 1];
+    if (last) markChannelRead(activeChannelId, last.id);
+  }, [activeTab]);
+
+  const handleChatScroll = () => {
+    const el = chatScrollContainerRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    isNearBottomRef.current = nearBottom;
+    if (nearBottom && newBelowCount > 0) setNewBelowCount(0);
+    // 上端付近で自動的に過去ログ読み込み
+    if (el.scrollTop < 80 && hasMoreMessages && !isLoadingMoreMessages && !chatSearchQuery) {
+      handleLoadMoreMessages();
+    }
+  };
+
+  // Load more older messages
+  const handleLoadMoreMessages = async () => {
+    const oldest = messages.find(m => m.id > 0);
+    if (!token || !activeChannelId || isLoadingMoreMessages || !hasMoreMessages || !oldest) return;
+    setIsLoadingMoreMessages(true);
+    const oldestId = oldest.id;
+    const channelId = activeChannelId;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels/${activeChannelId}/messages?limit=30&beforeId=${oldestId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const older = await res.json();
+        if (older.length < 30) {
+          setHasMoreMessages(false);
+        }
+        if (older.length > 0 && channelId === activeChannelIdRef.current) {
+          // Maintain scroll position after prepending (restored in useLayoutEffect)
+          const container = chatScrollContainerRef.current;
+          if (container) pendingScrollRestoreRef.current = { height: container.scrollHeight, top: container.scrollTop };
+          older.forEach((m: Message) => processedMessageIdsRef.current.add(m.id));
+          setMessages(prev => [...older.filter((o: Message) => !prev.some(p => p.id === o.id)), ...prev]);
+        }
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsLoadingMoreMessages(false);
+    }
+  };
 
   // Auth Handler
   const handleAuthSubmit = async (e: React.FormEvent) => {
@@ -752,14 +1213,9 @@ export default function App() {
   };
 
   // Chat Send with Instant Local Reflection & Auto Scroll
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!chatInput.trim() || !token) return;
+  const tempMessageIdRef = useRef(-1);
 
-    const content = chatInput;
-    const targetChannelId = activeChannelId;
-    setChatInput('');
-
+  const postChatMessage = async (content: string, targetChannelId: number, clientNonce: string) => {
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/channels/${targetChannelId}/messages`, {
         method: 'POST',
@@ -767,21 +1223,56 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ content })
+        body: JSON.stringify({ content, clientNonce })
       });
-      if (res.ok) {
-        const savedMessage = await res.json();
-        setMessages(prev => {
-          if (prev.some(m => m.id === savedMessage.id)) return prev;
-          return [...prev, savedMessage];
-        });
-        setTimeout(() => {
-          messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-        }, 50);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const savedMessage: Message = await res.json();
+      ingestNewMessageRef.current({ ...savedMessage, client_nonce: clientNonce });
+      // WS経由で先に確定済みでも、残っている送信中表示を必ず消す
+      setMessages(prev => mergeIncomingMessage(prev, { ...savedMessage, client_nonce: clientNonce }));
     } catch (err) {
       console.error('Failed to send message:', err);
+      setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === clientNonce ? { ...m, pending: false, failed: true } : m)));
     }
+  };
+
+  // Chat Send: 楽観的に即時表示 → サーバー確定で置換
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim() || !token) return;
+
+    const content = chatInput;
+    const targetChannelId = activeChannelId;
+    const clientNonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    setChatInput('');
+    setShowMentionSuggestions(false);
+
+    const me = currentUserRef.current;
+    const optimistic: Message = {
+      id: tempMessageIdRef.current--,
+      channel_id: targetChannelId,
+      user_id: me?.id ?? 0,
+      username: me?.username ?? '',
+      sender_username: me?.username,
+      content,
+      created_at: new Date().toISOString(),
+      client_nonce: clientNonce,
+      pending: true,
+    };
+    setMessages(prev => [...prev, optimistic]);
+    scheduleScrollToBottom();
+
+    await postChatMessage(content, targetChannelId, clientNonce);
+  };
+
+  const handleRetryMessage = (m: Message) => {
+    if (!m.client_nonce) return;
+    setMessages(prev => prev.map(x => (x.id === m.id ? { ...x, pending: true, failed: false } : x)));
+    postChatMessage(m.content, m.channel_id, m.client_nonce);
+  };
+
+  const handleDiscardFailedMessage = (m: Message) => {
+    setMessages(prev => prev.filter(x => x.id !== m.id));
   };
 
   // Reorder Channels (Up / Down)
@@ -1267,48 +1758,68 @@ export default function App() {
   };
 
 
-  const handleMemoContentChange = (newVal: string) => {
-    setMemoContent(newVal);
-    // Realtime broadcast to other users
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'NOTE_CONTENT_SYNC',
-        slotIndex: selectedSlotIndex,
-        content: newVal,
-        title: memoTitle
-      }));
-    }
-  };
-
-  const handleSaveMemo = async () => {
+  const handleSaveMemo = async (explicitContent?: string, explicitTitle?: string, explicitMode?: string) => {
     if (!token) return;
     setIsSavingMemo(true);
+    setAutoSaveStatus('saving');
+    const targetSlot = selectedSlotIndexRef.current;
+    const contentToSave = explicitContent !== undefined ? explicitContent : memoContent;
+    const titleToSave = explicitTitle !== undefined ? explicitTitle : memoTitle;
+    const modeToSave = explicitMode !== undefined ? explicitMode : memoMode;
+
     try {
-      const res = await safeFetch(`${API_BASE_URL}/api/notes/${selectedSlotIndex}`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/notes/${targetSlot}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
-          title: memoTitle,
-          content: memoContent,
-          mode: memoMode,
+          title: titleToSave,
+          content: contentToSave,
+          mode: modeToSave,
           assigned_user_id: memoAssignedUser
         })
       });
       if (res.ok) {
         const updated = await res.json();
-        setMemoSlots(prev => prev.map(m => m.slot_index === selectedSlotIndex ? updated : m));
+        setMemoSlots(prev => prev.map(m => m.slot_index === targetSlot ? updated : m));
+        setAutoSaveStatus('saved');
       } else {
         const err = await res.json();
-        alert(err.error || '保存に失敗しました');
+        console.warn('Memo save failed:', err.error);
+        setAutoSaveStatus('dirty');
       }
     } catch (err) {
       console.error(err);
+      setAutoSaveStatus('dirty');
     } finally {
       setIsSavingMemo(false);
     }
+  };
+
+  const handleMemoContentChange = (newVal: string) => {
+    setMemoContent(newVal);
+    setAutoSaveStatus('dirty');
+
+    // Realtime broadcast to other users
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'NOTE_CONTENT_SYNC',
+        slotIndex: selectedSlotIndexRef.current,
+        content: newVal,
+        title: memoTitle
+      }));
+    }
+
+    // Auto-save debounce
+    if (memoAutoSaveTimerRef.current) {
+      clearTimeout(memoAutoSaveTimerRef.current);
+    }
+    const intervalMs = Math.max(1, memoAutoSaveInterval) * 1000;
+    memoAutoSaveTimerRef.current = setTimeout(() => {
+      handleSaveMemo(newVal, memoTitle, memoMode);
+    }, intervalMs);
   };
 
   // Phase 3: Create Assignment
@@ -1327,6 +1838,7 @@ export default function App() {
           title: newAssignTitle,
           subject: newAssignSubject,
           deadline: newAssignDeadline,
+          resubmitDeadline: newAssignResubmitDeadline || undefined,
           description: newAssignDesc
         })
       });
@@ -1335,6 +1847,7 @@ export default function App() {
         setAssignments(prev => [...prev, { ...created, my_status: 'unstarted' }]);
         setNewAssignTitle('');
         setNewAssignDesc('');
+        setNewAssignResubmitDeadline('');
       }
     } catch (err) {
       console.error(err);
@@ -1376,7 +1889,39 @@ export default function App() {
     }
   };
 
-  // Phase 3: Gemini Summarize Assignment
+  // Phase 3: Update Assignment (Title, Subject, Deadline, Description)
+  const handleUpdateAssignment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingAssignment || !token) return;
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/assignments/${editingAssignment.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          title: editingAssignment.title,
+          subject: editingAssignment.subject,
+          deadline: editingAssignment.deadline,
+          resubmitDeadline: editingAssignment.resubmit_deadline,
+          description: editingAssignment.description
+        })
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setAssignments(prev => prev.map(a => a.id === updated.id ? { ...a, ...updated } : a));
+        setEditingAssignment(null);
+      } else {
+        const err = await res.json();
+        alert(err.error || '提出物の更新に失敗しました');
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Phase 3: Gemini Summarize Assignment (opens clean floating modal)
   const handleSummarizeAssignment = async (assignment: Assignment) => {
     if (!token || !assignment.description) return;
     setIsSummarizingAI(assignment.id);
@@ -1392,6 +1937,11 @@ export default function App() {
       const data = await res.json();
       if (data.summary) {
         setSummarizedTexts(prev => ({ ...prev, [assignment.id]: data.summary }));
+        setFloatingAiSummary({
+          id: assignment.id,
+          title: assignment.title,
+          summary: data.summary
+        });
       }
     } catch (err) {
       console.error(err);
@@ -1555,27 +2105,50 @@ export default function App() {
     }
   }, [activeTab, boardStrokes, boardTexts, isTimelapsePlaying]);
 
-  const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
+
+    let clientX = 0;
+    let clientY = 0;
+
+    if ('touches' in e) {
+      if (e.touches && e.touches.length > 0) {
+        clientX = e.touches[0].clientX;
+        clientY = e.touches[0].clientY;
+      } else if (e.changedTouches && e.changedTouches.length > 0) {
+        clientX = e.changedTouches[0].clientX;
+        clientY = e.changedTouches[0].clientY;
+      }
+    } else {
+      clientX = e.clientX;
+      clientY = e.clientY;
+    }
+
     return {
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top) * scaleY
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY
     };
   };
 
-  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
     if (boardMode !== 'draw' && boardMode !== 'eraser') return;
+    if ('touches' in e && e.cancelable) {
+      e.preventDefault();
+    }
     const { x, y } = getCanvasCoords(e);
     setIsDrawing(true);
     setCurrentStrokePoints([{ x, y }]);
   };
 
-  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
     if (!isDrawing || (boardMode !== 'draw' && boardMode !== 'eraser')) return;
+    if ('touches' in e && e.cancelable) {
+      e.preventDefault();
+    }
     const { x, y } = getCanvasCoords(e);
     const newPoints = [...currentStrokePoints, { x, y }];
     setCurrentStrokePoints(newPoints);
@@ -1871,7 +2444,10 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-[#090A0C] text-[#D6D3D1] flex flex-col font-['Inter']">
+    <div 
+      className="min-h-screen bg-[#090A0C] text-[#D6D3D1] flex flex-col font-['Inter']"
+      style={{ zoom: `${uiScale}%` }}
+    >
       {/* 1. TOP BAR */}
       <header className="h-14 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md sticky top-0 z-50 px-2 sm:px-4 flex items-center justify-between select-none overflow-x-auto gap-2">
         <div className="flex items-center gap-1 sm:gap-2 shrink-0">
@@ -1907,6 +2483,11 @@ export default function App() {
                 >
                   <Icon className="w-3.5 h-3.5" />
                   <span className="hidden sm:inline">{tab.label}</span>
+                  {tab.id === 'chat' && totalUnread > 0 && (
+                    <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold leading-[18px] text-center">
+                      {totalUnread > 99 ? '99+' : totalUnread}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -1981,32 +2562,42 @@ export default function App() {
                       <Plus className="w-3.5 h-3.5" />
                     </button>
                   </div>
-                  <div className="flex-1 overflow-y-auto space-y-1 max-h-[calc(100vh-250px)] pr-1">
-                    {channels.map((ch, idx) => (
+                  <div className="flex-1 overflow-y-auto space-y-0.5 max-h-[calc(100vh-250px)] pr-1">
+                    {channels.map((ch, idx) => {
+                      const unread = activeChannelId === ch.id ? 0 : (unreadCounts[ch.id] || 0);
+                      const isActiveCh = activeChannelId === ch.id;
+                      return (
                       <div
                         key={ch.id}
-                        className={`group flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-mono transition ${
-                          activeChannelId === ch.id
-                            ? 'bg-amber-500/10 text-amber-400 font-bold border border-amber-500/30'
-                            : 'text-stone-400 hover:bg-stone-900/60 hover:text-stone-200'
+                        className={`group relative flex items-center justify-between pl-3 pr-2 py-2 rounded-lg text-sm transition ${
+                          isActiveCh
+                            ? 'bg-amber-500/15 text-amber-300 font-bold'
+                            : unread > 0
+                              ? 'text-white font-bold hover:bg-stone-800/60'
+                              : 'text-stone-500 hover:bg-stone-900/60 hover:text-stone-300'
                         }`}
                       >
+                        {/* 左端インジケーター: 選択中=アンバーのバー / 未読=白い点 */}
+                        {isActiveCh ? (
+                          <span className="absolute left-0 top-1.5 bottom-1.5 w-1 rounded-r bg-amber-400" />
+                        ) : unread > 0 ? (
+                          <span className="absolute -left-0.5 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-white" />
+                        ) : null}
                         <button
-                          onClick={() => {
-                            setActiveChannelId(ch.id);
-                            setUnreadCounts(prev => ({ ...prev, [ch.id]: 0 }));
-                          }}
+                          onClick={() => setActiveChannelId(ch.id)}
                           className="flex items-center gap-2 flex-1 text-left truncate min-w-0"
                         >
-                          {ch.type === 'voice' ? <Mic className="w-3.5 h-3.5 text-stone-500 shrink-0" /> : <Hash className="w-3.5 h-3.5 text-stone-500 shrink-0" />}
+                          {ch.type === 'voice'
+                            ? <Mic className={`w-4 h-4 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
+                            : <Hash className={`w-4 h-4 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />}
                           <span className="truncate">{ch.name}</span>
                         </button>
 
                         <div className="flex items-center gap-1 shrink-0 ml-1">
                           {/* 未読バッジ */}
-                          {(unreadCounts[ch.id] || 0) > 0 && activeChannelId !== ch.id && (
-                            <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.2 rounded-full">
-                              {unreadCounts[ch.id]}
+                          {unread > 0 && (
+                            <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold leading-5 text-center shadow">
+                              {unread > 99 ? '99+' : unread}
                             </span>
                           )}
 
@@ -2043,7 +2634,8 @@ export default function App() {
                           )}
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -2132,7 +2724,24 @@ export default function App() {
                     <Layout className="w-3.5 h-3.5" />
                   </button>
                   <Hash className="w-4 h-4 text-amber-400" />
-                  <span>{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
+                  <span className="text-sm">{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
+                  <span
+                    className={`ml-1 flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-normal ${
+                      wsStatus === 'online'
+                        ? 'border-emerald-700/60 text-emerald-400 bg-emerald-950/30'
+                        : wsStatus === 'offline'
+                          ? 'border-red-800/70 text-red-400 bg-red-950/30'
+                          : 'border-amber-700/60 text-amber-400 bg-amber-950/30'
+                    }`}
+                    title={wsStatus === 'online' ? 'WebSocketでリアルタイム接続中' : 'WebSocket再接続中（その間は3秒ごとに自動同期）'}
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${
+                      wsStatus === 'online' ? 'bg-emerald-400' : wsStatus === 'offline' ? 'bg-red-400' : 'bg-amber-400 animate-pulse'
+                    }`} />
+                    <span className="hidden sm:inline">
+                      {wsStatus === 'online' ? 'リアルタイム' : wsStatus === 'offline' ? 'オフライン' : wsStatus === 'connecting' ? '接続中…' : '再接続中…'}
+                    </span>
+                  </span>
                 </div>
 
                 <div className="flex items-center gap-2">
@@ -2197,9 +2806,39 @@ export default function App() {
                 </div>
               )}
 
-              <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              <div className="relative flex-1 min-h-0 flex flex-col">
+              <div ref={chatScrollContainerRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto px-2 sm:px-4 py-3">
+                {/* 過去ログ読み込み (上端で自動 / 手動ボタン) */}
+                {hasMoreMessages && messages.length > 0 && !chatSearchQuery && (
+                  <div className="flex justify-center py-2">
+                    <button
+                      onClick={handleLoadMoreMessages}
+                      disabled={isLoadingMoreMessages}
+                      className="px-4 py-1.5 rounded-full bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 text-xs transition flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+                    >
+                      {isLoadingMoreMessages ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                          <span>過去ログを読み込み中...</span>
+                        </>
+                      ) : (
+                        <>
+                          <ArrowDown className="w-3.5 h-3.5 rotate-180 text-amber-400" />
+                          <span>過去のメッセージを読み込む</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
+
+                {!hasMoreMessages && messages.length > 0 && !chatSearchQuery && (
+                  <div className="text-center text-[11px] text-stone-600 py-3">
+                    #{channels.find(c => c.id === activeChannelId)?.name} の最初のメッセージです
+                  </div>
+                )}
+
                 {messages.filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
-                  <div className="h-full flex flex-col items-center justify-center text-stone-600 font-mono text-xs space-y-2">
+                  <div className="h-full flex flex-col items-center justify-center text-stone-600 text-xs space-y-2">
                     <MessageSquare className="w-8 h-8 opacity-40 text-amber-400" />
                     <p>メッセージはありません。@gemini でAIと会話できます。</p>
                   </div>
@@ -2207,52 +2846,80 @@ export default function App() {
                   messages
                     .filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase()))
                     .map((m, mIdx, filteredList) => {
-                      const lastReadId = lastReadMessageIds[activeChannelId] || 0;
-                      const isUnread = lastReadId > 0 && m.id > lastReadId;
+                      const lastReadId = unreadAnchor && unreadAnchor.channelId === activeChannelId ? unreadAnchor.lastReadId : 0;
                       const prevMsg = mIdx > 0 ? filteredList[mIdx - 1] : null;
-                      const isFirstUnread = isUnread && (!prevMsg || prevMsg.id <= lastReadId);
+                      const isMine = m.user_id === currentUser?.id;
+                      const isUnread = lastReadId > 0 && m.id > lastReadId && !isMine;
+                      const isFirstUnread = isUnread && (!prevMsg || prevMsg.id <= lastReadId || prevMsg.id < 0);
+                      const senderName = m.sender_username || m.username || 'unknown';
+                      const isGemini = senderName === 'Gemini';
+                      const created = new Date(m.created_at);
+                      const prevCreated = prevMsg ? new Date(prevMsg.created_at) : null;
+                      const isNewDay = !prevCreated || prevCreated.toDateString() !== created.toDateString();
+                      // 同じ人が5分以内に連投した場合はアバター/名前を省略してまとめる
+                      const isGrouped = Boolean(
+                        prevMsg && !isNewDay && !isFirstUnread && !m.is_pinned && !prevMsg.is_pinned &&
+                        (prevMsg.sender_username || prevMsg.username) === senderName &&
+                        created.getTime() - (prevCreated?.getTime() || 0) < 5 * 60 * 1000
+                      );
+                      const isMentioningMe = Boolean(
+                        currentUser && !isMine && (m.content.includes(`@${currentUser.username}`) || m.content.includes('@everyone'))
+                      );
+                      const timeLabel = created.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
                       return (
                         <React.Fragment key={m.id}>
-                          {isFirstUnread && (
-                            <div className="flex items-center gap-3 my-3">
-                              <div className="flex-1 h-px bg-red-500/60" />
-                              <span className="text-[10px] font-mono font-bold text-red-400 bg-red-950/60 border border-red-800/80 px-2.5 py-0.5 rounded-full uppercase tracking-wider flex items-center gap-1">
-                                <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />
-                                ここから未読メッセージ
-                              </span>
-                              <div className="flex-1 h-px bg-red-500/60" />
+                          {isNewDay && (
+                            <div className="flex items-center gap-3 my-4">
+                              <div className="flex-1 h-px bg-stone-800" />
+                              <span className="text-[11px] font-bold text-stone-500">{formatDateSeparator(created)}</span>
+                              <div className="flex-1 h-px bg-stone-800" />
                             </div>
                           )}
 
-                          <div 
-                            id={`msg-${m.id}`}
-                            className={`flex items-start gap-3 group relative p-1.5 rounded-xl transition ${
-                              m.is_pinned ? 'bg-amber-500/5 border border-amber-500/20' : ''
-                            }`}
-                          >
-                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-mono font-bold uppercase shrink-0 ${
-                              m.sender_username === 'Gemini' 
-                                ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40' 
-                                : 'bg-stone-800 border border-stone-700 text-stone-300'
-                            }`}>
-                              {m.sender_username === 'Gemini' ? 'AI' : (m.sender_username || m.username || 'U')[0]}
+                          {isFirstUnread && (
+                            <div ref={unreadMessageRef} className="flex items-center gap-2 my-2">
+                              <div className="flex-1 h-px bg-red-500" />
+                              <span className="text-[10px] font-bold text-white bg-red-500 px-2 py-0.5 rounded">
+                                新着
+                              </span>
                             </div>
+                          )}
+
+                          <div
+                            id={`msg-${m.id}`}
+                            className={`flex items-start gap-3 group relative px-2 rounded-lg transition hover:bg-white/[0.03] ${
+                              isGrouped ? 'py-0.5' : 'pt-2 pb-0.5 mt-1.5'
+                            } ${m.is_pinned ? 'bg-amber-500/5 border-l-2 border-amber-500/60' : ''} ${
+                              isMentioningMe ? 'bg-amber-500/10 border-l-2 border-amber-400' : ''
+                            } ${m.pending ? 'opacity-60' : ''}`}
+                          >
+                            {isGrouped ? (
+                              <div className="w-9 shrink-0 text-[10px] text-stone-600 text-right pt-1 opacity-0 group-hover:opacity-100 select-none">
+                                {timeLabel}
+                              </div>
+                            ) : (
+                              <div className={`w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold uppercase shrink-0 border ${
+                                isGemini ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : avatarColorFor(senderName)
+                              }`}>
+                                {isGemini ? 'AI' : senderName.replace('[Discord] ', '')[0]}
+                              </div>
+                            )}
 
                             <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-2 mb-1">
-                                <span className={`text-xs font-bold ${m.sender_username === 'Gemini' ? 'text-amber-400 font-mono' : 'text-stone-200'}`}>
-                                  {m.sender_username || m.username}
-                                </span>
-                                <span className="text-[10px] text-stone-500 font-mono">
-                                  {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                </span>
-                                {m.is_pinned && (
-                                  <span className="flex items-center gap-0.5 text-[10px] text-amber-400 bg-amber-400/10 px-1.5 py-0.2 rounded border border-amber-400/20">
-                                    <Pin className="w-2.5 h-2.5" /> ピン留め
+                              {!isGrouped && (
+                                <div className="flex items-baseline gap-2 mb-0.5">
+                                  <span className={`text-sm font-bold ${isGemini ? 'text-amber-400' : isMine ? 'text-amber-200' : 'text-stone-100'}`}>
+                                    {senderName}
                                   </span>
-                                )}
-                              </div>
+                                  <span className="text-[11px] text-stone-500">{timeLabel}</span>
+                                  {m.is_pinned && (
+                                    <span className="flex items-center gap-0.5 text-[10px] text-amber-400 bg-amber-400/10 px-1.5 rounded border border-amber-400/20">
+                                      <Pin className="w-2.5 h-2.5" /> ピン留め
+                                    </span>
+                                  )}
+                                </div>
+                              )}
 
                               {editingMessageId === m.id ? (
                                 <div className="flex items-center gap-2 mt-1">
@@ -2260,7 +2927,13 @@ export default function App() {
                                     type="text"
                                     value={editingContent}
                                     onChange={e => setEditingContent(e.target.value)}
-                                    className="flex-1 bg-[#16181D] border border-amber-500 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none"
+                                    onKeyDown={e => {
+                                      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                                      if (e.key === 'Enter') handleEditMessage(m.id);
+                                      if (e.key === 'Escape') setEditingMessageId(null);
+                                    }}
+                                    autoFocus
+                                    className="flex-1 bg-[#16181D] border border-amber-500 rounded-lg px-2.5 py-1 text-sm text-white focus:outline-none"
                                   />
                                   <button
                                     onClick={() => handleEditMessage(m.id)}
@@ -2276,15 +2949,13 @@ export default function App() {
                                   </button>
                                 </div>
                               ) : (
-                                <div className={`text-sm rounded-xl px-3.5 py-2 inline-block max-w-2xl leading-relaxed ${
-                                  m.sender_username === 'Gemini' 
-                                    ? 'bg-[#151720] border border-amber-500/30 text-amber-100' 
-                                    : 'bg-[#111214] border border-stone-800/80 text-stone-300'
+                                <div className={`text-[15px] leading-relaxed whitespace-pre-wrap break-words ${
+                                  isGemini ? 'text-amber-100' : 'text-stone-200'
                                 }`}>
                                   {m.content.startsWith('![image]') ? (
-                                    <img 
-                                      src={m.content.match(/\((.*?)\)/)?.[1]} 
-                                      alt="attachment" 
+                                    <img
+                                      src={m.content.match(/\((.*?)\)/)?.[1]}
+                                      alt="attachment"
                                       className="max-h-72 rounded-lg object-contain my-1 border border-stone-800"
                                     />
                                   ) : (
@@ -2293,13 +2964,24 @@ export default function App() {
                                 </div>
                               )}
 
+                              {m.pending && (
+                                <div className="text-[10px] text-stone-500 mt-0.5">送信中…</div>
+                              )}
+                              {m.failed && (
+                                <div className="flex items-center gap-2 text-[11px] text-red-400 mt-0.5">
+                                  <span>送信に失敗しました</span>
+                                  <button onClick={() => handleRetryMessage(m)} className="underline hover:text-red-300">再送</button>
+                                  <button onClick={() => handleDiscardFailedMessage(m)} className="underline text-stone-500 hover:text-stone-300">削除</button>
+                                </div>
+                              )}
+
                               {m.reactions && Object.keys(m.reactions).length > 0 && (
-                                <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                                <div className="flex items-center gap-1.5 mt-1 flex-wrap">
                                   {Object.entries(m.reactions).map(([emoji, userIds]) => (
                                     <button
                                       key={emoji}
                                       onClick={() => handleToggleReaction(m.id, emoji)}
-                                      className={`text-xs px-2 py-0.5 rounded-md border font-mono flex items-center gap-1 transition ${
+                                      className={`text-xs px-2 py-0.5 rounded-md border flex items-center gap-1 transition ${
                                         userIds.includes(currentUser?.id)
                                           ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
                                           : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-700'
@@ -2313,7 +2995,8 @@ export default function App() {
                               )}
                             </div>
 
-                            <div className="opacity-0 group-hover:opacity-100 transition absolute right-2 top-2 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-1 shadow-md">
+                            {m.id > 0 && (
+                            <div className="opacity-0 group-hover:opacity-100 transition absolute right-2 -top-3 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-1 shadow-md z-10">
                               <button
                                 onClick={() => handleToggleReaction(m.id, '👍')}
                                 title="いいね"
@@ -2363,12 +3046,33 @@ export default function App() {
                                 </>
                               )}
                             </div>
+                            )}
                           </div>
                         </React.Fragment>
                       );
                     })
                 )}
                 <div ref={messagesEndRef} />
+              </div>
+
+                {/* 新着ピル / 最下部へ */}
+                {newBelowCount > 0 ? (
+                  <button
+                    onClick={scrollToBottom}
+                    className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold shadow-lg flex items-center gap-1 transition z-20"
+                  >
+                    <ArrowDown className="w-3.5 h-3.5" />
+                    新着 {newBelowCount} 件
+                  </button>
+                ) : (
+                  <button
+                    onClick={scrollToBottom}
+                    className="absolute bottom-3 right-4 p-1.5 rounded-full bg-[#16181D]/90 border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-amber-500/50 transition shadow-lg z-20"
+                    title="最下部へスクロール"
+                  >
+                    <ArrowDown className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
 
               {/* Chat Input: Fixed at bottom with shrink-0 */}
@@ -2429,13 +3133,15 @@ export default function App() {
                         }
                       }}
                       onKeyDown={e => {
+                        // 日本語IMEの変換確定Enterでは送信しない
+                        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                         if (e.key === 'Enter' && !e.shiftKey) {
                           e.preventDefault();
                           handleSendMessage(e);
                         }
                       }}
-                      placeholder="メッセージを入力... (@gemini でAI応答, Enterで送信)"
-                      className="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 font-mono"
+                      placeholder={`#${channels.find(c => c.id === activeChannelId)?.name || 'chat'} へメッセージ (@gemini でAI応答)`}
+                      className="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder-stone-600"
                     />
                     <button
                       type="submit"
@@ -2580,16 +3286,53 @@ export default function App() {
                     </span>
                   )}
 
+                  {/* 自動保存インジケーター */}
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-stone-900 border border-stone-800 text-[11px] font-mono">
+                    <span className={`w-2 h-2 rounded-full ${autoSaveStatus === 'saving' ? 'bg-amber-400 animate-pulse' : autoSaveStatus === 'dirty' ? 'bg-orange-500' : 'bg-emerald-400'}`} />
+                    <span className="text-stone-400">
+                      {autoSaveStatus === 'saving' ? '自動保存中...' : autoSaveStatus === 'dirty' ? '未保存' : '自動保存済み'}
+                    </span>
+                  </div>
+
                   {selectedSlotIndex <= 10 ? (
-                    <select
-                      value={memoMode}
-                      disabled={isMonacoLocked}
-                      onChange={e => setMemoMode(e.target.value as any)}
-                      className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2.5 py-1.5 focus:outline-none disabled:opacity-50"
-                    >
-                      <option value="markdown">Markdownモード</option>
-                      <option value="plain">プレーンテキスト</option>
-                    </select>
+                    <div className="flex items-center gap-1.5">
+                      <select
+                        value={memoMode}
+                        disabled={isMonacoLocked}
+                        onChange={e => setMemoMode(e.target.value as any)}
+                        className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2.5 py-1.5 focus:outline-none disabled:opacity-50 text-xs font-mono"
+                      >
+                        <option value="markdown">Markdownモード</option>
+                        <option value="plain">プレーンテキスト</option>
+                      </select>
+
+                      {memoMode === 'markdown' && (
+                        <div className="flex items-center bg-[#14161C] border border-stone-800 rounded-lg p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setMemoViewMode('split')}
+                            className={`px-2 py-1 rounded text-[11px] font-mono flex items-center gap-1 transition ${
+                              memoViewMode === 'split' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
+                            }`}
+                            title="編集とプレビューの2分割表示"
+                          >
+                            <Book className="w-3 h-3" />
+                            <span>分割編集</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setMemoViewMode('view_only')}
+                            className={`px-2 py-1 rounded text-[11px] font-mono flex items-center gap-1 transition ${
+                              memoViewMode === 'view_only' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
+                            }`}
+                            title="大画面でマークダウンを綺麗に閲覧"
+                          >
+                            <Eye className="w-3 h-3" />
+                            <span>閲覧専用</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   ) : (
                     <span className="text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-lg text-xs font-mono font-bold flex items-center gap-1">
                       <Code className="w-3 h-3" /> Monaco Editor
@@ -2628,11 +3371,11 @@ export default function App() {
                   </div>
 
                   <button
-                    onClick={handleSaveMemo}
+                    onClick={() => handleSaveMemo()}
                     disabled={isSavingMemo || isMonacoLocked}
                     className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition interactive-btn uppercase disabled:opacity-50"
                   >
-                    {isSavingMemo ? '保存中...' : '保存'}
+                    {isSavingMemo ? '保存中...' : '手動保存'}
                   </button>
                 </div>
               </div>
@@ -2655,7 +3398,38 @@ export default function App() {
                       onChange={val => handleMemoContentChange(val || '')}
                     />
                   </div>
+                ) : memoMode === 'plain' ? (
+                  /* プレーンテキスト選択時: Markdown Live Previewは非表示で全幅編集 */
+                  <div className="flex-1 p-4 overflow-hidden">
+                    <textarea
+                      value={memoContent}
+                      onChange={e => handleMemoContentChange(e.target.value)}
+                      placeholder="プレーンテキストを入力..."
+                      className="w-full h-full bg-[#16181D] border border-stone-800 rounded-xl p-4 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
+                    />
+                  </div>
+                ) : memoViewMode === 'view_only' ? (
+                  /* Markdown閲覧専用モード: 大画面で実際のMarkdownを快適に読む */
+                  <div className="flex-1 p-6 overflow-y-auto">
+                    <div className="max-w-4xl mx-auto bg-[#16181D]/80 border border-stone-800 rounded-2xl p-6 sm:p-8 text-stone-200 font-sans leading-relaxed prose prose-invert max-w-none shadow-xl">
+                      <div className="flex items-center justify-between pb-3 mb-4 border-b border-stone-800 text-xs font-mono text-stone-400">
+                        <span className="flex items-center gap-1.5 text-amber-400 font-bold">
+                          <Eye className="w-3.5 h-3.5" /> MARKDOWN VIEW-ONLY MODE
+                        </span>
+                        <button
+                          onClick={() => setMemoViewMode('split')}
+                          className="px-2.5 py-1 rounded bg-stone-900 border border-stone-700 hover:border-amber-500 text-stone-300 hover:text-white transition"
+                        >
+                          編集モードに戻る
+                        </button>
+                      </div>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {memoContent || '（内容がありません）'}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
                 ) : (
+                  /* Markdown 2分割編集モード */
                   <div className="flex-1 flex gap-4 p-4 overflow-hidden">
                     <textarea
                       value={memoContent}
@@ -2664,8 +3438,14 @@ export default function App() {
                       className="flex-1 h-full bg-[#16181D] border border-stone-800 rounded-xl p-3.5 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
                     />
                     <div className="flex-1 h-full bg-[#16181D]/60 border border-stone-800 rounded-xl p-4 text-stone-300 font-sans text-sm overflow-y-auto leading-relaxed prose prose-invert max-w-none">
-                      <div className="text-[10px] font-mono text-stone-500 mb-2 border-b border-stone-800 pb-1">
-                        MARKDOWN LIVE PREVIEW
+                      <div className="flex items-center justify-between text-[10px] font-mono text-stone-500 mb-2 border-b border-stone-800 pb-1">
+                        <span>MARKDOWN LIVE PREVIEW</span>
+                        <button
+                          onClick={() => setMemoViewMode('view_only')}
+                          className="hover:text-amber-400 transition"
+                        >
+                          [全画面閲覧]
+                        </button>
                       </div>
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
                         {memoContent || '（内容がありません）'}
@@ -2716,7 +3496,7 @@ export default function App() {
             </div>
 
             {/* AI Messages Stream */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-4xl w-full mx-auto">
+            <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-6xl w-full mx-auto">
               {aiMessages.map(msg => (
                 <div
                   key={msg.id}
@@ -2741,11 +3521,52 @@ export default function App() {
                     {msg.role === 'user' ? (
                       <div className="whitespace-pre-wrap">{msg.content}</div>
                     ) : (
-                      <div className="prose prose-invert prose-xs max-w-none overflow-x-auto">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {msg.content}
-                        </ReactMarkdown>
-                      </div>
+                      <>
+                        <div className="prose prose-invert prose-xs max-w-none overflow-x-auto">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {msg.content}
+                          </ReactMarkdown>
+                        </div>
+                        {/* メモ連携アクションバー */}
+                        <div className="mt-3 pt-2.5 border-t border-stone-800/80 flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handleMemoContentChange(msg.content);
+                              alert(`現在のメモ(#${selectedSlotIndex})にAIの回答を反映しました！`);
+                            }}
+                            className="px-2 py-1 rounded bg-stone-900 border border-stone-800 hover:border-emerald-500/50 text-stone-300 hover:text-emerald-400 text-[10px] transition flex items-center gap-1 font-mono"
+                            title="現在のメモをこの回答で上書き"
+                          >
+                            <FileText className="w-3 h-3 text-emerald-400" />
+                            <span>メモに反映(上書き)</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const newContent = memoContent ? `${memoContent}\n\n---\n${msg.content}` : msg.content;
+                              handleMemoContentChange(newContent);
+                              alert(`現在のメモ(#${selectedSlotIndex})の末尾に追記しました！`);
+                            }}
+                            className="px-2 py-1 rounded bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 text-[10px] transition flex items-center gap-1 font-mono"
+                            title="現在のメモの末尾にこの回答を追記"
+                          >
+                            <Plus className="w-3 h-3 text-amber-400" />
+                            <span>メモに追記</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(msg.content);
+                              alert('クリップボードにコピーしました！');
+                            }}
+                            className="px-2 py-1 rounded bg-stone-900 border border-stone-800 hover:border-stone-600 text-stone-400 hover:text-white text-[10px] transition flex items-center gap-1 font-mono"
+                          >
+                            <Copy className="w-3 h-3" />
+                            <span>コピー</span>
+                          </button>
+                        </div>
+                      </>
                     )}
                   </div>
                 </div>
@@ -2766,10 +3587,35 @@ export default function App() {
 
             {/* Input Form: Fixed at bottom with shrink-0 */}
             <div className="p-4 border-t border-stone-800/80 bg-[#111214] shrink-0">
-              <form onSubmit={handleSendAiMessage} className="max-w-4xl mx-auto flex gap-2">
+              <div className="max-w-6xl mx-auto mb-2 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-stone-400">
+                <div className="flex items-center gap-2">
+                  <span className="text-stone-500">選択中メモ:</span>
+                  <span className="text-amber-400 font-bold">#{selectedSlotIndex} {memoTitle || 'メモ'}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!memoContent.trim()) {
+                        alert('現在のメモに本文がありません。');
+                        return;
+                      }
+                      const quote = `【#${selectedSlotIndex} ${memoTitle || 'メモ'}の内容】\n${memoContent}\n\n`;
+                      setAiInput(prev => quote + prev);
+                    }}
+                    className="px-2 py-0.5 rounded bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 transition flex items-center gap-1"
+                    title="現在のメモの内容を質問欄に引用"
+                  >
+                    <FileText className="w-3 h-3 text-amber-400" />
+                    <span>メモ内容を引用して質問</span>
+                  </button>
+                </div>
+                <div className="text-[10px] text-stone-500 flex items-center gap-1">
+                  <span>※質問内で <code className="text-amber-400/80">#メモ名</code> や <code className="text-amber-400/80">#チャンネル名</code> を含めると自動参照されます</span>
+                </div>
+              </div>
+              <form onSubmit={handleSendAiMessage} className="max-w-6xl mx-auto flex gap-2">
                 <input
                   type="text"
-                  placeholder="Geminiに質問を入力 (例: 次の数学のテスト対策どうすればいい？、この課題の要約して)..."
+                  placeholder="Geminiに質問を入力 (#メモ名 や #チャンネル名 でDB自動取得)..."
                   value={aiInput}
                   onChange={e => setAiInput(e.target.value)}
                   disabled={isLoadingAi}
@@ -2829,53 +3675,116 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 提出物作成フォーム */}
-              <form onSubmit={handleCreateAssignment} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 space-y-3 font-mono text-xs">
-                <div className="text-stone-300 font-bold uppercase tracking-wider flex items-center gap-1.5">
-                  <Plus className="w-4 h-4 text-amber-400" /> 新規提出物の登録
+              {/* 提出物作成フォーム (簡易入力・選択肢充実) */}
+              <form onSubmit={handleCreateAssignment} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 sm:p-5 space-y-3 font-mono text-xs shadow-lg">
+                <div className="flex items-center justify-between text-stone-300 font-bold uppercase tracking-wider">
+                  <span className="flex items-center gap-1.5 text-white">
+                    <Plus className="w-4 h-4 text-amber-400" /> 新規提出物の登録
+                  </span>
+                  <span className="text-[10px] text-stone-500 font-normal">ワンタップ入力対応</span>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <input
-                    type="text"
-                    required
-                    placeholder="課題タイトル"
-                    value={newAssignTitle}
-                    onChange={e => setNewAssignTitle(e.target.value)}
-                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
-                  />
-                  <select
-                    value={newAssignSubject}
-                    onChange={e => setNewAssignSubject(e.target.value)}
-                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
-                  >
-                    {['国語', '数学', '英語', '理科', '社会', '情報', '保健体育', 'その他'].map(s => (
-                      <option key={s} value={s}>{s}</option>
+
+                {/* クイック教科選択ボタン */}
+                <div className="space-y-1.5 bg-[#16181D]/60 p-2.5 rounded-xl border border-stone-800/60">
+                  <div className="text-[10px] text-stone-400 font-bold flex items-center justify-between">
+                    <span>教科クイック選択:</span>
+                    <span className="text-amber-400 font-bold">{newAssignSubject}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {['国語', '数学', '英語', '理科', '社会', '情報', '体育', '美術', '音楽', '技家', '総合', 'その他'].map(subj => (
+                      <button
+                        type="button"
+                        key={subj}
+                        onClick={() => setNewAssignSubject(subj)}
+                        className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${
+                          newAssignSubject === subj
+                            ? 'bg-amber-500 text-black font-bold border-amber-400 shadow-sm'
+                            : 'bg-[#111214] text-stone-300 border-stone-800 hover:border-stone-600'
+                        }`}
+                      >
+                        {subj}
+                      </button>
                     ))}
-                  </select>
-                  <input
-                    type="date"
-                    required
-                    value={newAssignDeadline}
-                    onChange={e => setNewAssignDeadline(e.target.value)}
-                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                  </div>
+                </div>
+
+                {/* クイック課題プリセットボタン */}
+                <div className="space-y-1.5 bg-[#16181D]/60 p-2.5 rounded-xl border border-stone-800/60">
+                  <span className="text-[10px] text-stone-400 font-bold block">課題名プリセット:</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {[
+                      { label: '教科書ワーク', prefix: 'ワーク P.' },
+                      { label: '授業プリント', prefix: 'プリント提出' },
+                      { label: 'レポート課題', prefix: 'レポート' },
+                      { label: 'ノート提出', prefix: 'ノート点検' },
+                      { label: 'Web小テスト', prefix: 'Webテスト' },
+                      { label: '週末課題', prefix: '週末課題' },
+                    ].map(preset => (
+                      <button
+                        type="button"
+                        key={preset.label}
+                        onClick={() => setNewAssignTitle(prev => prev ? `${preset.prefix} (${prev})` : preset.prefix)}
+                        className="px-2 py-0.5 rounded-md bg-[#111214] border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-amber-500/50 text-[10px] transition"
+                      >
+                        +{preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="sm:col-span-1">
+                    <label className="text-[10px] text-stone-400 block mb-1">課題タイトル *</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="例: 数学I ワーク P.40-45"
+                      value={newAssignTitle}
+                      onChange={e => setNewAssignTitle(e.target.value)}
+                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-stone-400 block mb-1">提出締切日 *</label>
+                    <input
+                      type="date"
+                      required
+                      value={newAssignDeadline}
+                      onChange={e => setNewAssignDeadline(e.target.value)}
+                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-stone-400 block mb-1">再提出締切日 (任意)</label>
+                    <input
+                      type="date"
+                      value={newAssignResubmitDeadline}
+                      onChange={e => setNewAssignResubmitDeadline(e.target.value)}
+                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-[10px] text-stone-400 block mb-1">指示文・持ち物・注意事項 (Gemini AI要約対応)</label>
+                  <textarea
+                    placeholder="問題番号、提出形式、注意点など。AIが自動要約してフローティング表示できます"
+                    value={newAssignDesc}
+                    onChange={e => setNewAssignDesc(e.target.value)}
+                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-3 text-white focus:outline-none focus:border-amber-500/60 resize-none h-18 text-xs font-mono"
                   />
                 </div>
-                <textarea
-                  placeholder="指示文・持ち物・注意事項（Geminiによる自動要約が使えます）"
-                  value={newAssignDesc}
-                  onChange={e => setNewAssignDesc(e.target.value)}
-                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-3 text-white focus:outline-none focus:border-amber-500/60 resize-none h-18"
-                />
+
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition interactive-btn uppercase"
+                  className="w-full sm:w-auto px-6 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition interactive-btn uppercase tracking-wider"
                 >
-                  提出物を追加
+                  提出物を追加登録
                 </button>
               </form>
 
               {/* フィルター */}
-              <div className="flex items-center gap-2 font-mono text-xs">
+              <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
                 <span className="text-stone-500">Filter:</span>
                 {[
                   { id: 'all', label: 'すべて' },
@@ -2889,7 +3798,7 @@ export default function App() {
                     onClick={() => setAssignmentFilter(f.id as any)}
                     className={`px-2.5 py-1 rounded-lg border transition ${
                       assignmentFilter === f.id
-                        ? 'bg-amber-500/10 text-amber-400 border-amber-500/40'
+                        ? 'bg-amber-500/10 text-amber-400 border-amber-500/40 font-bold'
                         : 'bg-[#111214] text-stone-400 border-stone-800 hover:border-stone-700'
                     }`}
                   >
@@ -2905,83 +3814,113 @@ export default function App() {
                     表示できる提出物はありません。
                   </div>
                 ) : (
-                  filteredAssignments.map((item) => (
-                    <div key={item.id} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4.5 interactive-card space-y-3">
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                        <div className="flex items-center gap-2.5">
-                          <span className="px-2.5 py-0.5 rounded-lg text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 font-bold">
-                            {item.subject}
-                          </span>
-                          <span className="font-bold text-white text-base">{item.title}</span>
+                  filteredAssignments.map((item) => {
+                    const membersProg = assignmentMembersProgress[item.id] || [];
+                    const submittedOrPassedCount = membersProg.filter(p => p.status === 'submitted' || p.status === 'passed').length;
+                    const totalMembers = membersProg.length;
+
+                    return (
+                      <div key={item.id} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4.5 interactive-card space-y-3 shadow-lg">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div className="flex items-center gap-2.5 flex-wrap">
+                            <span className="px-2.5 py-0.5 rounded-lg text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 font-bold">
+                              {item.subject}
+                            </span>
+                            <span className="font-bold text-white text-base">{item.title}</span>
+                          </div>
+
+                          {/* アクションボタン群 */}
+                          <div className="flex items-center gap-2 font-mono text-xs flex-wrap">
+                            {/* メンバー別進捗確認ボタン */}
+                            <button
+                              type="button"
+                              onClick={() => setShowMemberProgressModalId(item.id)}
+                              className="px-2.5 py-1 rounded-lg bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 text-[11px] transition flex items-center gap-1.5"
+                              title="全員の提出状況を確認"
+                            >
+                              <Users className="w-3.5 h-3.5 text-amber-400" />
+                              <span>進捗: {submittedOrPassedCount}{totalMembers > 0 ? `/${totalMembers}人` : '人'}</span>
+                            </button>
+
+                            {/* 提出物編集ボタン */}
+                            <button
+                              type="button"
+                              onClick={() => setEditingAssignment(item)}
+                              className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 hover:border-stone-600 text-stone-400 hover:text-white transition"
+                              title="提出物を編集"
+                            >
+                              <Edit3 className="w-3.5 h-3.5" />
+                            </button>
+
+                            {/* ステータスセレクト */}
+                            <select
+                              value={item.my_status}
+                              onChange={e => handleUpdateAssignmentStatus(item.id, e.target.value)}
+                              className={`px-3 py-1 rounded-lg border font-bold focus:outline-none ${
+                                item.my_status === 'passed'
+                                  ? 'bg-emerald-950/40 border-emerald-800 text-emerald-400'
+                                  : item.my_status === 'submitted'
+                                  ? 'bg-sky-950/40 border-sky-800 text-sky-400'
+                                  : item.my_status === 'in_progress'
+                                  ? 'bg-amber-950/40 border-amber-800 text-amber-400'
+                                  : 'bg-stone-900 border-stone-800 text-stone-400'
+                              }`}
+                            >
+                              <option value="unstarted">未着手</option>
+                              <option value="in_progress">進行中</option>
+                              <option value="submitted">提出済み</option>
+                              <option value="resubmit">再提出</option>
+                              <option value="passed">合格</option>
+                            </select>
+
+                            {/* 削除ボタン */}
+                            <button
+                              onClick={() => handleDeleteAssignment(item.id)}
+                              className="p-1.5 rounded-lg text-stone-500 hover:text-red-400 hover:bg-stone-800 transition"
+                              title="提出物を削除"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
 
-                        {/* ステータスセレクト & 削除ボタン */}
-                        <div className="flex items-center gap-2 font-mono text-xs">
-                          <select
-                            value={item.my_status}
-                            onChange={e => handleUpdateAssignmentStatus(item.id, e.target.value)}
-                            className={`px-3 py-1 rounded-lg border font-bold focus:outline-none ${
-                              item.my_status === 'passed'
-                                ? 'bg-emerald-950/40 border-emerald-800 text-emerald-400'
-                                : item.my_status === 'submitted'
-                                ? 'bg-sky-950/40 border-sky-800 text-sky-400'
-                                : item.my_status === 'in_progress'
-                                ? 'bg-amber-950/40 border-amber-800 text-amber-400'
-                                : 'bg-stone-900 border-stone-800 text-stone-400'
-                            }`}
-                          >
-                            <option value="unstarted">未着手</option>
-                            <option value="in_progress">進行中</option>
-                            <option value="submitted">提出済み</option>
-                            <option value="resubmit">再提出</option>
-                            <option value="passed">合格</option>
-                          </select>
-
-                          <button
-                            onClick={() => handleDeleteAssignment(item.id)}
-                            className="p-1.5 rounded-lg text-stone-500 hover:text-red-400 hover:bg-stone-800 transition"
-                            title="提出物を削除"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="flex flex-wrap items-center gap-4 text-xs font-mono text-stone-400">
-                        <div>締切: <span className="text-stone-200 font-bold">{new Date(item.deadline).toLocaleDateString()}</span></div>
-                        {item.resubmit_deadline && (
-                          <div>再提出締切: <span className="text-stone-200">{new Date(item.resubmit_deadline).toLocaleDateString()}</span></div>
-                        )}
-                      </div>
-
-                      {item.description && (
-                        <div className="bg-[#16181D] border border-stone-800/60 rounded-xl p-3 text-xs text-stone-300 font-sans leading-relaxed">
-                          {item.description}
-                        </div>
-                      )}
-
-                      {/* Gemini 要約ボタン & 要約表示 */}
-                      <div className="flex flex-col gap-2 pt-1 border-t border-stone-800/50">
-                        <div className="flex items-center justify-between">
-                          <button
-                            onClick={() => handleSummarizeAssignment(item)}
-                            disabled={isSummarizingAI === item.id || !item.description}
-                            className="text-xs font-mono flex items-center gap-1.5 text-amber-400 hover:text-amber-300 disabled:opacity-40 transition"
-                          >
-                            <Sparkles className="w-3.5 h-3.5" />
-                            <span>{isSummarizingAI === item.id ? 'Gemini 要約中...' : 'Geminiで要約・重要ポイント抽出'}</span>
-                          </button>
+                        <div className="flex flex-wrap items-center gap-4 text-xs font-mono text-stone-400">
+                          <div>締切: <span className="text-stone-200 font-bold">{new Date(item.deadline).toLocaleDateString()}</span></div>
+                          {item.resubmit_deadline && (
+                            <div>再提出締切: <span className="text-amber-300 font-bold">{new Date(item.resubmit_deadline).toLocaleDateString()}</span></div>
+                          )}
                         </div>
 
-                        {summarizedTexts[item.id] && (
-                          <div className="bg-[#141720] border border-amber-500/30 rounded-xl p-3 text-xs text-amber-100 font-mono whitespace-pre-wrap leading-relaxed">
-                            <div className="text-[10px] text-amber-400 font-bold mb-1">AI要約結果:</div>
-                            {summarizedTexts[item.id]}
+                        {item.description && (
+                          <div className="bg-[#16181D] border border-stone-800/60 rounded-xl p-3 text-xs text-stone-300 font-sans leading-relaxed">
+                            {item.description}
                           </div>
                         )}
+
+                        {/* Gemini 要約ボタン & 要約表示 */}
+                        <div className="flex flex-col gap-2 pt-1 border-t border-stone-800/50">
+                          <div className="flex items-center justify-between">
+                            <button
+                              onClick={() => handleSummarizeAssignment(item)}
+                              disabled={isSummarizingAI === item.id || !item.description}
+                              className="text-xs font-mono flex items-center gap-1.5 text-amber-400 hover:text-amber-300 disabled:opacity-40 transition"
+                            >
+                              <Sparkles className="w-3.5 h-3.5" />
+                              <span>{isSummarizingAI === item.id ? 'Gemini 要約中...' : 'Geminiで要約・ポイント抽出 (フローティング表示)'}</span>
+                            </button>
+                            {summarizedTexts[item.id] && (
+                              <button
+                                onClick={() => setFloatingAiSummary({ id: item.id, title: item.title, summary: summarizedTexts[item.id] })}
+                                className="text-[11px] font-mono text-stone-400 hover:text-amber-400 transition"
+                              >
+                                [要約ウィンドウを開く]
+                              </button>
+                            )}
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </div>
@@ -3316,6 +4255,7 @@ export default function App() {
                 <div className="flex gap-1.5 font-mono text-xs bg-[#111214] p-1 rounded-xl border border-stone-800">
                   {[
                     { id: 'account', label: 'アカウント' },
+                    { id: 'appearance', label: '表示・操作' },
                     { id: 'notifications', label: '通知設定' },
                     { id: 'webhook', label: 'Webhook' },
                     { id: 'audit', label: '監査ログ' },
@@ -3342,6 +4282,120 @@ export default function App() {
                   ))}
                 </div>
               </div>
+
+              {/* 0. 表示・操作設定 (UI縮小・スクロール・自動保存) */}
+              {settingsSection === 'appearance' && (
+                <div className="space-y-4">
+                  {/* UI縮小率 */}
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4 shadow-lg">
+                    <div className="flex items-center justify-between border-b border-stone-800 pb-2">
+                      <span className="text-white font-bold text-sm">UI縮小・画面スケール (UI Scale)</span>
+                      <span className="text-amber-400 font-bold">{uiScale}%</span>
+                    </div>
+                    <p className="text-stone-400 leading-relaxed">
+                      Chromebookや小型ノートPC、低解像度モニターでも快適に画面全体を見渡せるよう、全体の表示サイズを縮小・最適化できます。
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {[
+                        { scale: 75, label: '75% (超コンパクト)' },
+                        { scale: 85, label: '85% (推奨・見やすい)' },
+                        { scale: 100, label: '100% (標準サイズ)' },
+                        { scale: 110, label: '110% (文字大きめ)' },
+                      ].map(item => (
+                        <button
+                          key={item.scale}
+                          type="button"
+                          onClick={() => {
+                            setUiScale(item.scale);
+                            localStorage.setItem('asdf_ui_scale', String(item.scale));
+                          }}
+                          className={`p-3 rounded-xl border text-center transition ${
+                            uiScale === item.scale
+                              ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold shadow-sm'
+                              : 'bg-[#16181D] border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
+                          }`}
+                        >
+                          <div className="text-sm font-bold">{item.scale}%</div>
+                          <div className="text-[10px] text-stone-500 mt-1">{item.label.split(' ')[1]}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* チャット自動スクロール */}
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4 shadow-lg">
+                    <div className="flex items-center justify-between border-b border-stone-800 pb-2">
+                      <span className="text-white font-bold text-sm">チャット自動スクロール挙動</span>
+                      <span className="text-amber-400 font-bold uppercase">{chatAutoScrollMode}</span>
+                    </div>
+                    <p className="text-stone-400 leading-relaxed">
+                      新着メッセージ受信時の画面スクロール動作を選択できます。「未読で停止」にすると、過去ログを読んでいる最中に勝手に最下部へ飛ばされません。
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      {[
+                        { mode: 'always', label: '常に最新へスクロール', desc: '新着を逃さず追従' },
+                        { mode: 'unread_stop', label: '未読位置で停止 (推奨)', desc: '未読があればスクロール固定' },
+                        { mode: 'manual', label: '完全手動スクロール', desc: '勝手に動かない' },
+                      ].map(item => (
+                        <button
+                          key={item.mode}
+                          type="button"
+                          onClick={() => {
+                            setChatAutoScrollMode(item.mode as any);
+                            localStorage.setItem('asdf_chat_scroll_mode', item.mode);
+                          }}
+                          className={`p-3 rounded-xl border text-left transition ${
+                            chatAutoScrollMode === item.mode
+                              ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold shadow-sm'
+                              : 'bg-[#16181D] border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
+                          }`}
+                        >
+                          <div className="font-bold text-white">{item.label}</div>
+                          <div className="text-[10px] text-stone-500 mt-1">{item.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* メモ自動保存間隔 */}
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4 shadow-lg">
+                    <div className="flex items-center justify-between border-b border-stone-800 pb-2">
+                      <span className="text-white font-bold text-sm">メモ自動保存間隔</span>
+                      <span className="text-amber-400 font-bold">
+                        {memoAutoSaveInterval === 0 ? '手動保存のみ' : `${memoAutoSaveInterval / 1000}秒`}
+                      </span>
+                    </div>
+                    <p className="text-stone-400 leading-relaxed">
+                      入力停止後、指定した時間が経過すると自動でサーバーに同期・保存されます。
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {[
+                        { ms: 1000, label: '1秒 (リアルタイム)' },
+                        { ms: 2000, label: '2秒 (標準)' },
+                        { ms: 5000, label: '5秒 (長め)' },
+                        { ms: 0, label: 'オフ (手動のみ)' },
+                      ].map(item => (
+                        <button
+                          key={item.ms}
+                          type="button"
+                          onClick={() => {
+                            setMemoAutoSaveInterval(item.ms);
+                            localStorage.setItem('asdf_memo_autosave', String(item.ms));
+                          }}
+                          className={`p-2.5 rounded-xl border text-center transition ${
+                            memoAutoSaveInterval === item.ms
+                              ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold shadow-sm'
+                              : 'bg-[#16181D] border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
+                          }`}
+                        >
+                          <div className="font-bold">{item.ms === 0 ? 'オフ' : `${item.ms / 1000}秒`}</div>
+                          <div className="text-[10px] text-stone-500 mt-0.5">{item.label.split(' ')[1]}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* 1. アカウント設定 */}
               {settingsSection === 'account' && (
@@ -3522,13 +4576,24 @@ export default function App() {
       </main>
 
       {/* カメラ小窓 (実機WebRTCカメラプレビュー) */}
+      {/* 4. カメラ小窓 & フロント/バック切り替え */}
       {showCamera && (
         <div className="fixed bottom-4 right-4 w-72 bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden z-50">
           <div className="p-2.5 border-b border-stone-800 flex items-center justify-between text-xs font-mono text-stone-400">
             <span className="flex items-center gap-1.5 font-bold text-white">
-              <Camera className="w-3.5 h-3.5 text-amber-400" /> カメラプレビュー
+              <Camera className="w-3.5 h-3.5 text-amber-400" /> カメラ ({cameraFacingMode === 'user' ? 'フロント' : 'バック'})
             </span>
-            <button onClick={() => setShowCamera(false)} className="text-stone-500 hover:text-white">&times;</button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setCameraFacingMode(prev => prev === 'user' ? 'environment' : 'user')}
+                title="フロント/バック切り替え"
+                className="p-1 rounded bg-stone-900 border border-stone-700 hover:text-amber-400 text-stone-300 transition flex items-center gap-1 text-[10px]"
+              >
+                <SwitchCamera className="w-3 h-3 text-amber-400" />
+                <span>切替</span>
+              </button>
+              <button onClick={() => setShowCamera(false)} className="text-stone-500 hover:text-white">&times;</button>
+            </div>
           </div>
           <div className="h-48 bg-black flex items-center justify-center relative overflow-hidden">
             {cameraError ? (
@@ -3541,7 +4606,7 @@ export default function App() {
                 autoPlay
                 playsInline
                 muted
-                className="w-full h-full object-cover"
+                className={`w-full h-full object-cover ${cameraFacingMode === 'user' ? 'scale-x-[-1]' : ''}`}
               />
             )}
           </div>
@@ -3663,17 +4728,20 @@ export default function App() {
         </div>
       )}
 
-      {/* 時間割管理モーダル (ヘッダーの「次の教科」クリック時など) */}
+      {/* 時間割専用エディタモーダル (週間グリッド & ワンタップ編集) */}
       {isTimetableModalOpen && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div 
             onClick={e => e.stopPropagation()} 
-            className="w-full max-w-2xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs max-h-[90vh] flex flex-col"
+            className="w-full max-w-4xl bg-[#111214] border border-amber-500/30 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs max-h-[90vh] flex flex-col"
           >
-            <div className="p-4 border-b border-stone-800 flex items-center justify-between">
+            <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-stone-900/60">
               <div className="flex items-center gap-2">
                 <BookOpen className="w-4 h-4 text-amber-400" />
-                <span className="font-bold text-white text-sm">時間割・時程の管理</span>
+                <span className="font-bold text-white text-sm">時間割専用エディタ</span>
+                <span className="text-[10px] text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded-full font-bold">
+                  {scheduleType === 'normal' ? '通常時程' : scheduleType === 'short' ? '短縮時程' : 'S短時程'}
+                </span>
               </div>
               <button 
                 onClick={() => setIsTimetableModalOpen(false)}
@@ -3685,115 +4753,478 @@ export default function App() {
 
             <div className="p-4 space-y-4 overflow-y-auto flex-1">
               {/* 時程選択 */}
-              <div className="flex items-center gap-2 bg-[#16181D] border border-stone-800 p-2.5 rounded-xl">
-                <span className="text-stone-400 font-bold">時程タイプ:</span>
-                <div className="flex gap-1.5 flex-1">
-                  {[
-                    { id: 'normal', label: '通常時程' },
-                    { id: 'short', label: '短縮時程' },
-                    { id: 's_short', label: 'S短時程' }
-                  ].map(t => (
-                    <button
-                      key={t.id}
-                      onClick={() => setScheduleType(t.id as any)}
-                      className={`px-3 py-1 rounded-lg border transition ${
-                        scheduleType === t.id
-                          ? 'bg-amber-500 text-black font-bold border-amber-500'
-                          : 'border-stone-800 text-stone-400 hover:text-white'
-                      }`}
-                    >
-                      {t.label}
-                    </button>
-                  ))}
+              <div className="flex flex-wrap items-center justify-between gap-2 bg-[#16181D] border border-stone-800 p-2.5 rounded-xl">
+                <div className="flex items-center gap-2">
+                  <span className="text-stone-400 font-bold">時程モード:</span>
+                  <div className="flex gap-1.5">
+                    {[
+                      { id: 'normal', label: '通常時程' },
+                      { id: 'short', label: '短縮時程' },
+                      { id: 's_short', label: 'S短時程' }
+                    ].map(t => (
+                      <button
+                        key={t.id}
+                        onClick={() => setScheduleType(t.id as any)}
+                        className={`px-3 py-1 rounded-lg border text-xs transition ${
+                          scheduleType === t.id
+                            ? 'bg-amber-500 text-black font-bold border-amber-500 shadow-sm'
+                            : 'border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
+                        }`}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+                <span className="text-[10px] text-stone-500">※マスをクリックしてコマを登録・変更できます</span>
               </div>
 
-              {/* 時間割登録フォーム */}
-              <form onSubmit={handleCreateTimetableEntry} className="bg-[#16181D] border border-stone-800 p-3 rounded-xl space-y-3">
-                <div className="text-[11px] font-bold text-stone-300">新しいコマを登録</div>
-                <div className="grid grid-cols-3 gap-2">
-                  <div>
-                    <label className="text-[10px] text-stone-500 block mb-1">曜日</label>
+              {/* クイックコマ登録バー (選択中の曜日・時限に対して) */}
+              <form onSubmit={handleCreateTimetableEntry} className="bg-[#16181D]/80 border border-stone-800 p-3 rounded-xl space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-bold text-stone-300">
+                  <div className="flex items-center gap-2">
+                    <span className="text-amber-400">コマの登録 / 変更:</span>
+                    <span className="bg-amber-500/10 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded">
+                      {['', '月曜日', '火曜日', '水曜日', '木曜日', '金曜日'][newTtDay]} {newTtPeriod}限
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
                     <select
                       value={newTtDay}
                       onChange={e => setNewTtDay(Number(e.target.value))}
-                      className="w-full bg-[#111214] border border-stone-800 rounded-lg px-2 py-1.5 text-white focus:outline-none"
+                      className="bg-[#111214] border border-stone-800 rounded px-2 py-1 text-white text-[11px] focus:outline-none"
                     >
-                      <option value={1}>月曜日</option>
-                      <option value={2}>火曜日</option>
-                      <option value={3}>水曜日</option>
-                      <option value={4}>木曜日</option>
-                      <option value={5}>金曜日</option>
+                      <option value={1}>月曜</option>
+                      <option value={2}>火曜</option>
+                      <option value={3}>水曜</option>
+                      <option value={4}>木曜</option>
+                      <option value={5}>金曜</option>
                     </select>
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-stone-500 block mb-1">時限</label>
                     <select
                       value={newTtPeriod}
                       onChange={e => setNewTtPeriod(Number(e.target.value))}
-                      className="w-full bg-[#111214] border border-stone-800 rounded-lg px-2 py-1.5 text-white focus:outline-none"
+                      className="bg-[#111214] border border-stone-800 rounded px-2 py-1 text-white text-[11px] focus:outline-none"
                     >
                       {[1, 2, 3, 4, 5, 6, 7].map(p => (
                         <option key={p} value={p}>{p}限</option>
                       ))}
                     </select>
                   </div>
-                  <div>
-                    <label className="text-[10px] text-stone-500 block mb-1">教科名</label>
-                    <input
-                      type="text"
-                      required
-                      placeholder="数学、物理など"
-                      value={newTtSubject}
-                      onChange={e => setNewTtSubject(e.target.value)}
-                      className="w-full bg-[#111214] border border-stone-800 rounded-lg px-2 py-1.5 text-white focus:outline-none"
-                    />
-                  </div>
                 </div>
-                <button
-                  type="submit"
-                  className="w-full py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition"
-                >
-                  コマを追加
-                </button>
+
+                {/* クイック教科ボタン */}
+                <div className="flex flex-wrap gap-1.5">
+                  {['国語', '数学', '英語', '物理', '化学', '生物', '日本史', '世界史', '地理', '情報', '体育', '美術', '音楽', 'HR', '自習'].map(subj => (
+                    <button
+                      type="button"
+                      key={subj}
+                      onClick={() => setNewTtSubject(subj)}
+                      className={`px-2 py-0.5 rounded border text-[11px] transition ${
+                        newTtSubject === subj
+                          ? 'bg-amber-500 text-black font-bold border-amber-400'
+                          : 'bg-[#111214] border-stone-800 text-stone-400 hover:text-white'
+                      }`}
+                    >
+                      {subj}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    required
+                    placeholder="教科名を入力 (例: 数学A, コミュ英)..."
+                    value={newTtSubject}
+                    onChange={e => setNewTtSubject(e.target.value)}
+                    className="flex-1 bg-[#111214] border border-stone-800 rounded-lg px-3 py-1.5 text-white focus:outline-none focus:border-amber-500/60"
+                  />
+                  <button
+                    type="submit"
+                    className="px-5 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition uppercase tracking-wider"
+                  >
+                    このコマを保存
+                  </button>
+                </div>
               </form>
 
-              {/* 登録済み時間割一覧 */}
-              <div className="space-y-2">
-                <div className="text-[11px] font-bold text-stone-300">登録済みコマ一覧 ({scheduleType})</div>
-                {timetables.length === 0 ? (
-                  <div className="text-center py-6 text-stone-600">登録されたコマはありません</div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {timetables.map((tt: any) => {
-                      const dayNames = ['', '月', '火', '水', '木', '金'];
-                      return (
-                        <div key={tt.id} className="flex items-center justify-between p-2.5 bg-[#16181D] border border-stone-800 rounded-xl">
-                          <div className="flex items-center gap-2">
-                            <span className="w-6 h-6 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 flex items-center justify-center font-bold">
-                              {dayNames[tt.day_of_week] || '月'}
-                            </span>
-                            <span className="text-stone-400">{tt.period}限</span>
-                            <span className="text-white font-bold">{tt.subject}</span>
-                          </div>
-                          <button
-                            onClick={() => handleDeleteTimetableEntry(tt.id)}
-                            className="p-1 text-stone-500 hover:text-red-400 transition"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+              {/* 週間時間割グリッドエディタ */}
+              <div className="overflow-x-auto rounded-xl border border-stone-800 bg-[#0C0D10]">
+                <table className="w-full text-center border-collapse">
+                  <thead>
+                    <tr className="bg-stone-900/80 border-b border-stone-800 text-stone-400 text-xs">
+                      <th className="py-2.5 px-3 w-16 border-r border-stone-800 font-bold">時限</th>
+                      {['月曜日', '火曜日', '水曜日', '木曜日', '金曜日'].map((day, idx) => (
+                        <th key={day} className="py-2.5 px-3 border-r border-stone-800 last:border-r-0 font-bold">
+                          <span className="text-white">{day}</span>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[1, 2, 3, 4, 5, 6, 7].map(period => (
+                      <tr key={period} className="border-b border-stone-800/80 hover:bg-stone-900/30 transition">
+                        <td className="py-2 px-3 border-r border-stone-800 font-bold text-amber-500/80 bg-stone-950/40">
+                          {period}限
+                        </td>
+                        {[1, 2, 3, 4, 5].map(day => {
+                          const existing = timetables.find(tt => tt.day_of_week === day && tt.period === period);
+                          const isSelected = newTtDay === day && newTtPeriod === period;
+
+                          return (
+                            <td
+                              key={day}
+                              onClick={() => {
+                                setNewTtDay(day);
+                                setNewTtPeriod(period);
+                                if (existing) setNewTtSubject(existing.subject);
+                              }}
+                              className={`py-2 px-2 border-r border-stone-800 last:border-r-0 cursor-pointer transition relative group ${
+                                isSelected
+                                  ? 'bg-amber-500/20 ring-1 ring-amber-500'
+                                  : existing
+                                  ? 'bg-[#14161C]/80 hover:bg-stone-800/60'
+                                  : 'hover:bg-stone-900/40'
+                              }`}
+                            >
+                              {existing ? (
+                                <div className="flex items-center justify-between gap-1 px-2 py-1 bg-amber-500/10 border border-amber-500/30 rounded-lg text-amber-200 font-bold text-xs">
+                                  <span className="truncate">{existing.subject}</span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleDeleteTimetableEntry(existing.id);
+                                    }}
+                                    className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 text-stone-500 transition"
+                                    title="コマを削除"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="text-stone-700 text-[11px] group-hover:text-stone-400 transition">
+                                  +空き
+                                </span>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* メモAI処理結果モーダル */}
+      {/* 提出物編集モーダル */}
+      {editingAssignment && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div 
+            onClick={e => e.stopPropagation()} 
+            className="w-full max-w-lg bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[85vh]"
+          >
+            <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-amber-500/10">
+              <div className="flex items-center gap-2 text-amber-300 font-bold text-sm">
+                <Edit3 className="w-4 h-4 text-amber-400" />
+                <span>提出物の編集</span>
+              </div>
+              <button 
+                onClick={() => setEditingAssignment(null)}
+                className="text-stone-500 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleUpdateAssignment} className="p-4 space-y-3 overflow-y-auto flex-1">
+              <div>
+                <label className="text-[10px] text-stone-400 block mb-1">タイトル *</label>
+                <input
+                  type="text"
+                  required
+                  value={editingAssignment.title}
+                  onChange={e => setEditingAssignment({ ...editingAssignment, title: e.target.value })}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[10px] text-stone-400 block mb-1">教科 *</label>
+                  <select
+                    value={editingAssignment.subject}
+                    onChange={e => setEditingAssignment({ ...editingAssignment, subject: e.target.value })}
+                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  >
+                    {['国語', '数学', '英語', '理科', '社会', '情報', '保健体育', '美術', '音楽', 'その他'].map(s => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-[10px] text-stone-400 block mb-1">提出締切日 *</label>
+                  <input
+                    type="date"
+                    required
+                    value={editingAssignment.deadline ? editingAssignment.deadline.slice(0, 10) : ''}
+                    onChange={e => setEditingAssignment({ ...editingAssignment, deadline: e.target.value })}
+                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[10px] text-stone-400 block mb-1">再提出締切日 (任意)</label>
+                <input
+                  type="date"
+                  value={editingAssignment.resubmit_deadline ? editingAssignment.resubmit_deadline.slice(0, 10) : ''}
+                  onChange={e => setEditingAssignment({ ...editingAssignment, resubmit_deadline: e.target.value || undefined })}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="text-[10px] text-stone-400 block mb-1">指示文・持ち物・注意事項</label>
+                <textarea
+                  value={editingAssignment.description || ''}
+                  onChange={e => setEditingAssignment({ ...editingAssignment, description: e.target.value })}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-3 text-white focus:outline-none resize-none h-24"
+                />
+              </div>
+
+              <div className="pt-2 flex justify-end gap-2 border-t border-stone-800">
+                <button
+                  type="button"
+                  onClick={() => setEditingAssignment(null)}
+                  className="px-4 py-2 rounded-xl bg-stone-900 border border-stone-800 text-stone-300 hover:text-white transition"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition"
+                >
+                  保存する
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 提出物のメンバー別進捗確認モーダル */}
+      {showMemberProgressModalId && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div 
+            onClick={e => e.stopPropagation()} 
+            className="w-full max-w-lg bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[85vh]"
+          >
+            <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-stone-900/60">
+              <div className="flex items-center gap-2">
+                <Users className="w-4 h-4 text-amber-400" />
+                <span className="font-bold text-white text-sm">メンバー別提出状況</span>
+              </div>
+              <button 
+                onClick={() => setShowMemberProgressModalId(null)}
+                className="text-stone-500 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-4 overflow-y-auto flex-1">
+              {(() => {
+                const targetAssignment = assignments.find(a => a.id === showMemberProgressModalId);
+                const progressList = assignmentMembersProgress[showMemberProgressModalId] || [];
+                const passedCount = progressList.filter(p => p.status === 'passed').length;
+                const submittedCount = progressList.filter(p => p.status === 'submitted').length;
+                const total = progressList.length || 1;
+                const rate = Math.round(((passedCount + submittedCount) / total) * 100);
+
+                return (
+                  <div className="space-y-4">
+                    {targetAssignment && (
+                      <div className="bg-[#16181D] p-3 rounded-xl border border-stone-800">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/20 px-2 py-0.5 rounded font-bold">
+                            {targetAssignment.subject}
+                          </span>
+                          <span className="font-bold text-white text-sm">{targetAssignment.title}</span>
+                        </div>
+                        <div className="text-[11px] text-stone-400">
+                          締切: {new Date(targetAssignment.deadline).toLocaleDateString()}
+                        </div>
+                        {/* 進捗プログレスバー */}
+                        <div className="mt-2.5 space-y-1">
+                          <div className="flex justify-between text-[10px] text-stone-400 font-bold">
+                            <span>提出率: {rate}%</span>
+                            <span>{passedCount + submittedCount} / {total} 人完了</span>
+                          </div>
+                          <div className="h-2 rounded-full bg-stone-900 border border-stone-800 overflow-hidden flex">
+                            <div style={{ width: `${(passedCount / total) * 100}%` }} className="bg-emerald-500" title="合格" />
+                            <div style={{ width: `${(submittedCount / total) * 100}%` }} className="bg-sky-500" title="提出済み" />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="space-y-1.5">
+                      <div className="text-[11px] font-bold text-stone-400 uppercase tracking-wider px-1">メンバー一覧</div>
+                      {progressList.length === 0 ? (
+                        <div className="p-4 text-center text-stone-600 bg-[#16181D] rounded-xl border border-stone-800">
+                          進捗データがまだありません
+                        </div>
+                      ) : (
+                        progressList.map(member => {
+                          const statusConfig: Record<string, { label: string; cls: string }> = {
+                            passed: { label: '合格', cls: 'bg-emerald-950/60 border-emerald-800 text-emerald-300 font-bold' },
+                            submitted: { label: '提出済み', cls: 'bg-sky-950/60 border-sky-800 text-sky-300 font-bold' },
+                            in_progress: { label: '進行中', cls: 'bg-amber-950/60 border-amber-800 text-amber-300' },
+                            resubmit: { label: '再提出', cls: 'bg-red-950/60 border-red-800 text-red-300 font-bold' },
+                            unstarted: { label: '未着手', cls: 'bg-stone-900 border-stone-800 text-stone-500' }
+                          };
+                          const conf = statusConfig[member.status] || statusConfig.unstarted;
+
+                          return (
+                            <div
+                              key={member.userId}
+                              className="flex items-center justify-between p-2.5 bg-[#16181D] border border-stone-800/80 rounded-xl"
+                            >
+                              <div className="flex items-center gap-2.5">
+                                <div className="w-7 h-7 rounded-full bg-stone-800 border border-stone-700 flex items-center justify-center text-white font-bold text-xs uppercase">
+                                  {member.username.slice(0, 1)}
+                                </div>
+                                <span className="font-bold text-white text-xs">{member.username}</span>
+                              </div>
+                              <span className={`px-2.5 py-1 rounded-lg border text-[11px] ${conf.cls}`}>
+                                {conf.label}
+                              </span>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="p-3 border-t border-stone-800 flex justify-end bg-stone-900/60">
+              <button
+                type="button"
+                onClick={() => setShowMemberProgressModalId(null)}
+                className="px-4 py-1.5 bg-stone-800 hover:bg-stone-700 text-stone-200 rounded-xl transition"
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 提出物AI要約フローティングモーダル (JSON解析 & リッチ表示) */}
+      {floatingAiSummary && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div 
+            onClick={e => e.stopPropagation()} 
+            className="w-full max-w-xl bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[85vh]"
+          >
+            <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-amber-500/10">
+              <div className="flex items-center gap-2 text-amber-300 font-bold">
+                <Sparkles className="w-4 h-4 text-amber-400" />
+                <span>Gemini AI 要約: {floatingAiSummary.title}</span>
+              </div>
+              <button 
+                onClick={() => setFloatingAiSummary(null)}
+                className="text-stone-500 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3 overflow-y-auto flex-1 select-text">
+              {(() => {
+                let parsed: any = null;
+                try {
+                  const clean = floatingAiSummary.summary.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+                  if (clean.startsWith('{') && clean.endsWith('}')) {
+                    parsed = JSON.parse(clean);
+                  }
+                } catch {}
+
+                if (parsed && typeof parsed === 'object') {
+                  return (
+                    <div className="space-y-3 font-sans text-xs">
+                      {parsed.title && (
+                        <div className="text-sm font-bold text-amber-300 font-mono pb-1 border-b border-stone-800">
+                          {parsed.title}
+                        </div>
+                      )}
+                      {parsed.summary && (
+                        <div className="bg-[#16181D] border border-stone-800 p-3 rounded-xl leading-relaxed text-stone-200">
+                          {parsed.summary}
+                        </div>
+                      )}
+                      {Object.entries(parsed).filter(([k]) => !['title', 'summary'].includes(k)).map(([key, val]) => {
+                        const keyLabel = key === 'deadline' ? '締切' : key === 'items' ? '持ち物' : key === 'points' ? '重要事項' : key;
+                        return (
+                          <div key={key} className="bg-[#14161C] border border-stone-800/80 p-3 rounded-xl">
+                            <div className="text-[10px] font-mono uppercase font-bold text-amber-400 mb-1">{keyLabel}</div>
+                            {Array.isArray(val) ? (
+                              <ul className="list-disc list-inside space-y-1 text-stone-300">
+                                {val.map((item, idx) => (
+                                  <li key={idx}>{typeof item === 'object' ? JSON.stringify(item) : String(item)}</li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <div className="text-stone-300">{String(val)}</div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="prose prose-invert prose-xs max-w-none text-stone-200 font-sans leading-relaxed whitespace-pre-wrap">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {floatingAiSummary.summary}
+                    </ReactMarkdown>
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="p-3 border-t border-stone-800 flex justify-end gap-2 bg-[#16181D]">
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(floatingAiSummary.summary);
+                  alert('クリップボードに要約内容をコピーしました！');
+                }}
+                className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-white rounded-lg transition flex items-center gap-1.5"
+              >
+                <Copy className="w-3.5 h-3.5 text-amber-400" />
+                <span>コピー</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setFloatingAiSummary(null)}
+                className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition"
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* メモAI処理結果モーダル (反映ボタン付き) */}
       {memoAiResultModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div 
@@ -3815,23 +5246,41 @@ export default function App() {
             <div className="p-4 overflow-y-auto flex-1 text-stone-200 whitespace-pre-wrap leading-relaxed select-text">
               {memoAiResultModal}
             </div>
-            <div className="p-3 border-t border-stone-800 flex justify-end gap-2 bg-[#16181D]">
+            <div className="p-3 border-t border-stone-800 flex items-center justify-between bg-[#16181D]">
               <button
+                type="button"
                 onClick={() => {
-                  navigator.clipboard.writeText(memoAiResultModal);
-                  alert('クリップボードにコピーしました！');
+                  handleMemoContentChange(memoAiResultModal);
+                  setMemoAiResultModal(null);
+                  alert('現在のメモにAI処理結果を反映しました！');
                 }}
-                className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-white rounded-lg transition flex items-center gap-1.5"
+                className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition flex items-center gap-1.5 shadow-sm"
+                title="現在のメモをこの結果で上書き反映"
               >
-                <Copy className="w-3.5 h-3.5 text-amber-400" />
-                <span>結果をコピー</span>
+                <Check className="w-3.5 h-3.5" />
+                <span>メモに反映する</span>
               </button>
-              <button
-                onClick={() => setMemoAiResultModal(null)}
-                className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition"
-              >
-                閉じる
-              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(memoAiResultModal);
+                    alert('クリップボードにコピーしました！');
+                  }}
+                  className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-white rounded-lg transition flex items-center gap-1.5"
+                >
+                  <Copy className="w-3.5 h-3.5 text-amber-400" />
+                  <span>コピー</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMemoAiResultModal(null)}
+                  className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition"
+                >
+                  閉じる
+                </button>
+              </div>
             </div>
           </div>
         </div>

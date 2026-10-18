@@ -20,7 +20,20 @@ const apiProxy = createProxyMiddleware({
   changeOrigin: true,
   secure: true,
   pathFilter: '/api/**',
-  logLevel: 'debug',
+  proxyTimeout: 30000,
+  timeout: 30000,
+  headers: {
+    'Connection': 'keep-alive',
+  },
+  // http-proxy-middleware v3+ uses `on: { error }` (legacy `onError` is ignored)
+  on: {
+    error: (err, req, res) => {
+      console.error('[API Proxy Error]', err.message);
+      if (res && typeof res.status === 'function' && !res.headersSent) {
+        res.status(502).json({ error: 'バックエンドAPIプロキシ通信エラー (502 Bad Gateway)' });
+      }
+    },
+  },
 });
 app.use(apiProxy);
 
@@ -30,7 +43,19 @@ const uploadsProxy = createProxyMiddleware({
   changeOrigin: true,
   secure: true,
   pathFilter: '/uploads/**',
-  logLevel: 'warn',
+  proxyTimeout: 60000,
+  timeout: 60000,
+  headers: {
+    'Connection': 'keep-alive',
+  },
+  on: {
+    error: (err, req, res) => {
+      console.error('[Uploads Proxy Error]', err.message);
+      if (res && typeof res.status === 'function' && !res.headersSent) {
+        res.status(502).json({ error: '画像プロキシ通信エラー' });
+      }
+    },
+  },
 });
 app.use(uploadsProxy);
 
@@ -41,7 +66,15 @@ const wsProxy = createProxyMiddleware({
   ws: true,
   secure: true,
   pathFilter: '/ws',
-  logLevel: 'warn',
+  proxyTimeout: 3600000,
+  timeout: 3600000,
+  on: {
+    error: (err, req, socket) => {
+      console.error('[WS Proxy Error]', err.message);
+      // Destroy the client socket so the browser gets onclose immediately and reconnects
+      if (socket && typeof socket.destroy === 'function') socket.destroy();
+    },
+  },
 });
 app.use(wsProxy);
 
@@ -59,3 +92,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 });
 
 server.on('upgrade', wsProxy.upgrade);
+
+// Keep long-lived sockets (WebSocket) from being cut by Node's default timeouts
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.requestTimeout = 0;

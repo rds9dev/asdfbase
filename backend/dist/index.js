@@ -307,20 +307,87 @@ app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'チャンネル削除に失敗しました' });
     }
 });
-// Messages API
+// Messages API (supports pagination: limit & beforeId)
 app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) => {
     try {
         const channelId = parseInt(req.params.channelId, 10);
         const limit = parseInt(req.query.limit, 10) || 50;
-        const result = await db_js_1.pool.query(`SELECT m.*, u.username as sender_username 
-       FROM messages m 
-       LEFT JOIN users u ON m.user_id = u.id 
-       WHERE m.channel_id = $1 
-       ORDER BY m.id DESC LIMIT $2`, [channelId, limit]);
+        const beforeId = req.query.beforeId ? parseInt(req.query.beforeId, 10) : null;
+        let query = `
+      SELECT m.*, u.username as sender_username 
+      FROM messages m 
+      LEFT JOIN users u ON m.user_id = u.id 
+      WHERE m.channel_id = $1 
+    `;
+        const params = [channelId];
+        const afterId = req.query.afterId ? parseInt(req.query.afterId, 10) : null;
+        if (afterId) {
+            // Catch-up fetch (reconnect / polling fallback): ascending order
+            query += ` AND m.id > $2 ORDER BY m.id ASC LIMIT $3`;
+            params.push(afterId, Math.min(limit, 200));
+            const result = await db_js_1.pool.query(query, params);
+            return res.json(result.rows);
+        }
+        else if (beforeId) {
+            query += ` AND m.id < $2 ORDER BY m.id DESC LIMIT $3`;
+            params.push(beforeId, limit);
+        }
+        else {
+            query += ` ORDER BY m.id DESC LIMIT $2`;
+            params.push(limit);
+        }
+        const result = await db_js_1.pool.query(query, params);
         res.json(result.rows.reverse());
     }
     catch (err) {
         res.status(500).json({ error: 'メッセージ取得エラー' });
+    }
+});
+// Cross-channel catch-up: messages newer than afterId (used by WS reconnect & polling fallback)
+app.get('/api/messages/since', authMiddleware, async (req, res) => {
+    try {
+        const afterId = parseInt(req.query.afterId, 10) || 0;
+        const result = await db_js_1.pool.query(`SELECT m.*, u.username as sender_username
+       FROM messages m
+       LEFT JOIN users u ON m.user_id = u.id
+       WHERE m.id > $1
+       ORDER BY m.id ASC
+       LIMIT 200`, [afterId]);
+        res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'メッセージ同期エラー' });
+    }
+});
+// Unread counts per channel based on client's last-read message ids
+app.post('/api/channels/unread-counts', authMiddleware, async (req, res) => {
+    try {
+        const lastRead = req.body?.lastRead || {};
+        const channelIds = [];
+        const lastReadIds = [];
+        for (const [ch, id] of Object.entries(lastRead)) {
+            const chNum = parseInt(ch, 10);
+            const idNum = Number(id);
+            if (Number.isFinite(chNum) && Number.isFinite(idNum)) {
+                channelIds.push(chNum);
+                lastReadIds.push(idNum);
+            }
+        }
+        const result = await db_js_1.pool.query(`SELECT m.channel_id,
+              MAX(m.id) AS last_message_id,
+              COUNT(*) FILTER (WHERE r.last_read IS NOT NULL AND m.id > r.last_read) AS unread
+       FROM messages m
+       LEFT JOIN (SELECT unnest($1::int[]) AS ch, unnest($2::int[]) AS last_read) r ON r.ch = m.channel_id
+       GROUP BY m.channel_id`, [channelIds, lastReadIds]);
+        res.json(result.rows.map(r => ({
+            channelId: r.channel_id,
+            lastMessageId: Number(r.last_message_id),
+            unread: Number(r.unread),
+        })));
+    }
+    catch (err) {
+        console.error('Unread counts error:', err);
+        res.status(500).json({ error: '未読数取得エラー' });
     }
 });
 app.delete('/api/messages/:messageId', authMiddleware, async (req, res) => {
@@ -372,12 +439,12 @@ app.put('/api/messages/:messageId', authMiddleware, async (req, res) => {
 app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) => {
     try {
         const channelId = parseInt(req.params.channelId, 10);
-        const { content, attachments, replyToId } = req.body;
+        const { content, attachments, replyToId, clientNonce } = req.body;
         const userId = req.user.id;
         const username = req.user.username;
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, userId, username, content, JSON.stringify(attachments || []), replyToId || null]);
-        const savedMessage = { ...result.rows[0], sender_username: username };
+        const savedMessage = { ...result.rows[0], sender_username: username, client_nonce: clientNonce || null };
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
         relayToDiscord(username, content);
         // Check for @gemini mention trigger
@@ -465,27 +532,6 @@ app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'ピン留め更新エラー' });
     }
 });
-// Timetables API
-app.get('/api/timetables', authMiddleware, async (req, res) => {
-    try {
-        const result = await db_js_1.pool.query(`SELECT * FROM timetables ORDER BY day_of_week ASC, period ASC`);
-        res.json(result.rows);
-    }
-    catch (err) {
-        res.status(500).json({ error: '時間割取得エラー' });
-    }
-});
-app.post('/api/timetables', authMiddleware, async (req, res) => {
-    try {
-        const { dayOfWeek, period, subject, scheduleType } = req.body;
-        const result = await db_js_1.pool.query(`INSERT INTO timetables (day_of_week, period, subject, schedule_type) 
-       VALUES ($1, $2, $3, $4) RETURNING *`, [dayOfWeek, period, subject, scheduleType || 'normal']);
-        res.json(result.rows[0]);
-    }
-    catch (err) {
-        res.status(500).json({ error: '時間割登録エラー' });
-    }
-});
 // Assignments API
 app.get('/api/assignments', authMiddleware, async (req, res) => {
     try {
@@ -511,6 +557,25 @@ app.post('/api/assignments', authMiddleware, async (req, res) => {
         res.status(500).json({ error: '提出物作成エラー' });
     }
 });
+app.put('/api/assignments/:id', authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const { title, subject, description, deadline, resubmitDeadline } = req.body;
+        const result = await db_js_1.pool.query(`UPDATE assignments 
+       SET title = $1, subject = $2, description = $3, deadline = $4, resubmit_deadline = $5 
+       WHERE id = $6 RETURNING *`, [title, subject, description, deadline, resubmitDeadline || null, id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: '提出物が見つかりません' });
+        }
+        const updated = result.rows[0];
+        broadcast({ type: 'ASSIGNMENT_UPDATED', payload: updated });
+        res.json(updated);
+    }
+    catch (err) {
+        console.error('Assignment update error:', err);
+        res.status(500).json({ error: '提出物更新エラー' });
+    }
+});
 app.delete('/api/assignments/:id', authMiddleware, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
@@ -523,12 +588,29 @@ app.delete('/api/assignments/:id', authMiddleware, async (req, res) => {
         res.status(500).json({ error: '提出物削除エラー' });
     }
 });
+// Get all members progress for assignments
+app.get('/api/assignments/progress/all', authMiddleware, async (req, res) => {
+    try {
+        const result = await db_js_1.pool.query(`
+      SELECT p.assignment_id, p.user_id, p.status, u.username
+      FROM assignment_progress p
+      JOIN users u ON p.user_id = u.id
+      ORDER BY p.assignment_id ASC, u.username ASC
+    `);
+        res.json(result.rows);
+    }
+    catch (err) {
+        console.error('Progress all fetch error:', err);
+        res.status(500).json({ error: 'メンバー進捗取得エラー' });
+    }
+});
 // Update Assignment Progress (未着手/進行中/提出済み/再提出/合格)
 app.put('/api/assignments/:id/progress', authMiddleware, async (req, res) => {
     try {
         const assignmentId = parseInt(req.params.id, 10);
         const { status } = req.body;
         const userId = req.user.id;
+        const username = req.user.username;
         await db_js_1.pool.query(`INSERT INTO assignment_progress (assignment_id, user_id, status) 
        VALUES ($1, $2, $3) 
        ON CONFLICT (assignment_id, user_id) 
@@ -538,10 +620,16 @@ app.put('/api/assignments/:id/progress', authMiddleware, async (req, res) => {
         const passedCountRes = await db_js_1.pool.query(`SELECT COUNT(*) FROM assignment_progress WHERE assignment_id = $1 AND status = 'passed'`, [assignmentId]);
         const totalUsers = parseInt(usersCountRes.rows[0].count, 10);
         const passedUsers = parseInt(passedCountRes.rows[0].count, 10);
+        let isArchived = false;
         if (totalUsers > 0 && passedUsers >= totalUsers) {
             await db_js_1.pool.query(`UPDATE assignments SET is_archived = TRUE WHERE id = $1`, [assignmentId]);
+            isArchived = true;
         }
-        res.json({ success: true, status });
+        broadcast({
+            type: 'ASSIGNMENT_PROGRESS_UPDATED',
+            payload: { assignmentId, userId, username, status, isArchived }
+        });
+        res.json({ success: true, status, isArchived });
     }
     catch (err) {
         res.status(500).json({ error: '進捗更新エラー' });
@@ -635,15 +723,74 @@ app.post('/api/test-scores/advice', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'アドバイス生成エラー' });
     }
 });
-// AI Chat Endpoint (for AI Tab)
+// AI Chat Endpoint (for AI Tab) with Smart # and @ contextual resolver
 app.post('/api/ai/chat', authMiddleware, async (req, res) => {
     try {
         const { messages, contextData, systemInstruction } = req.body;
         if (!messages || !Array.isArray(messages)) {
             return res.status(400).json({ error: '会話履歴（messages）が必要です' });
         }
-        const reply = await (0, gemini_js_1.chatWithGemini)(messages, contextData, systemInstruction);
-        res.json({ reply, keyCount: (0, gemini_js_1.getAvailableKeyCount)() });
+        // Inspect last user message for #name or @username
+        const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+        const dynamicReferences = {};
+        if (lastUserMsg && typeof lastUserMsg.content === 'string') {
+            const text = lastUserMsg.content;
+            // Match #tag (#1, #メモ1, #general, etc)
+            const hashMatches = text.match(/#([a-zA-Z0-9_\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\-]+)/g);
+            if (hashMatches) {
+                for (const rawTag of hashMatches) {
+                    const tag = rawTag.substring(1).trim();
+                    // Check if slot index number (e.g. #1 or #12)
+                    const slotNum = parseInt(tag, 10);
+                    if (!isNaN(slotNum)) {
+                        const noteRes = await db_js_1.pool.query(`SELECT slot_index, title, content, mode, updated_at FROM notes WHERE slot_index = $1`, [slotNum]);
+                        if (noteRes.rows.length > 0) {
+                            dynamicReferences[`note_slot_${slotNum}`] = noteRes.rows[0];
+                            continue;
+                        }
+                    }
+                    // Check if note title match
+                    const noteByTitle = await db_js_1.pool.query(`SELECT slot_index, title, content, mode, updated_at FROM notes WHERE title ILIKE $1 LIMIT 1`, [`%${tag}%`]);
+                    if (noteByTitle.rows.length > 0) {
+                        dynamicReferences[`note_${tag}`] = noteByTitle.rows[0];
+                        continue;
+                    }
+                    // Check if channel name match -> fetch latest 25 messages
+                    const chRes = await db_js_1.pool.query(`SELECT id, name, type FROM channels WHERE name ILIKE $1 LIMIT 1`, [`%${tag}%`]);
+                    if (chRes.rows.length > 0) {
+                        const ch = chRes.rows[0];
+                        const msgsRes = await db_js_1.pool.query(`SELECT m.id, m.content, m.created_at, COALESCE(u.username, m.username) as sender 
+               FROM messages m 
+               LEFT JOIN users u ON m.user_id = u.id 
+               WHERE m.channel_id = $1 
+               ORDER BY m.id DESC LIMIT 25`, [ch.id]);
+                        dynamicReferences[`channel_${ch.name}_latest25`] = {
+                            channel: ch,
+                            messages: msgsRes.rows.reverse()
+                        };
+                    }
+                }
+            }
+            // Match @username
+            const atMatches = text.match(/@([a-zA-Z0-9_\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\-]+)/g);
+            if (atMatches) {
+                for (const rawAt of atMatches) {
+                    const targetName = rawAt.substring(1).trim();
+                    if (targetName.toLowerCase() === 'gemini')
+                        continue;
+                    const uRes = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, last_active_at FROM users WHERE username ILIKE $1 LIMIT 1`, [`%${targetName}%`]);
+                    if (uRes.rows.length > 0) {
+                        dynamicReferences[`user_${targetName}`] = uRes.rows[0];
+                    }
+                }
+            }
+        }
+        const mergedContext = {
+            ...(contextData || {}),
+            ...(Object.keys(dynamicReferences).length > 0 ? { dynamic_fetched_references: dynamicReferences } : {})
+        };
+        const reply = await (0, gemini_js_1.chatWithGemini)(messages, mergedContext, systemInstruction);
+        res.json({ reply, keyCount: (0, gemini_js_1.getAvailableKeyCount)(), resolvedReferences: Object.keys(dynamicReferences) });
     }
     catch (err) {
         console.error('AI chat error:', err);
@@ -818,11 +965,10 @@ app.get('/api/notes', authMiddleware, async (req, res) => {
       SET title = REGEXP_REPLACE(title, '^メモ\\s*#([0-9]+)', 'メモ \\1') 
       WHERE slot_index <= 10 AND title LIKE '%#%'
     `).catch(() => { });
-        // 3. 全利用メンバーの専用Monacoエディタスロット（スロット11以降）を自動確保
+        // 3. 全利用メンバーの専用Monacoエディタスロット（スロット11以降: 10 + user.id 固定）を自動確保
         const usersRes = await db_js_1.pool.query(`SELECT id, username FROM users ORDER BY id ASC`);
-        for (let uIdx = 0; uIdx < usersRes.rows.length; uIdx++) {
-            const u = usersRes.rows[uIdx];
-            const slotIndex = 11 + uIdx; // 1人1スロット順次割り当て
+        for (const u of usersRes.rows) {
+            const slotIndex = 10 + u.id; // ユーザーID固定スロット
             await db_js_1.pool.query(`
         INSERT INTO notes (slot_index, title, content, mode, assigned_user_id)
         VALUES ($1, $2, '', 'monaco', $3)
@@ -1030,22 +1176,63 @@ app.delete('/api/users/:userId', authMiddleware, async (req, res) => {
     }
 });
 const clients = new Map();
+const aliveSockets = new WeakMap();
 function broadcast(message, excludeWs) {
     const data = JSON.stringify(message);
     for (const [ws] of clients.entries()) {
         if (ws !== excludeWs && ws.readyState === ws_1.WebSocket.OPEN) {
-            ws.send(data);
+            try {
+                ws.send(data);
+            }
+            catch (err) {
+                console.error('WS send error:', err);
+            }
         }
     }
 }
+// Server-side heartbeat: detect half-open connections dropped by proxies/tunnels
+const wsHeartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+        if (aliveSockets.get(ws) === false) {
+            ws.terminate();
+            continue;
+        }
+        aliveSockets.set(ws, false);
+        try {
+            ws.ping();
+        }
+        catch (_) { }
+    }
+}, 25000);
+wss.on('close', () => clearInterval(wsHeartbeat));
 wss.on('connection', (ws) => {
     clients.set(ws, { ws });
+    aliveSockets.set(ws, true);
+    ws.on('pong', () => aliveSockets.set(ws, true));
+    ws.on('error', (err) => console.error('WS socket error:', err.message));
     ws.on('message', async (data) => {
+        aliveSockets.set(ws, true);
         try {
             const msg = JSON.parse(data.toString());
+            // Application-level heartbeat (keeps proxies from idling out & lets client detect dead links)
+            if (msg.type === 'PING') {
+                if (ws.readyState === ws_1.WebSocket.OPEN)
+                    ws.send(JSON.stringify({ type: 'PONG', t: msg.t || Date.now() }));
+                return;
+            }
             if (msg.type === 'AUTH') {
-                const decoded = jsonwebtoken_1.default.verify(msg.token, JWT_SECRET);
+                let decoded;
+                try {
+                    decoded = jsonwebtoken_1.default.verify(msg.token, JWT_SECRET);
+                }
+                catch (_) {
+                    if (ws.readyState === ws_1.WebSocket.OPEN)
+                        ws.send(JSON.stringify({ type: 'AUTH_ERROR' }));
+                    return;
+                }
                 clients.set(ws, { ws, userId: decoded.id, username: decoded.username });
+                if (ws.readyState === ws_1.WebSocket.OPEN)
+                    ws.send(JSON.stringify({ type: 'AUTH_OK', payload: { userId: decoded.id } }));
                 await db_js_1.pool.query(`UPDATE users SET status = 'online', last_active_at = NOW() WHERE id = $1`, [decoded.id]);
                 broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: decoded.id, status: 'online' } });
                 return;
@@ -1054,10 +1241,10 @@ wss.on('connection', (ws) => {
             if (!clientInfo || !clientInfo.userId)
                 return;
             if (msg.type === 'SEND_MESSAGE') {
-                const { channelId, content, attachments, replyToId } = msg;
+                const { channelId, content, attachments, replyToId, clientNonce } = msg;
                 const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, clientInfo.userId, clientInfo.username, content, JSON.stringify(attachments || []), replyToId || null]);
-                const savedMessage = { ...result.rows[0], sender_username: clientInfo.username };
+                const savedMessage = { ...result.rows[0], sender_username: clientInfo.username, client_nonce: clientNonce || null };
                 broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
                 relayToDiscord(clientInfo.username || 'unknown', content);
                 // Handle AI reply via WS
@@ -1134,8 +1321,9 @@ wss.on('connection', (ws) => {
             }
             if (msg.type === 'SET_STATUS') {
                 const { status } = msg;
-                await db_js_1.pool.query(`UPDATE users SET status = $1, last_active_at = NOW() WHERE id = $2`, [status, clientInfo.userId]);
-                broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: clientInfo.userId, status } });
+                const validStatus = (status === 'away' || status === 'offline') ? status : 'online';
+                await db_js_1.pool.query(`UPDATE users SET status = $1, last_active_at = NOW() WHERE id = $2`, [validStatus, clientInfo.userId]);
+                broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: clientInfo.userId, status: validStatus } });
             }
         }
         catch (err) {
@@ -1144,11 +1332,21 @@ wss.on('connection', (ws) => {
     });
     ws.on('close', async () => {
         const info = clients.get(ws);
-        if (info && info.userId) {
-            await db_js_1.pool.query(`UPDATE users SET status = 'offline', last_active_at = NOW() WHERE id = $1`, [info.userId]);
-            broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: info.userId, status: 'offline' } });
-        }
         clients.delete(ws);
+        if (info && info.userId) {
+            // Check if user still has any other active connection
+            let hasOtherConnections = false;
+            for (const [otherWs, otherInfo] of clients.entries()) {
+                if (otherWs !== ws && otherInfo.userId === info.userId && otherWs.readyState === ws_1.WebSocket.OPEN) {
+                    hasOtherConnections = true;
+                    break;
+                }
+            }
+            if (!hasOtherConnections) {
+                await db_js_1.pool.query(`UPDATE users SET status = 'offline', last_active_at = NOW() WHERE id = $1`, [info.userId]);
+                broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: info.userId, status: 'offline' } });
+            }
+        }
     });
 });
 server.listen(PORT, async () => {
