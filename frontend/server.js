@@ -14,6 +14,35 @@ const BACKEND_TARGET = process.env.BACKEND_TARGET || process.env.BACKEND_INTERNA
 
 console.log(`[Render Proxy Server] Proxy target: ${BACKEND_TARGET}`);
 
+// 0. Realtime HTTP transports (SSE / long-poll): 長時間接続なのでタイムアウトを長く & バッファリング無効
+const rtProxy = createProxyMiddleware({
+  target: BACKEND_TARGET,
+  changeOrigin: true,
+  secure: true,
+  pathFilter: '/api/rt/**',
+  proxyTimeout: 3600000,
+  timeout: 3600000,
+  on: {
+    proxyRes: (proxyRes, req, res) => {
+      if (String(proxyRes.headers['content-type'] || '').includes('text/event-stream')) {
+        proxyRes.headers['cache-control'] = 'no-cache, no-transform';
+        proxyRes.headers['x-accel-buffering'] = 'no';
+        if (req.socket) {
+          req.socket.setTimeout(0);
+          req.socket.setNoDelay(true);
+        }
+      }
+    },
+    error: (err, req, res) => {
+      console.error('[RT Proxy Error]', err.message);
+      if (res && typeof res.status === 'function' && !res.headersSent) {
+        res.status(502).json({ error: 'リアルタイム通信プロキシエラー' });
+      }
+    },
+  },
+});
+app.use(rtProxy);
+
 // 1. API Reverse Proxy (Preserve /api prefix)
 const apiProxy = createProxyMiddleware({
   target: BACKEND_TARGET,

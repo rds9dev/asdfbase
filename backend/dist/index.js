@@ -847,9 +847,13 @@ app.post('/api/timetables', authMiddleware, async (req, res) => {
         if (dayOfWeek === undefined || !period || !subject) {
             return res.status(400).json({ error: '曜日、時限、教科名は必須です' });
         }
+        const type = scheduleType || 'normal';
+        // 同じ曜日・時限のコマは上書き (重複登録を防ぐ)
+        await db_js_1.pool.query(`DELETE FROM timetables WHERE day_of_week = $1 AND period = $2 AND schedule_type = $3`, [dayOfWeek, period, type]);
         const result = await db_js_1.pool.query(`INSERT INTO timetables (day_of_week, period, subject, schedule_type)
        VALUES ($1, $2, $3, $4)
-       RETURNING *`, [dayOfWeek, period, subject, scheduleType || 'normal']);
+       RETURNING *`, [dayOfWeek, period, subject, type]);
+        broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: type } });
         res.json(result.rows[0]);
     }
     catch (err) {
@@ -859,7 +863,8 @@ app.post('/api/timetables', authMiddleware, async (req, res) => {
 app.delete('/api/timetables/:id', authMiddleware, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
-        await db_js_1.pool.query(`DELETE FROM timetables WHERE id = $1`, [id]);
+        const deleted = await db_js_1.pool.query(`DELETE FROM timetables WHERE id = $1 RETURNING schedule_type`, [id]);
+        broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: deleted.rows[0]?.schedule_type || 'normal' } });
         res.json({ success: true });
     }
     catch (err) {
@@ -976,6 +981,31 @@ app.get('/api/notes', authMiddleware, async (req, res) => {
         SET assigned_user_id = EXCLUDED.assigned_user_id,
             title = CASE WHEN notes.title LIKE '%の専用エディタ' THEN EXCLUDED.title ELSE notes.title END
       `, [slotIndex, `${u.username}の専用エディタ`, u.id]);
+        }
+        // 4. 旧方式(11 + 並び順)で作られた重複専用スロットを正規スロット(10 + user.id)へ統合して削除
+        const strayRes = await db_js_1.pool.query(`
+      SELECT n.slot_index, n.content, n.assigned_user_id
+      FROM notes n
+      WHERE n.slot_index > 10
+        AND (n.assigned_user_id IS NULL
+             OR n.slot_index <> 10 + n.assigned_user_id
+             OR NOT EXISTS (SELECT 1 FROM users u WHERE u.id = n.assigned_user_id))
+    `);
+        for (const stray of strayRes.rows) {
+            const owner = usersRes.rows.find(u => u.id === stray.assigned_user_id);
+            if (owner) {
+                const canonical = 10 + owner.id;
+                // 正規スロットが空なら内容を引き継ぐ
+                if (stray.content) {
+                    await db_js_1.pool.query(`UPDATE notes SET content = $1, updated_at = NOW() WHERE slot_index = $2 AND (content IS NULL OR content = '')`, [stray.content, canonical]);
+                }
+                await db_js_1.pool.query(`UPDATE note_history SET slot_index = $1 WHERE slot_index = $2`, [canonical, stray.slot_index]);
+                await db_js_1.pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
+            }
+            else if (!stray.content) {
+                // 削除済みユーザーの空スロット
+                await db_js_1.pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
+            }
         }
         const result = await db_js_1.pool.query(`
       SELECT n.*, u.username as assigned_username 
@@ -1175,21 +1205,295 @@ app.delete('/api/users/:userId', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'アカウント削除に失敗しました' });
     }
 });
+const BOOT_ID = Math.random().toString(36).slice(2, 10);
+const EVENT_LOG_MAX = 3000;
+const eventLog = [];
+let eventSeq = 0;
 const clients = new Map();
 const aliveSockets = new WeakMap();
-function broadcast(message, excludeWs) {
-    const data = JSON.stringify(message);
-    for (const [ws] of clients.entries()) {
-        if (ws !== excludeWs && ws.readyState === ws_1.WebSocket.OPEN) {
-            try {
-                ws.send(data);
-            }
-            catch (err) {
-                console.error('WS send error:', err);
-            }
+const sseClients = new Set();
+const waiters = new Set();
+function eventVisibleTo(ev, userId, connId) {
+    if (ev.targetUserId !== undefined && ev.targetUserId !== userId)
+        return false;
+    if (ev.excludeConnId && ev.excludeConnId === connId)
+        return false;
+    return true;
+}
+function publish(message, opts = {}) {
+    const seq = ++eventSeq;
+    const ev = { seq, data: JSON.stringify({ ...message, seq }), ...opts };
+    eventLog.push(ev);
+    if (eventLog.length > EVENT_LOG_MAX)
+        eventLog.splice(0, eventLog.length - EVENT_LOG_MAX);
+    for (const [ws, info] of clients.entries()) {
+        if (!info.userId || ws.readyState !== ws_1.WebSocket.OPEN)
+            continue;
+        if (!eventVisibleTo(ev, info.userId, info.connId || ''))
+            continue;
+        try {
+            ws.send(ev.data);
+        }
+        catch (err) {
+            console.error('WS send error:', err);
         }
     }
+    for (const c of sseClients) {
+        if (!eventVisibleTo(ev, c.userId, c.connId))
+            continue;
+        try {
+            c.res.write(`id: ${seq}\ndata: ${ev.data}\n\n`);
+        }
+        catch (_) { }
+    }
+    for (const w of waiters) {
+        if (eventVisibleTo(ev, w.userId, w.connId))
+            w.finish();
+    }
 }
+function broadcast(message, excludeConnId) {
+    publish(message, { excludeConnId });
+}
+// after 以降で自分宛てのイベント。バッファ切れ/サーバー再起動なら reset=true
+function eventsSince(after, boot, userId, connId) {
+    const oldest = eventLog.length > 0 ? eventLog[0].seq : eventSeq + 1;
+    const reset = (boot !== undefined && boot !== '' && boot !== BOOT_ID) || after > eventSeq || (after > 0 && after < oldest - 1);
+    if (reset)
+        return { reset: true, events: [] };
+    const events = [];
+    for (const ev of eventLog) {
+        if (ev.seq > after && eventVisibleTo(ev, userId, connId))
+            events.push(ev.data);
+    }
+    return { reset: false, events };
+}
+const presence = new Map();
+const PRESENCE_TIMEOUT_MS = 35000;
+async function setUserStatus(userId, status) {
+    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
+    if (p.status === status)
+        return;
+    p.status = status;
+    presence.set(userId, p);
+    try {
+        await db_js_1.pool.query(`UPDATE users SET status = $1, last_active_at = NOW() WHERE id = $2`, [status, userId]);
+    }
+    catch (_) { }
+    broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId, status } });
+}
+function touchPresence(userId) {
+    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
+    p.lastHttp = Date.now();
+    presence.set(userId, p);
+    if (p.status === 'offline')
+        setUserStatus(userId, 'online');
+}
+function addConnection(userId) {
+    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
+    p.connections++;
+    p.lastHttp = Date.now();
+    presence.set(userId, p);
+    if (p.status === 'offline')
+        setUserStatus(userId, 'online');
+}
+function removeConnection(userId) {
+    const p = presence.get(userId);
+    if (!p)
+        return;
+    p.connections = Math.max(0, p.connections - 1);
+    // 即オフラインにせず、HTTP系トランスポートへの切替猶予を残す
+    p.lastHttp = Date.now();
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [userId, p] of presence.entries()) {
+        if (p.status !== 'offline' && p.connections === 0 && now - p.lastHttp > PRESENCE_TIMEOUT_MS) {
+            setUserStatus(userId, 'offline');
+        }
+    }
+}, 10000);
+// ---------------- クライアント→サーバー メッセージ (WS / HTTP 共通) ----------------
+async function handleClientMessage(user, connId, msg) {
+    if (msg.type === 'SEND_MESSAGE') {
+        const { channelId, content, attachments, replyToId, clientNonce } = msg;
+        const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, user.id, user.username, content, JSON.stringify(attachments || []), replyToId || null]);
+        const savedMessage = { ...result.rows[0], sender_username: user.username, client_nonce: clientNonce || null };
+        broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
+        relayToDiscord(user.username || 'unknown', content);
+        const trimmed = String(content || '').trim();
+        if (trimmed.includes('@gemini')) {
+            const prompt = trimmed.replace(/@gemini/g, '').trim();
+            if (prompt) {
+                setTimeout(async () => {
+                    const aiResponse = await (0, gemini_js_1.askGemini)(prompt, '簡潔に答えてください。');
+                    const botResult = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
+             VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, aiResponse, savedMessage.id]);
+                    broadcast({ type: 'NEW_MESSAGE', payload: { ...botResult.rows[0], sender_username: 'Gemini' } });
+                }, 100);
+            }
+        }
+        return;
+    }
+    // Realtime text/markdown note sync (送信元タブ以外へ)
+    if (msg.type === 'NOTE_CONTENT_SYNC') {
+        const { slotIndex, content, title } = msg;
+        broadcast({
+            type: 'NOTE_CONTENT_SYNC',
+            payload: { slotIndex, content, title, senderId: user.id, senderUsername: user.username },
+        }, connId);
+        return;
+    }
+    // WebRTC Signaling for Voice Chat & Screen Share (宛先ユーザーのみ)
+    if (msg.type === 'WEBRTC_SIGNAL') {
+        const { targetUserId, signal, channelId } = msg;
+        publish({
+            type: 'WEBRTC_SIGNAL',
+            payload: { fromUserId: user.id, fromUsername: user.username, signal, channelId },
+        }, { targetUserId: Number(targetUserId) });
+        return;
+    }
+    if (msg.type === 'VC_JOIN' || msg.type === 'VC_LEAVE') {
+        broadcast({
+            type: msg.type === 'VC_JOIN' ? 'VC_USER_JOINED' : 'VC_USER_LEFT',
+            payload: { userId: user.id, username: user.username, channelId: msg.channelId },
+        });
+        return;
+    }
+    if (msg.type === 'VC_STATE_CHANGE') {
+        const { channelId, isMuted, isDeafened, isScreenSharing } = msg;
+        broadcast({
+            type: 'VC_STATE_CHANGED',
+            payload: { userId: user.id, username: user.username, channelId, isMuted, isDeafened, isScreenSharing },
+        });
+        return;
+    }
+    if (msg.type === 'SET_STATUS') {
+        const validStatus = msg.status === 'away' ? 'away' : 'online';
+        touchPresence(user.id);
+        await setUserStatus(user.id, validStatus);
+    }
+}
+function verifyToken(token) {
+    if (!token)
+        return null;
+    try {
+        return jsonwebtoken_1.default.verify(token, JWT_SECRET);
+    }
+    catch (_) {
+        return null;
+    }
+}
+function getConnId(req) {
+    return String(req.query.connId || req.headers['x-conn-id'] || '').slice(0, 64);
+}
+// 疎通確認・トランスポート情報
+app.get('/api/rt/info', authMiddleware, (req, res) => {
+    touchPresence(req.user.id);
+    res.json({ boot: BOOT_ID, seq: eventSeq });
+});
+// Polling / Long-polling: GET /api/rt/poll?after=&boot=&wait=秒
+app.get('/api/rt/poll', authMiddleware, (req, res) => {
+    const user = req.user;
+    const connId = getConnId(req);
+    const after = parseInt(req.query.after, 10) || 0;
+    const boot = req.query.boot;
+    const wait = Math.min(Math.max(parseInt(req.query.wait, 10) || 0, 0), 25);
+    touchPresence(user.id);
+    res.setHeader('Cache-Control', 'no-store, no-transform');
+    const reply = () => {
+        const r = eventsSince(after, boot, user.id, connId);
+        res.json({ boot: BOOT_ID, seq: eventSeq, reset: r.reset, events: r.events.map(e => JSON.parse(e)) });
+    };
+    const initial = eventsSince(after, boot, user.id, connId);
+    if (wait === 0 || initial.reset || initial.events.length > 0) {
+        reply();
+        return;
+    }
+    let done = false;
+    const waiter = {
+        userId: user.id,
+        connId,
+        after,
+        finish: () => {
+            if (done)
+                return;
+            done = true;
+            clearTimeout(timer);
+            waiters.delete(waiter);
+            // 同時に発生したイベントをまとめて返すため少しだけ待つ
+            setTimeout(() => {
+                if (!res.writableEnded)
+                    reply();
+            }, 15);
+        },
+    };
+    const timer = setTimeout(() => waiter.finish(), wait * 1000);
+    waiters.add(waiter);
+    req.on('close', () => {
+        if (!done) {
+            done = true;
+            clearTimeout(timer);
+            waiters.delete(waiter);
+        }
+    });
+});
+// Server-Sent Events: GET /api/rt/stream?token=&after=&boot=&connId=
+app.get('/api/rt/stream', (req, res) => {
+    const user = verifyToken(req.query.token || (req.headers.authorization || '').replace('Bearer ', ''));
+    if (!user)
+        return res.status(401).json({ error: '無効または期限切れのトークンです' });
+    const connId = getConnId(req);
+    const after = parseInt(req.query.after || req.headers['last-event-id'], 10) || 0;
+    const boot = req.query.boot;
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    req.socket.setTimeout(0);
+    req.socket.setNoDelay(true);
+    // 中間プロキシのバッファリング対策のパディング
+    res.write(`:${' '.repeat(2048)}\n\n`);
+    res.write(`retry: 2000\n\n`);
+    res.write(`event: hello\ndata: ${JSON.stringify({ boot: BOOT_ID, seq: eventSeq })}\n\n`);
+    const r = eventsSince(after, boot, user.id, connId);
+    if (r.reset) {
+        res.write(`event: reset\ndata: ${JSON.stringify({ boot: BOOT_ID, seq: eventSeq })}\n\n`);
+    }
+    else {
+        for (const e of r.events)
+            res.write(`data: ${e}\n\n`);
+    }
+    const client = { res, userId: user.id, connId };
+    sseClients.add(client);
+    addConnection(user.id);
+    const ping = setInterval(() => {
+        try {
+            res.write(`event: ping\ndata: ${Date.now()}\n\n`);
+        }
+        catch (_) { }
+    }, 15000);
+    req.on('close', () => {
+        clearInterval(ping);
+        sseClients.delete(client);
+        removeConnection(user.id);
+    });
+});
+// HTTP経由でのクライアントメッセージ送信 (WS不通時)
+app.post('/api/rt/send', authMiddleware, async (req, res) => {
+    try {
+        touchPresence(req.user.id);
+        await handleClientMessage(req.user, getConnId(req), req.body || {});
+        res.json({ ok: true });
+    }
+    catch (err) {
+        console.error('RT send error:', err);
+        res.status(500).json({ error: '送信エラー' });
+    }
+});
+// ---------------- WebSocket ----------------
 // Server-side heartbeat: detect half-open connections dropped by proxies/tunnels
 const wsHeartbeat = setInterval(() => {
     for (const ws of wss.clients) {
@@ -1221,138 +1525,51 @@ wss.on('connection', (ws) => {
                 return;
             }
             if (msg.type === 'AUTH') {
-                let decoded;
-                try {
-                    decoded = jsonwebtoken_1.default.verify(msg.token, JWT_SECRET);
-                }
-                catch (_) {
+                const decoded = verifyToken(msg.token);
+                if (!decoded) {
                     if (ws.readyState === ws_1.WebSocket.OPEN)
                         ws.send(JSON.stringify({ type: 'AUTH_ERROR' }));
                     return;
                 }
-                clients.set(ws, { ws, userId: decoded.id, username: decoded.username });
-                if (ws.readyState === ws_1.WebSocket.OPEN)
-                    ws.send(JSON.stringify({ type: 'AUTH_OK', payload: { userId: decoded.id } }));
-                await db_js_1.pool.query(`UPDATE users SET status = 'online', last_active_at = NOW() WHERE id = $1`, [decoded.id]);
-                broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: decoded.id, status: 'online' } });
+                const prev = clients.get(ws);
+                if (prev?.userId)
+                    removeConnection(prev.userId);
+                const connId = String(msg.connId || '').slice(0, 64);
+                clients.set(ws, { ws, connId, userId: decoded.id, username: decoded.username });
+                addConnection(decoded.id);
+                // 取りこぼし分を返してから AUTH_OK
+                const after = Number(msg.after) || 0;
+                const r = eventsSince(after, msg.boot, decoded.id, connId);
+                if (ws.readyState === ws_1.WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'AUTH_OK', payload: { userId: decoded.id, boot: BOOT_ID, seq: eventSeq, reset: r.reset } }));
+                    if (!r.reset)
+                        for (const e of r.events)
+                            ws.send(e);
+                }
                 return;
             }
             const clientInfo = clients.get(ws);
             if (!clientInfo || !clientInfo.userId)
                 return;
-            if (msg.type === 'SEND_MESSAGE') {
-                const { channelId, content, attachments, replyToId, clientNonce } = msg;
-                const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, clientInfo.userId, clientInfo.username, content, JSON.stringify(attachments || []), replyToId || null]);
-                const savedMessage = { ...result.rows[0], sender_username: clientInfo.username, client_nonce: clientNonce || null };
-                broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
-                relayToDiscord(clientInfo.username || 'unknown', content);
-                // Handle AI reply via WS
-                const trimmed = content.trim();
-                if (trimmed.includes('@gemini')) {
-                    const prompt = trimmed.replace(/@gemini/g, '').trim();
-                    if (prompt) {
-                        setTimeout(async () => {
-                            const aiResponse = await (0, gemini_js_1.askGemini)(prompt, '簡潔に答えてください。');
-                            const botResult = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
-                 VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, aiResponse, savedMessage.id]);
-                            broadcast({
-                                type: 'NEW_MESSAGE',
-                                payload: { ...botResult.rows[0], sender_username: 'Gemini' },
-                            });
-                        }, 100);
-                    }
-                }
-            }
-            // Realtime text/markdown note sync
-            if (msg.type === 'NOTE_CONTENT_SYNC') {
-                const { slotIndex, content, title } = msg;
-                broadcast({
-                    type: 'NOTE_CONTENT_SYNC',
-                    payload: { slotIndex, content, title, senderId: clientInfo.userId, senderUsername: clientInfo.username },
-                }, ws);
-            }
-            // WebRTC Signaling for Voice Chat & Screen Share
-            if (msg.type === 'WEBRTC_SIGNAL') {
-                const { targetUserId, signal, channelId } = msg;
-                // Direct to target user
-                for (const [targetWs, info] of clients.entries()) {
-                    if (info.userId === targetUserId && targetWs.readyState === ws_1.WebSocket.OPEN) {
-                        targetWs.send(JSON.stringify({
-                            type: 'WEBRTC_SIGNAL',
-                            payload: {
-                                fromUserId: clientInfo.userId,
-                                fromUsername: clientInfo.username,
-                                signal,
-                                channelId,
-                            }
-                        }));
-                        break;
-                    }
-                }
-            }
-            if (msg.type === 'VC_JOIN') {
-                const { channelId } = msg;
-                broadcast({
-                    type: 'VC_USER_JOINED',
-                    payload: { userId: clientInfo.userId, username: clientInfo.username, channelId }
-                });
-            }
-            if (msg.type === 'VC_LEAVE') {
-                const { channelId } = msg;
-                broadcast({
-                    type: 'VC_USER_LEFT',
-                    payload: { userId: clientInfo.userId, username: clientInfo.username, channelId }
-                });
-            }
-            if (msg.type === 'VC_STATE_CHANGE') {
-                const { channelId, isMuted, isDeafened, isScreenSharing } = msg;
-                broadcast({
-                    type: 'VC_STATE_CHANGED',
-                    payload: {
-                        userId: clientInfo.userId,
-                        username: clientInfo.username,
-                        channelId,
-                        isMuted,
-                        isDeafened,
-                        isScreenSharing,
-                    }
-                });
-            }
-            if (msg.type === 'SET_STATUS') {
-                const { status } = msg;
-                const validStatus = (status === 'away' || status === 'offline') ? status : 'online';
-                await db_js_1.pool.query(`UPDATE users SET status = $1, last_active_at = NOW() WHERE id = $2`, [validStatus, clientInfo.userId]);
-                broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: clientInfo.userId, status: validStatus } });
-            }
+            await handleClientMessage({ id: clientInfo.userId, username: clientInfo.username || '' }, clientInfo.connId || '', msg);
         }
         catch (err) {
             console.error('WS Message error:', err);
         }
     });
-    ws.on('close', async () => {
+    ws.on('close', () => {
         const info = clients.get(ws);
         clients.delete(ws);
-        if (info && info.userId) {
-            // Check if user still has any other active connection
-            let hasOtherConnections = false;
-            for (const [otherWs, otherInfo] of clients.entries()) {
-                if (otherWs !== ws && otherInfo.userId === info.userId && otherWs.readyState === ws_1.WebSocket.OPEN) {
-                    hasOtherConnections = true;
-                    break;
-                }
-            }
-            if (!hasOtherConnections) {
-                await db_js_1.pool.query(`UPDATE users SET status = 'offline', last_active_at = NOW() WHERE id = $1`, [info.userId]);
-                broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId: info.userId, status: 'offline' } });
-            }
-        }
+        if (info && info.userId)
+            removeConnection(info.userId);
     });
 });
 server.listen(PORT, async () => {
     console.log(`[asdfbase-backend] Server listening on http://127.0.0.1:${PORT}`);
     try {
         await (0, db_js_1.initDb)();
+        // 再起動直後は全員オフライン扱いにし、接続/アクセスで復帰させる
+        await db_js_1.pool.query(`UPDATE users SET status = 'offline'`);
     }
     catch (err) {
         console.error('DB Init failed:', err);

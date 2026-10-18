@@ -65,7 +65,12 @@ import {
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { API_BASE_URL, REMOTE_API_BASE, detectApiBase, getApiBaseUrl, setApiBaseUrl, getWsUrl, getWsFallbackUrl } from './config';
+import {
+  API_BASE_URL, getApiBaseUrl,
+  getConnectionRoute, setConnectionRoute, getRealtimeTransport, setRealtimeTransport, getPollInterval, setPollInterval,
+  type ConnectionRoute, type RealtimeTransport,
+} from './config';
+import { RealtimeClient, type RealtimeStatus, type ConcreteTransport } from './realtime';
 
 interface User {
   id: number;
@@ -107,6 +112,13 @@ function mergeIncomingMessage(prev: Message[], msg: Message): Message[] {
   if (firstPending === -1) return [...prev, msg];
   return [...prev.slice(0, firstPending), msg, ...prev.slice(firstPending)];
 }
+
+const TRANSPORT_LABELS: Record<string, string> = {
+  ws: 'WebSocket',
+  sse: 'SSE',
+  longpoll: 'ロングポーリング',
+  poll: 'ポーリング',
+};
 
 const AVATAR_COLORS = [
   'bg-sky-500/20 text-sky-300 border-sky-500/40',
@@ -264,7 +276,8 @@ export default function App() {
   const [newChannelType, setNewChannelType] = useState<'text' | 'voice'>('text');
 
   // Settings State (Account, Notifications, Webhook, Audit Logs, Appearance)
-  const [settingsSection, setSettingsSection] = useState<'account' | 'notifications' | 'webhook' | 'audit' | 'appearance'>('account');
+  const [settingsSection, setSettingsSection] = useState<'account' | 'notifications' | 'webhook' | 'audit' | 'appearance' | 'connection'>('account');
+  const [latencyResult, setLatencyResult] = useState<string>('');
   const [currentPasswordInput, setCurrentPasswordInput] = useState('');
   const [newPasswordInput, setNewPasswordInput] = useState('');
   const [passwordChangeStatus, setPasswordChangeStatus] = useState('');
@@ -305,7 +318,12 @@ export default function App() {
   // チャンネルを開いた時点の既読位置 (未読ラインの表示用)
   const [unreadAnchor, setUnreadAnchor] = useState<{ channelId: number; lastReadId: number } | null>(null);
   const [newBelowCount, setNewBelowCount] = useState(0);
-  const [wsStatus, setWsStatus] = useState<'connecting' | 'online' | 'reconnecting' | 'offline'>('connecting');
+  const [wsStatus, setWsStatus] = useState<RealtimeStatus>('connecting');
+  const [activeTransport, setActiveTransport] = useState<ConcreteTransport | null>(null);
+  // 接続設定 (設定画面から変更・localStorageに保存)
+  const [rtTransport, setRtTransportState] = useState<RealtimeTransport>(() => getRealtimeTransport());
+  const [rtPollInterval, setRtPollIntervalState] = useState<number>(() => getPollInterval());
+  const [connRoute, setConnRouteState] = useState<ConnectionRoute>(() => getConnectionRoute());
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
@@ -328,6 +346,8 @@ export default function App() {
   // Phase 3 State: Timetables & Assignments
   const [scheduleType, setScheduleType] = useState<'normal' | 'short' | 's_short'>('normal');
   const [timetables, setTimetables] = useState<TimetableItem[]>([]);
+  const scheduleTypeRef = useRef(scheduleType);
+  scheduleTypeRef.current = scheduleType;
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [assignmentFilter, setAssignmentFilter] = useState<'all' | 'unstarted' | 'in_progress' | 'submitted' | 'passed'>('all');
   const [newAssignTitle, setNewAssignTitle] = useState('');
@@ -481,7 +501,10 @@ export default function App() {
   }, [showCamera, cameraFacingMode]);
 
   // WebSocket Ref
-  const wsRef = useRef<WebSocket | null>(null);
+  const realtimeRef = useRef<RealtimeClient | null>(null);
+  const pendingNoteSyncRef = useRef<object | null>(null);
+  const noteSyncTimerRef = useRef<any>(null);
+  const handleFetchTimetablesRef = useRef<() => void>(() => {});
 
   const scrollToBottom = () => scheduleScrollToBottom();
 
@@ -514,7 +537,7 @@ export default function App() {
   useEffect(() => {
     async function fetchWeather() {
       try {
-        const res = await fetch('/api/weather').catch(() => null);
+        const res = await fetch(`${getApiBaseUrl()}/api/weather`).catch(() => null);
         if (res && res.ok) {
           const data = await res.json();
           if (data && typeof data.temp === 'number') {
@@ -546,6 +569,10 @@ export default function App() {
     }
     if (!cleanPath.startsWith('/')) {
       cleanPath = `/${cleanPath}`;
+    }
+    // 直結モードでは API のみ VPS へ直接 (それ以外は常に同一オリジン)
+    if (cleanPath.startsWith('/api/')) {
+      cleanPath = `${getApiBaseUrl()}${cleanPath}`;
     }
     return fetch(cleanPath, init);
   };
@@ -712,221 +739,146 @@ export default function App() {
       });
   }, [token]);
 
-  // WebSocket Setup: Auto-Reconnect (backoff) + Heartbeat watchdog + Catch-up sync
+  // リアルタイムイベント処理 (WS / SSE / ロングポーリング / ポーリング共通)
+  const handleRealtimeEvent = (msg: any) => {
+      if (msg.type === 'NEW_MESSAGE') {
+        ingestNewMessageRef.current(msg.payload);
+      } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
+        setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
+      } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
+        setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
+      } else if (msg.type === 'NOTE_UPDATED') {
+        setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? msg.payload : n));
+        if (msg.payload.slot_index === selectedSlotIndexRef.current) {
+          setMemoTitle(msg.payload.title);
+          setMemoContent(msg.payload.content);
+          setMemoMode(msg.payload.mode);
+          setMemoAssignedUser(msg.payload.assigned_user_id);
+        }
+      } else if (msg.type === 'USER_STATUS_CHANGED') {
+        setOnlineUsers(prev => {
+          if (!prev.some(u => u.id === msg.payload.userId)) {
+            // 新規メンバー: 一覧を取り直す
+            reloadUsersRef.current();
+            return prev;
+          }
+          return prev.map(u => u.id === msg.payload.userId ? { ...u, status: msg.payload.status } : u);
+        });
+      } else if (msg.type === 'TIMETABLE_UPDATED') {
+        if (!msg.payload?.scheduleType || msg.payload.scheduleType === scheduleTypeRef.current) {
+          handleFetchTimetablesRef.current();
+        }
+      } else if (msg.type === 'BOARD_NEW_STROKE') {
+        setBoardStrokes(prev => [...prev, msg.payload]);
+      } else if (msg.type === 'BOARD_NEW_TEXT') {
+        setBoardTexts(prev => [...prev, msg.payload]);
+      } else if (msg.type === 'BOARD_CLEARED') {
+        setBoardStrokes([]);
+        setBoardTexts([]);
+      } else if (msg.type === 'CLIPBOARD_UPDATED') {
+        setClipboardText(msg.payload.content);
+        setClipboardUpdatedBy(msg.payload.updated_by);
+      } else if (msg.type === 'CHANNEL_CREATED') {
+        setChannels(prev => prev.some(c => c.id === msg.payload.id) ? prev : [...prev, msg.payload]);
+      } else if (msg.type === 'CHANNELS_REORDERED') {
+        setChannels(msg.payload);
+      } else if (msg.type === 'CHANNEL_DELETED') {
+        setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
+      } else if (msg.type === 'ASSIGNMENT_UPDATED') {
+        setAssignments(prev => prev.map(a => a.id === msg.payload.id ? { ...a, ...msg.payload } : a));
+      } else if (msg.type === 'ASSIGNMENT_DELETED') {
+        setAssignments(prev => prev.filter(a => a.id !== msg.payload.id));
+      } else if (msg.type === 'ASSIGNMENT_PROGRESS_UPDATED') {
+        const { assignmentId, userId, username, status, isArchived } = msg.payload;
+        if (currentUserRef.current?.id === userId) {
+          setAssignments(prev => prev.map(a => a.id === assignmentId ? { ...a, my_status: status, is_archived: isArchived || a.is_archived } : a));
+        } else if (isArchived) {
+          setAssignments(prev => prev.map(a => a.id === assignmentId ? { ...a, is_archived: true } : a));
+        }
+        setAssignmentMembersProgress(prev => {
+          const currentList = prev[assignmentId] || [];
+          const exists = currentList.some(p => p.userId === userId);
+          const updated = exists 
+            ? currentList.map(p => p.userId === userId ? { ...p, status } : p)
+            : [...currentList, { userId, username, status }];
+          return { ...prev, [assignmentId]: updated };
+        });
+      } else if (msg.type === 'MESSAGE_DELETED') {
+        setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
+      } else if (msg.type === 'MESSAGE_UPDATED') {
+        setMessages(prev => prev.map(m => m.id === msg.payload.id ? { ...m, content: msg.payload.content } : m));
+      } else if (msg.type === 'NOTE_CONTENT_SYNC') {
+        if (msg.payload.slotIndex === selectedSlotIndexRef.current) {
+          setMemoContent(msg.payload.content);
+          if (msg.payload.title) setMemoTitle(msg.payload.title);
+        }
+      } else if (msg.type === 'USER_DELETED') {
+        setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
+      } else if (msg.type === 'VC_USER_JOINED') {
+        setActiveVcUsers(prev => prev.some(u => u.userId === msg.payload.userId) ? prev : [...prev, msg.payload]);
+      } else if (msg.type === 'VC_USER_LEFT') {
+        setActiveVcUsers(prev => prev.filter(u => u.userId !== msg.payload.userId));
+      }
+  };
+  const handleRealtimeEventRef = useRef(handleRealtimeEvent);
+  handleRealtimeEventRef.current = handleRealtimeEvent;
+
+  const reloadUsers = () => {
+    const tk = tokenRef.current;
+    if (!tk) return;
+    safeFetch('/api/users', { headers: { Authorization: `Bearer ${tk}` } })
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (Array.isArray(data)) setOnlineUsers(data);
+      })
+      .catch(() => {});
+  };
+  const reloadUsersRef = useRef(reloadUsers);
+  reloadUsersRef.current = reloadUsers;
+
+  // クライアント→サーバー送信 (WSが使えればWS、なければHTTP)
+  const rtSend = (msg: object) => {
+    realtimeRef.current?.send(msg).catch(err => console.error('Realtime send failed:', err));
+  };
+
+  // Realtime 接続: 設定 (方式 / ポーリング間隔 / 経路) が変わったら張り直す
   useEffect(() => {
     if (!token) return;
-
-    let isUnmounted = false;
-    let reconnectTimeout: any = null;
-    let heartbeatInterval: any = null;
-    let connectTimeout: any = null;
-    let attempts = 0;
-    let hasConnectedOnce = false;
-    let lastActivity = Date.now();
-
-    const cleanupSocket = (ws: WebSocket | null) => {
-      if (!ws) return;
-      ws.onopen = null;
-      ws.onmessage = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      try { ws.close(); } catch (_) {}
-    };
-
-    const scheduleReconnect = (immediate = false) => {
-      if (isUnmounted) return;
-      clearTimeout(reconnectTimeout);
-      clearInterval(heartbeatInterval);
-      clearTimeout(connectTimeout);
-      setWsStatus('reconnecting');
-      const delay = immediate ? 0 : Math.min(1000 * 2 ** attempts, 10000) + Math.random() * 500;
-      attempts++;
-      reconnectTimeout = setTimeout(connectWs, delay);
-    };
-
-    const forceReconnect = () => {
-      const old = wsRef.current;
-      wsRef.current = null;
-      cleanupSocket(old);
-      scheduleReconnect(true);
-    };
-
-    function connectWs() {
-      if (isUnmounted) return;
-      cleanupSocket(wsRef.current);
-      const ws = new WebSocket(getWsUrl());
-      wsRef.current = ws;
-      if (!hasConnectedOnce) setWsStatus('connecting');
-
-      // プロキシ/フィルタでハンドシェイクが詰まった場合に備えた接続タイムアウト
-      connectTimeout = setTimeout(() => {
-        if (ws.readyState !== WebSocket.OPEN) {
-          wsRef.current = null;
-          cleanupSocket(ws);
-          scheduleReconnect();
-        }
-      }, 8000);
-
-      ws.onopen = () => {
-        clearTimeout(connectTimeout);
-        lastActivity = Date.now();
-        ws.send(JSON.stringify({ type: 'AUTH', token }));
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = setInterval(() => {
-          if (ws.readyState !== WebSocket.OPEN) return;
-          // 40秒間なにも届かなければ半死にの接続とみなして張り直す
-          if (Date.now() - lastActivity > 40000) {
-            forceReconnect();
-            return;
-          }
-          ws.send(JSON.stringify({ type: 'PING', t: Date.now() }));
-        }, 15000);
-      };
-
-      ws.onmessage = (event) => {
-        lastActivity = Date.now();
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'PONG') {
-            return;
-          } else if (msg.type === 'AUTH_OK') {
-            attempts = 0;
-            setWsStatus('online');
-            if (hasConnectedOnce) {
-              syncMissedMessagesRef.current();
-              refreshActiveChannelRef.current();
-            }
-            hasConnectedOnce = true;
-          } else if (msg.type === 'NEW_MESSAGE') {
-            ingestNewMessageRef.current(msg.payload);
-          } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
-            setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
-          } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
-            setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
-          } else if (msg.type === 'NOTE_UPDATED') {
-            setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? msg.payload : n));
-            if (msg.payload.slot_index === selectedSlotIndexRef.current) {
-              setMemoTitle(msg.payload.title);
-              setMemoContent(msg.payload.content);
-              setMemoMode(msg.payload.mode);
-              setMemoAssignedUser(msg.payload.assigned_user_id);
-            }
-          } else if (msg.type === 'USER_STATUS_CHANGED') {
-            setOnlineUsers(prev => prev.map(u => u.id === msg.payload.userId ? { ...u, status: msg.payload.status } : u));
-          } else if (msg.type === 'BOARD_NEW_STROKE') {
-            setBoardStrokes(prev => [...prev, msg.payload]);
-          } else if (msg.type === 'BOARD_NEW_TEXT') {
-            setBoardTexts(prev => [...prev, msg.payload]);
-          } else if (msg.type === 'BOARD_CLEARED') {
-            setBoardStrokes([]);
-            setBoardTexts([]);
-          } else if (msg.type === 'CLIPBOARD_UPDATED') {
-            setClipboardText(msg.payload.content);
-            setClipboardUpdatedBy(msg.payload.updated_by);
-          } else if (msg.type === 'CHANNEL_CREATED') {
-            setChannels(prev => prev.some(c => c.id === msg.payload.id) ? prev : [...prev, msg.payload]);
-          } else if (msg.type === 'CHANNELS_REORDERED') {
-            setChannels(msg.payload);
-          } else if (msg.type === 'CHANNEL_DELETED') {
-            setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
-          } else if (msg.type === 'ASSIGNMENT_UPDATED') {
-            setAssignments(prev => prev.map(a => a.id === msg.payload.id ? { ...a, ...msg.payload } : a));
-          } else if (msg.type === 'ASSIGNMENT_DELETED') {
-            setAssignments(prev => prev.filter(a => a.id !== msg.payload.id));
-          } else if (msg.type === 'ASSIGNMENT_PROGRESS_UPDATED') {
-            const { assignmentId, userId, username, status, isArchived } = msg.payload;
-            if (currentUserRef.current?.id === userId) {
-              setAssignments(prev => prev.map(a => a.id === assignmentId ? { ...a, my_status: status, is_archived: isArchived || a.is_archived } : a));
-            } else if (isArchived) {
-              setAssignments(prev => prev.map(a => a.id === assignmentId ? { ...a, is_archived: true } : a));
-            }
-            setAssignmentMembersProgress(prev => {
-              const currentList = prev[assignmentId] || [];
-              const exists = currentList.some(p => p.userId === userId);
-              const updated = exists 
-                ? currentList.map(p => p.userId === userId ? { ...p, status } : p)
-                : [...currentList, { userId, username, status }];
-              return { ...prev, [assignmentId]: updated };
-            });
-          } else if (msg.type === 'MESSAGE_DELETED') {
-            setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
-          } else if (msg.type === 'MESSAGE_UPDATED') {
-            setMessages(prev => prev.map(m => m.id === msg.payload.id ? { ...m, content: msg.payload.content } : m));
-          } else if (msg.type === 'NOTE_CONTENT_SYNC') {
-            if (msg.payload.slotIndex === selectedSlotIndexRef.current) {
-              setMemoContent(msg.payload.content);
-              if (msg.payload.title) setMemoTitle(msg.payload.title);
-            }
-          } else if (msg.type === 'USER_DELETED') {
-            setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
-          } else if (msg.type === 'VC_USER_JOINED') {
-            setActiveVcUsers(prev => prev.some(u => u.userId === msg.payload.userId) ? prev : [...prev, msg.payload]);
-          } else if (msg.type === 'VC_USER_LEFT') {
-            setActiveVcUsers(prev => prev.filter(u => u.userId !== msg.payload.userId));
-          }
-        } catch (err) {
-          console.error('WS parse error:', err);
-        }
-      };
-
-      ws.onclose = () => {
-        clearInterval(heartbeatInterval);
-        clearTimeout(connectTimeout);
-        if (wsRef.current === ws) wsRef.current = null;
-        scheduleReconnect();
-      };
-
-      ws.onerror = () => {
-        // onclose が続いて呼ばれるのでそちらで再接続
-        try { ws.close(); } catch (_) {}
-      };
-    }
-
-    connectWs();
-
-    const handleVisibilityChange = () => {
-      const ws = wsRef.current;
-      if (!document.hidden) {
-        // スリープ/タブ復帰: 接続を確認し、取りこぼしを即同期
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          forceReconnect();
-        } else {
-          ws.send(JSON.stringify({ type: 'PING', t: Date.now() }));
+    const client = new RealtimeClient({
+      token,
+      transport: rtTransport,
+      pollInterval: rtPollInterval,
+      onEvent: msg => handleRealtimeEventRef.current(msg),
+      onStatus: (status, transport) => {
+        setWsStatus(status);
+        setActiveTransport(transport);
+        if (status === 'online') {
+          // 接続/再接続のたびに取りこぼしを補完
           syncMissedMessagesRef.current();
         }
-      }
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'SET_STATUS', status: document.hidden ? 'away' : 'online' }));
-      }
+      },
+      onReset: () => {
+        syncMissedMessagesRef.current();
+        refreshActiveChannelRef.current();
+        reloadUsersRef.current();
+      },
+    });
+    realtimeRef.current = client;
+    client.start();
+
+    const handleVisibilityStatus = () => {
+      client.send({ type: 'SET_STATUS', status: document.hidden ? 'away' : 'online' }).catch(() => {});
+      if (!document.hidden) syncMissedMessagesRef.current();
     };
-    const handleOnline = () => forceReconnect();
-    const handleOffline = () => setWsStatus('offline');
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibilityStatus);
 
     return () => {
-      isUnmounted = true;
-      clearInterval(heartbeatInterval);
-      clearTimeout(reconnectTimeout);
-      clearTimeout(connectTimeout);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-      cleanupSocket(wsRef.current);
-      wsRef.current = null;
+      document.removeEventListener('visibilitychange', handleVisibilityStatus);
+      client.stop();
+      if (realtimeRef.current === client) realtimeRef.current = null;
     };
-  }, [token]);
+  }, [token, rtTransport, rtPollInterval, connRoute]);
 
-  // ポーリング: WS不調時は3秒ごと、正常時も20秒ごとに保険として同期
-  useEffect(() => {
-    if (!token) return;
-    const interval = setInterval(() => {
-      if (document.hidden && wsStatus === 'online') return;
-      syncMissedMessagesRef.current();
-    }, wsStatus === 'online' ? 20000 : 3000);
-    return () => clearInterval(interval);
-  }, [token, wsStatus]);
 
   // Initial Data Load
   useEffect(() => {
@@ -1144,7 +1096,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch(subPath, {
+      const res = await fetch(`${getApiBaseUrl()}${subPath}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -1532,9 +1484,7 @@ export default function App() {
       setIsScreenSharing(false);
       setInVoiceChannel(false);
       setVcSubtitles('');
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'VC_LEAVE' }));
-      }
+      rtSend({ type: 'VC_LEAVE' });
     } else {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -1542,9 +1492,7 @@ export default function App() {
         setInVoiceChannel(true);
         setIsMicMuted(false);
 
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: 'VC_JOIN' }));
-        }
+        rtSend({ type: 'VC_JOIN' });
 
         // VC字幕化 (SpeechRecognition)
         const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -1569,9 +1517,7 @@ export default function App() {
       } catch (err) {
         console.warn('Audio permission denied or device unavailable:', err);
         setInVoiceChannel(true);
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: 'VC_JOIN' }));
-        }
+        rtSend({ type: 'VC_JOIN' });
       }
     }
   };
@@ -1625,6 +1571,13 @@ export default function App() {
       console.error(e);
     }
   };
+
+  handleFetchTimetablesRef.current = handleFetchTimetables;
+
+  // 時程切替時・ログイン時に時間割を取り直す
+  useEffect(() => {
+    handleFetchTimetables();
+  }, [scheduleType, token]);
 
   const handleCreateTimetableEntry = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1803,13 +1756,22 @@ export default function App() {
     setAutoSaveStatus('dirty');
 
     // Realtime broadcast to other users
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'NOTE_CONTENT_SYNC',
-        slotIndex: selectedSlotIndexRef.current,
-        content: newVal,
-        title: memoTitle
-      }));
+    // HTTP系トランスポートでは1文字ごとに送らず200msに間引く
+    pendingNoteSyncRef.current = {
+      type: 'NOTE_CONTENT_SYNC',
+      slotIndex: selectedSlotIndexRef.current,
+      content: newVal,
+      title: memoTitle
+    };
+    if (realtimeRef.current?.transport === 'ws') {
+      rtSend(pendingNoteSyncRef.current);
+      pendingNoteSyncRef.current = null;
+    } else if (!noteSyncTimerRef.current) {
+      noteSyncTimerRef.current = setTimeout(() => {
+        noteSyncTimerRef.current = null;
+        if (pendingNoteSyncRef.current) rtSend(pendingNoteSyncRef.current);
+        pendingNoteSyncRef.current = null;
+      }, 200);
     }
 
     // Auto-save debounce
@@ -2445,11 +2407,12 @@ export default function App() {
 
   return (
     <div 
-      className="min-h-screen bg-[#090A0C] text-[#D6D3D1] flex flex-col font-['Inter']"
-      style={{ zoom: `${uiScale}%` }}
+      className="bg-[#090A0C] text-[#D6D3D1] flex flex-col font-['Inter'] overflow-hidden"
+      // 画面1枚に収める: zoom で縮小しても実表示がちょうど 100dvh になるよう補正
+      style={{ zoom: `${uiScale}%`, height: `calc(100dvh * ${100 / uiScale})` }}
     >
       {/* 1. TOP BAR */}
-      <header className="h-14 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md sticky top-0 z-50 px-2 sm:px-4 flex items-center justify-between select-none overflow-x-auto gap-2">
+      <header className="h-14 shrink-0 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md z-50 px-2 sm:px-4 flex items-center justify-between select-none overflow-x-auto gap-2">
         <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           <div 
             onClick={() => setActiveTab('chat')}
@@ -2544,16 +2507,16 @@ export default function App() {
       </header>
 
       {/* 2. MAIN CONTENT BODY */}
-      <main className="flex-1 flex overflow-hidden">
-        {/* TAB 1: リアルタイムチャット (3ペイン) */}
+      <main className="flex-1 min-h-0 flex overflow-hidden">
+        {/* TAB 1: リアルタイムチャット (3ペイン: チャンネル / チャット / メンバー) */}
         {activeTab === 'chat' && (
-          <div className="flex-1 flex overflow-hidden">
+          <div className="flex-1 min-h-0 flex overflow-hidden">
             {/* Channels Sidebar: Small screen / Chromebook responsive toggle */}
             {!isChannelsCollapsed && (
-              <aside className="w-48 sm:w-56 border-r border-stone-800/80 bg-[#0C0D10] p-2.5 sm:p-3 flex flex-col justify-between shrink-0">
-                <div>
-                  <div className="flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold">
-                    <span>Channels</span>
+              <aside className="w-48 sm:w-56 border-r border-stone-800 bg-[#0C0D10] flex flex-col shrink-0 min-h-0 overflow-hidden">
+                <div className="flex-1 min-h-0 flex flex-col p-2.5 sm:p-3">
+                  <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold shrink-0">
+                    <span>チャンネル</span>
                     <button
                       onClick={() => setIsNewChannelModalOpen(true)}
                       className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800 transition"
@@ -2562,7 +2525,8 @@ export default function App() {
                       <Plus className="w-3.5 h-3.5" />
                     </button>
                   </div>
-                  <div className="flex-1 overflow-y-auto space-y-0.5 max-h-[calc(100vh-250px)] pr-1">
+                  {/* チャンネル一覧: 収まらない時はこの中だけスクロール */}
+                  <div className="flex-1 min-h-0 overflow-y-auto space-y-0.5 pr-1">
                     {channels.map((ch, idx) => {
                       const unread = activeChannelId === ch.id ? 0 : (unreadCounts[ch.id] || 0);
                       const isActiveCh = activeChannelId === ch.id;
@@ -2639,8 +2603,8 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* VC コントロール & 画面共有 */}
-                <div className="bg-[#111214] border border-stone-800 rounded-xl p-2.5 space-y-2">
+                {/* VC コントロール & 画面共有 (チャンネル一覧の下に固定) */}
+                <div className="shrink-0 m-2.5 mt-0 bg-[#111214] border border-stone-800 rounded-xl p-2.5 space-y-2 max-h-[45%] overflow-y-auto">
                   <div className="flex items-center justify-between text-[11px] font-mono text-stone-400">
                     <span className="flex items-center gap-1.5 font-bold text-white">
                       <Mic className={`w-3.5 h-3.5 ${inVoiceChannel ? 'text-emerald-400 animate-pulse' : 'text-stone-500'}`} />
@@ -2713,7 +2677,7 @@ export default function App() {
             )}
 
             {/* Center: メインチャット */}
-            <section className="flex-1 flex flex-col bg-[#090A0C] overflow-hidden">
+            <section className="flex-1 min-w-0 min-h-0 flex flex-col bg-[#090A0C] overflow-hidden">
               <div className="h-12 border-b border-stone-800/80 px-3 sm:px-4 flex items-center justify-between bg-[#0C0D10]/50 font-mono text-xs">
                 <div className="flex items-center gap-2 font-bold text-white">
                   <button
@@ -2726,20 +2690,23 @@ export default function App() {
                   <Hash className="w-4 h-4 text-amber-400" />
                   <span className="text-sm">{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
                   <span
-                    className={`ml-1 flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-normal ${
+                    className={`ml-1 flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-normal cursor-pointer ${
                       wsStatus === 'online'
                         ? 'border-emerald-700/60 text-emerald-400 bg-emerald-950/30'
                         : wsStatus === 'offline'
                           ? 'border-red-800/70 text-red-400 bg-red-950/30'
                           : 'border-amber-700/60 text-amber-400 bg-amber-950/30'
                     }`}
-                    title={wsStatus === 'online' ? 'WebSocketでリアルタイム接続中' : 'WebSocket再接続中（その間は3秒ごとに自動同期）'}
+                    title={`${activeTransport ? TRANSPORT_LABELS[activeTransport] : ''} / ${connRoute === 'proxy' ? 'プロキシ経由' : '直結'}（クリックで接続設定）`}
+                    onClick={() => { setActiveTab('settings'); setSettingsSection('connection'); }}
                   >
                     <span className={`w-1.5 h-1.5 rounded-full ${
                       wsStatus === 'online' ? 'bg-emerald-400' : wsStatus === 'offline' ? 'bg-red-400' : 'bg-amber-400 animate-pulse'
                     }`} />
                     <span className="hidden sm:inline">
-                      {wsStatus === 'online' ? 'リアルタイム' : wsStatus === 'offline' ? 'オフライン' : wsStatus === 'connecting' ? '接続中…' : '再接続中…'}
+                      {wsStatus === 'online'
+                        ? `リアルタイム${activeTransport && activeTransport !== 'ws' ? ` (${TRANSPORT_LABELS[activeTransport]})` : ''}`
+                        : wsStatus === 'offline' ? 'オフライン' : wsStatus === 'connecting' ? '接続中…' : '再接続中…'}
                     </span>
                   </span>
                 </div>
@@ -3157,19 +3124,42 @@ export default function App() {
 
             {/* Right: Members Sidebar (Fixed width & scrollable) */}
             {!isMembersCollapsed && (
-              <aside className="w-48 sm:w-56 border-l border-stone-800/80 bg-[#0C0D10] p-3 hidden lg:flex flex-col shrink-0 h-full overflow-hidden">
-                <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-3 font-bold flex items-center justify-between shrink-0">
-                  <span>Members</span>
-                  <span className="text-amber-400 font-normal">{onlineUsers.length}</span>
-                </div>
-                <div className="flex-1 overflow-y-auto space-y-1 pr-1">
-                  {onlineUsers.map(u => (
-                    <div key={u.id} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-stone-900/60 text-xs font-mono text-stone-300">
-                      <span className={`w-2 h-2 rounded-full shrink-0 ${u.status === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-stone-600'}`} />
-                      <span className="truncate">{u.username}</span>
+              <aside className="w-48 sm:w-56 border-l border-stone-800 bg-[#0C0D10] p-3 hidden lg:flex flex-col shrink-0 min-h-0 overflow-y-auto">
+                {(['online', 'away', 'offline'] as const).map(group => {
+                  const members = onlineUsers.filter(u =>
+                    group === 'offline' ? (u.status !== 'online' && u.status !== 'away') : u.status === group
+                  );
+                  if (members.length === 0) return null;
+                  return (
+                    <div key={group} className="mb-3">
+                      <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold">
+                        {group === 'online' ? 'オンライン' : group === 'away' ? '離席中' : 'オフライン'} — {members.length}
+                      </div>
+                      <div className="space-y-0.5">
+                        {members.map(u => (
+                          <div
+                            key={u.id}
+                            className={`flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-900/60 text-sm ${
+                              group === 'offline' ? 'text-stone-600' : 'text-stone-200'
+                            }`}
+                          >
+                            <div className="relative shrink-0">
+                              <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold uppercase border ${
+                                group === 'offline' ? 'bg-stone-900 text-stone-600 border-stone-800' : avatarColorFor(u.username)
+                              }`}>
+                                {u.username[0]}
+                              </div>
+                              <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0C0D10] ${
+                                group === 'online' ? 'bg-emerald-400' : group === 'away' ? 'bg-amber-400' : 'bg-stone-600'
+                              }`} />
+                            </div>
+                            <span className="truncate">{u.username}</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  ))}
-                </div>
+                  );
+                })}
               </aside>
             )}
           </div>
@@ -4256,6 +4246,7 @@ export default function App() {
                   {[
                     { id: 'account', label: 'アカウント' },
                     { id: 'appearance', label: '表示・操作' },
+                    { id: 'connection', label: '接続' },
                     { id: 'notifications', label: '通知設定' },
                     { id: 'webhook', label: 'Webhook' },
                     { id: 'audit', label: '監査ログ' },
@@ -4282,6 +4273,143 @@ export default function App() {
                   ))}
                 </div>
               </div>
+
+              {/* 接続設定: リアルタイム方式 / ポーリング間隔 / プロキシ経由 or 直結 */}
+              {settingsSection === 'connection' && (
+                <div className="space-y-4 text-xs">
+                  {/* 現在の状態 */}
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-white font-bold text-sm">現在の接続</span>
+                      <span className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border ${
+                        wsStatus === 'online' ? 'border-emerald-700/60 text-emerald-400 bg-emerald-950/30'
+                          : wsStatus === 'offline' ? 'border-red-800/70 text-red-400 bg-red-950/30'
+                          : 'border-amber-700/60 text-amber-400 bg-amber-950/30'
+                      }`}>
+                        <span className={`w-2 h-2 rounded-full ${wsStatus === 'online' ? 'bg-emerald-400' : wsStatus === 'offline' ? 'bg-red-400' : 'bg-amber-400 animate-pulse'}`} />
+                        {wsStatus === 'online' ? '接続中' : wsStatus === 'offline' ? 'オフライン' : '接続を試行中…'}
+                        {activeTransport && ` · ${TRANSPORT_LABELS[activeTransport]}`}
+                        {` · ${connRoute === 'proxy' ? 'プロキシ経由' : '直結'}`}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setLatencyResult('計測中…');
+                          const times: number[] = [];
+                          for (let i = 0; i < 3; i++) {
+                            const t0 = performance.now();
+                            try {
+                              const r = await safeFetch('/api/rt/info', { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+                              if (!r.ok) throw new Error();
+                              times.push(performance.now() - t0);
+                            } catch {
+                              setLatencyResult('失敗: サーバーに届きませんでした');
+                              return;
+                            }
+                          }
+                          setLatencyResult(`往復 平均 ${Math.round(times.reduce((a, b) => a + b, 0) / times.length)}ms (最小 ${Math.round(Math.min(...times))}ms)`);
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 transition"
+                      >
+                        応答速度を測る
+                      </button>
+                      <span className="text-stone-400">{latencyResult}</span>
+                    </div>
+                  </div>
+
+                  {/* リアルタイム方式 */}
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
+                    <div className="text-white font-bold text-sm">リアルタイム通信方式</div>
+                    <p className="text-stone-400 leading-relaxed">
+                      学校のフィルター等で WebSocket が通らない場合は、自動で他の方式に切り替わります。うまくいかない時は手動で固定してください。
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-5 gap-2">
+                      {([
+                        { id: 'auto', label: '自動', desc: 'おすすめ' },
+                        { id: 'ws', label: 'WebSocket', desc: '最速・通らない環境あり' },
+                        { id: 'sse', label: 'SSE', desc: 'HTTPストリーム' },
+                        { id: 'longpoll', label: 'ロングポーリング', desc: '即時・ほぼ確実に通る' },
+                        { id: 'poll', label: 'ポーリング', desc: '一定間隔で確認' },
+                      ] as { id: RealtimeTransport; label: string; desc: string }[]).map(opt => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => {
+                            setRealtimeTransport(opt.id);
+                            setRtTransportState(opt.id);
+                          }}
+                          className={`p-3 rounded-xl border text-left transition ${
+                            rtTransport === opt.id
+                              ? 'bg-amber-500/15 border-amber-500 text-amber-300'
+                              : 'bg-[#16181D] border-stone-800 text-stone-300 hover:border-stone-600'
+                          }`}
+                        >
+                          <div className="font-bold">{opt.label}</div>
+                          <div className="text-[10px] text-stone-500 mt-0.5">{opt.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* ポーリング間隔 */}
+                  <div className={`bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3 ${rtTransport === 'poll' || (rtTransport === 'auto' && activeTransport === 'poll') ? '' : 'opacity-60'}`}>
+                    <div className="flex items-center justify-between">
+                      <span className="text-white font-bold text-sm">ポーリング間隔</span>
+                      <span className="text-stone-500">「ポーリング」方式の時に使われます</span>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {[500, 1000, 2000, 3000, 5000].map(ms => (
+                        <button
+                          key={ms}
+                          type="button"
+                          onClick={() => {
+                            setPollInterval(ms);
+                            setRtPollIntervalState(ms);
+                          }}
+                          className={`px-4 py-2 rounded-xl border transition ${
+                            rtPollInterval === ms
+                              ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold'
+                              : 'bg-[#16181D] border-stone-800 text-stone-300 hover:border-stone-600'
+                          }`}
+                        >
+                          {ms < 1000 ? `${ms / 1000}秒` : `${ms / 1000}秒`}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="text-stone-500">短いほど速く届きますが、通信量とバッテリー消費が増えます。</p>
+                  </div>
+
+                  {/* 経路 */}
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
+                    <div className="text-white font-bold text-sm">通信経路</div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {([
+                        { id: 'proxy', label: 'プロキシ経由', desc: 'このサイト経由で通信。フィルターにVPSのドメインが見えない (標準)' },
+                        { id: 'direct', label: '直結', desc: 'VPS (api-asdf.rds9.net) へ直接。速いがフィルターでブロック/記録される可能性あり' },
+                      ] as { id: ConnectionRoute; label: string; desc: string }[]).map(opt => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => {
+                            setConnectionRoute(opt.id);
+                            setConnRouteState(opt.id);
+                          }}
+                          className={`p-3 rounded-xl border text-left transition ${
+                            connRoute === opt.id
+                              ? 'bg-amber-500/15 border-amber-500 text-amber-300'
+                              : 'bg-[#16181D] border-stone-800 text-stone-300 hover:border-stone-600'
+                          }`}
+                        >
+                          <div className="font-bold">{opt.label}</div>
+                          <div className="text-[10px] text-stone-500 mt-0.5 leading-relaxed">{opt.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* 0. 表示・操作設定 (UI縮小・スクロール・自動保存) */}
               {settingsSection === 'appearance' && (
