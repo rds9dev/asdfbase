@@ -3,8 +3,12 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getSetting = getSetting;
+exports.setSetting = setSetting;
 exports.getDiscordWebhookUrl = getDiscordWebhookUrl;
-exports.relayToDiscord = relayToDiscord;
+exports.notifyImportant = notifyImportant;
+exports.relayMessage = relayMessage;
+exports.logAudit = logAudit;
 exports.authMiddleware = authMiddleware;
 const express_1 = __importDefault(require("express"));
 const http_1 = __importDefault(require("http"));
@@ -17,9 +21,13 @@ const multer_1 = __importDefault(require("multer"));
 const sharp_1 = __importDefault(require("sharp"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
+const dns_1 = __importDefault(require("dns"));
 const db_js_1 = require("./db.js");
 const gemini_js_1 = require("./gemini.js");
+const discord_js_1 = require("./discord.js");
 dotenv_1.default.config();
+// VPS は IPv6 の外向き通信が通らないため IPv4 を優先 (天気API等の ETIMEDOUT 対策)
+dns_1.default.setDefaultResultOrder('ipv4first');
 const app = (0, express_1.default)();
 const server = http_1.default.createServer(app);
 const wss = new ws_1.WebSocketServer({ server });
@@ -27,35 +35,98 @@ const PORT = process.env.PORT || 8091;
 const JWT_SECRET = process.env.JWT_SECRET || 'asdfbase_jwt_super_secret_key_2026_x89q';
 const INVITE_CODE = process.env.INVITE_CODE || 'ASDF';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
-async function getDiscordWebhookUrl() {
+// ---------------- System settings helpers ----------------
+async function getSetting(key, fallback = '') {
     try {
-        const res = await db_js_1.pool.query(`SELECT value FROM system_settings WHERE key = 'discord_webhook_url'`);
-        if (res.rows.length > 0 && res.rows[0].value) {
+        const res = await db_js_1.pool.query(`SELECT value FROM system_settings WHERE key = $1`, [key]);
+        if (res.rows.length > 0 && res.rows[0].value !== null)
             return res.rows[0].value;
-        }
     }
-    catch (err) {
-        // fallback
-    }
-    return DISCORD_WEBHOOK_URL;
+    catch (_) { }
+    return fallback;
 }
-async function relayToDiscord(username, content) {
-    try {
-        const webhookUrl = await getDiscordWebhookUrl();
-        if (!webhookUrl)
-            return;
-        fetch(webhookUrl, {
+async function setSetting(key, value) {
+    await db_js_1.pool.query(`INSERT INTO system_settings (key, value, updated_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`, [key, value]);
+}
+// 重要通知用 Webhook (従来の discord_webhook_url をそのまま重要通知専用として使う)
+async function getDiscordWebhookUrl() {
+    return getSetting('discord_webhook_url', DISCORD_WEBHOOK_URL);
+}
+async function postWebhook(url, body, files = []) {
+    if (files.length === 0) {
+        const res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                username: `[asdfbase] ${username}`,
-                content: content,
-            }),
-        }).catch(err => console.error('Discord webhook relay error:', err));
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok)
+            throw new Error(`Discord webhook HTTP ${res.status}`);
+        return;
+    }
+    const form = new FormData();
+    form.append('payload_json', JSON.stringify(body));
+    files.forEach((f, i) => form.append(`files[${i}]`, new Blob([fs_1.default.readFileSync(f)]), path_1.default.basename(f)));
+    const res = await fetch(url, { method: 'POST', body: form, signal: AbortSignal.timeout(20000) });
+    if (!res.ok)
+        throw new Error(`Discord webhook HTTP ${res.status}`);
+}
+// 重要な通知 (提出物・@everyone・ピン留め等) → 重要通知 Webhook
+async function notifyImportant(title, description, color = 0xf59e0b) {
+    try {
+        if ((await getSetting('notify_important_enabled', 'on')) !== 'on')
+            return;
+        const url = await getDiscordWebhookUrl();
+        if (!url)
+            return;
+        await postWebhook(url, {
+            username: 'asdfbase 重要通知',
+            embeds: [{ title: title.slice(0, 256), description: description.slice(0, 4000), color, timestamp: new Date().toISOString() }],
+            allowed_mentions: { parse: [] },
+        });
     }
     catch (err) {
-        console.error('relayToDiscord error:', err);
+        console.error('notifyImportant error:', err.message);
     }
+}
+// 通常メッセージの Discord 転送: Bot 連携があれば Bot、なければメッセージ用 Webhook
+async function relayMessage(msg) {
+    try {
+        const username = msg.sender_username || msg.username || 'unknown';
+        if (username.startsWith('[Discord]'))
+            return; // Discord から来たものは戻さない
+        if ((await getSetting('notify_messages_enabled', 'on')) !== 'on')
+            return;
+        if (await (0, discord_js_1.relayToDiscordBot)(msg.channel_id, username, msg.content))
+            return;
+        const url = await getSetting('discord_message_webhook_url', '');
+        if (!url)
+            return;
+        const files = [];
+        const text = msg.content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, (_m, p) => {
+            const f = path_1.default.join(UPLOAD_DIR, path_1.default.basename(p));
+            if (fs_1.default.existsSync(f))
+                files.push(f);
+            return '';
+        }).trim();
+        await postWebhook(url, { username: `[asdfbase] ${username}`, content: text || undefined, allowed_mentions: { parse: [] } }, files);
+    }
+    catch (err) {
+        console.error('relayMessage error:', err.message);
+    }
+}
+// ---------------- Audit log ----------------
+function requestMeta(req) {
+    const fwd = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    return {
+        ip: fwd || req.socket.remoteAddress || '',
+        userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
+    };
+}
+function logAudit(user, action, targetType, targetId, details, canRestore = false) {
+    db_js_1.pool.query(`INSERT INTO audit_logs (user_id, username, action, target_type, target_id, details, can_restore)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`, [user?.id || null, user?.username || 'system', action, targetType, targetId, JSON.stringify(details), canRestore]).catch(err => console.error('Audit log error:', err.message));
 }
 const UPLOAD_DIR = path_1.default.resolve('uploads');
 if (!fs_1.default.existsSync(UPLOAD_DIR)) {
@@ -92,7 +163,6 @@ app.get('/health', (req, res) => {
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', service: 'asdfbase-api', timestamp: new Date().toISOString() });
 });
-// Weather Cache & API (高松市)
 let weatherCache = null;
 function getWeatherDescription(code) {
     if (code === 0)
@@ -105,9 +175,9 @@ function getWeatherDescription(code) {
         return '曇り';
     if (code === 45 || code === 48)
         return '霧';
-    if (code >= 51 && code <= 55)
+    if (code >= 51 && code <= 57)
         return '霧雨';
-    if (code >= 61 && code <= 65)
+    if (code >= 61 && code <= 67)
         return '雨';
     if (code >= 71 && code <= 77)
         return '雪';
@@ -119,29 +189,80 @@ function getWeatherDescription(code) {
         return '雷雨';
     return '晴れ';
 }
-app.get('/api/weather', async (req, res) => {
-    const now = Date.now();
-    if (weatherCache && (now - weatherCache.updatedAt) < 10 * 60 * 1000) {
-        return res.json(weatherCache);
-    }
-    try {
-        const response = await fetch('https://api.open-meteo.com/v1/forecast?latitude=34.34&longitude=134.04&current_weather=true&timezone=Asia%2FTokyo');
-        if (response.ok) {
-            const data = await response.json();
-            if (data && data.current_weather) {
-                const weatherCode = Number(data.current_weather.weathercode);
-                const temp = Math.round(data.current_weather.temperature);
-                const desc = getWeatherDescription(weatherCode);
-                weatherCache = { temp, desc, weatherCode, updatedAt: now };
-                return res.json(weatherCache);
+async function fetchJson(url, timeoutMs = 6000) {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok)
+        throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+async function fetchWeatherOpenMeteo() {
+    const data = await fetchJson('https://api.open-meteo.com/v1/forecast?latitude=34.34&longitude=134.04' +
+        '&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max' +
+        '&forecast_days=1&timezone=Asia%2FTokyo');
+    const code = Number(data.current.weather_code);
+    return {
+        temp: Math.round(data.current.temperature_2m),
+        desc: getWeatherDescription(code),
+        weatherCode: code,
+        tempMax: data.daily?.temperature_2m_max?.[0] != null ? Math.round(data.daily.temperature_2m_max[0]) : null,
+        tempMin: data.daily?.temperature_2m_min?.[0] != null ? Math.round(data.daily.temperature_2m_min[0]) : null,
+        precipProb: data.daily?.precipitation_probability_max?.[0] ?? null,
+        source: 'open-meteo',
+        updatedAt: Date.now(),
+    };
+}
+// 気象庁 (香川県) — open-meteo が落ちている時の予備
+async function fetchWeatherJma() {
+    const data = await fetchJson('https://www.jma.go.jp/bosai/forecast/data/forecast/370000.json');
+    const series = data[0].timeSeries;
+    const weatherText = series[0].areas[0].weathers?.[0] || '';
+    const pops = series[1]?.areas?.[0]?.pops || [];
+    const temps = series[2]?.areas?.[0]?.temps || [];
+    const desc = weatherText.includes('雪') ? '雪' : weatherText.includes('雷') ? '雷雨' : weatherText.startsWith('雨') ? '雨'
+        : weatherText.startsWith('くもり') ? '曇り' : weatherText.startsWith('晴') ? '晴れ' : (weatherText.split(/\s/)[0] || '不明');
+    const nums = temps.map(Number).filter(n => Number.isFinite(n));
+    const popNums = pops.map(Number).filter(n => Number.isFinite(n));
+    return {
+        temp: nums.length > 0 ? Math.round(nums.reduce((a, b) => a + b, 0) / nums.length) : (weatherCache?.temp ?? 20),
+        desc,
+        weatherCode: desc === '晴れ' ? 1 : desc === '曇り' ? 3 : desc === '雨' ? 61 : desc === '雪' ? 71 : 2,
+        tempMax: nums.length > 0 ? Math.max(...nums) : null,
+        tempMin: nums.length > 1 ? Math.min(...nums) : null,
+        precipProb: popNums.length > 0 ? Math.max(...popNums) : null,
+        source: 'jma',
+        updatedAt: Date.now(),
+    };
+}
+let weatherInFlight = null;
+async function getWeather() {
+    if (weatherCache && Date.now() - weatherCache.updatedAt < 10 * 60 * 1000)
+        return weatherCache;
+    if (weatherInFlight)
+        return weatherInFlight;
+    weatherInFlight = (async () => {
+        try {
+            weatherCache = await fetchWeatherOpenMeteo();
+        }
+        catch (err) {
+            console.warn('open-meteo failed, falling back to JMA:', err.message);
+            try {
+                weatherCache = await fetchWeatherJma();
+            }
+            catch (err2) {
+                console.warn('JMA weather failed:', err2.message);
+                if (!weatherCache) {
+                    return { temp: 20, desc: '取得失敗', weatherCode: -1, tempMax: null, tempMin: null, precipProb: null, source: 'fallback', updatedAt: 0 };
+                }
             }
         }
-    }
-    catch (err) {
-        console.error('Failed to fetch weather in backend:', err);
-    }
-    const fallback = weatherCache || { temp: 21, desc: '晴れ', weatherCode: 1, updatedAt: now };
-    res.json(fallback);
+        return weatherCache;
+    })().finally(() => {
+        weatherInFlight = null;
+    });
+    return weatherInFlight;
+}
+app.get('/api/weather', async (req, res) => {
+    res.json(await getWeather());
 });
 // Register
 app.post('/api/auth/register', async (req, res) => {
@@ -189,8 +310,13 @@ app.post('/api/auth/login', async (req, res) => {
         const user = result.rows[0];
         const isMatch = await bcryptjs_1.default.compare(password, user.password_hash);
         if (!isMatch) {
+            logAudit({ id: user.id, username: user.username }, 'login_failed', 'user', user.id, {
+                message: 'ログイン失敗 (パスワード不一致)',
+                ...requestMeta(req),
+            });
             return res.status(401).json({ error: 'ユーザー名またはパスワードが正しくありません' });
         }
+        logAudit({ id: user.id, username: user.username }, 'login', 'user', user.id, { message: 'ログイン', ...requestMeta(req) });
         const token = jsonwebtoken_1.default.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, {
             expiresIn: '30d',
         });
@@ -266,6 +392,8 @@ app.post('/api/channels', authMiddleware, async (req, res) => {
         const result = await db_js_1.pool.query(`INSERT INTO channels (name, type, position) VALUES ($1, $2, $3) RETURNING *`, [cleanName, chType, nextPos]);
         const newChannel = result.rows[0];
         broadcast({ type: 'CHANNEL_CREATED', payload: newChannel });
+        logAudit(req.user, 'channel_create', 'channel', newChannel.id, { message: `チャンネル #${newChannel.name} を作成` });
+        (0, discord_js_1.refreshDiscordCommands)();
         res.json(newChannel);
     }
     catch (err) {
@@ -298,8 +426,10 @@ app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
         if (parseInt(countRes.rows[0].count, 10) <= 1) {
             return res.status(400).json({ error: '最後のチャンネルは削除できません' });
         }
-        await db_js_1.pool.query(`DELETE FROM channels WHERE id = $1`, [id]);
+        const delRes = await db_js_1.pool.query(`DELETE FROM channels WHERE id = $1 RETURNING name`, [id]);
         broadcast({ type: 'CHANNEL_DELETED', payload: { id } });
+        logAudit(req.user, 'channel_delete', 'channel', id, { message: `チャンネル #${delRes.rows[0]?.name || id} を削除` });
+        (0, discord_js_1.refreshDiscordCommands)();
         res.json({ success: true, id });
     }
     catch (err) {
@@ -307,6 +437,16 @@ app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'チャンネル削除に失敗しました' });
     }
 });
+// 返信先メッセージの概要を付与
+async function attachReplies(rows) {
+    const ids = Array.from(new Set(rows.map(r => r.reply_to_id).filter((v) => typeof v === 'number')));
+    if (ids.length === 0)
+        return rows;
+    const res = await db_js_1.pool.query(`SELECT m.id, m.content, m.user_id, COALESCE(u.username, m.username) AS username
+     FROM messages m LEFT JOIN users u ON u.id = m.user_id WHERE m.id = ANY($1::int[])`, [ids]);
+    const map = new Map(res.rows.map(r => [r.id, { id: r.id, username: r.username, user_id: r.user_id, content: String(r.content || '').slice(0, 200) }]));
+    return rows.map(r => (r.reply_to_id ? { ...r, reply_to: map.get(r.reply_to_id) || { id: r.reply_to_id, deleted: true } } : r));
+}
 // Messages API (supports pagination: limit & beforeId)
 app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) => {
     try {
@@ -326,7 +466,7 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
             query += ` AND m.id > $2 ORDER BY m.id ASC LIMIT $3`;
             params.push(afterId, Math.min(limit, 200));
             const result = await db_js_1.pool.query(query, params);
-            return res.json(result.rows);
+            return res.json(await attachReplies(result.rows));
         }
         else if (beforeId) {
             query += ` AND m.id < $2 ORDER BY m.id DESC LIMIT $3`;
@@ -337,7 +477,7 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
             params.push(limit);
         }
         const result = await db_js_1.pool.query(query, params);
-        res.json(result.rows.reverse());
+        res.json(await attachReplies(result.rows.reverse()));
     }
     catch (err) {
         res.status(500).json({ error: 'メッセージ取得エラー' });
@@ -353,7 +493,7 @@ app.get('/api/messages/since', authMiddleware, async (req, res) => {
        WHERE m.id > $1
        ORDER BY m.id ASC
        LIMIT 200`, [afterId]);
-        res.json(result.rows);
+        res.json(await attachReplies(result.rows));
     }
     catch (err) {
         res.status(500).json({ error: 'メッセージ同期エラー' });
@@ -405,6 +545,14 @@ app.delete('/api/messages/:messageId', authMiddleware, async (req, res) => {
         }
         await db_js_1.pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
         broadcast({ type: 'MESSAGE_DELETED', payload: { messageId, channelId: msg.channel_id } });
+        logAudit(req.user, 'message_delete', 'message', messageId, {
+            message: `メッセージ削除 (${msg.username} の投稿)`,
+            channel_id: msg.channel_id,
+            author: msg.username,
+            author_id: msg.user_id,
+            content: msg.content,
+            created_at: msg.created_at,
+        }, true);
         res.json({ success: true, messageId });
     }
     catch (err) {
@@ -426,8 +574,14 @@ app.put('/api/messages/:messageId', authMiddleware, async (req, res) => {
             return res.status(403).json({ error: '編集権限がありません' });
         }
         const updated = await db_js_1.pool.query(`UPDATE messages SET content = $1, updated_at = NOW() WHERE id = $2 RETURNING *`, [content, messageId]);
-        const updatedMessage = { ...updated.rows[0], sender_username: req.user.username };
+        const [updatedMessage] = await attachReplies([{ ...updated.rows[0], sender_username: req.user.username }]);
         broadcast({ type: 'MESSAGE_UPDATED', payload: updatedMessage });
+        logAudit(req.user, 'message_edit', 'message', messageId, {
+            message: 'メッセージ編集',
+            channel_id: msg.channel_id,
+            before: msg.content,
+            after: content,
+        });
         res.json(updatedMessage);
     }
     catch (err) {
@@ -444,9 +598,12 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
         const username = req.user.username;
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, userId, username, content, JSON.stringify(attachments || []), replyToId || null]);
-        const savedMessage = { ...result.rows[0], sender_username: username, client_nonce: clientNonce || null };
+        const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: username, client_nonce: clientNonce || null }]);
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
-        relayToDiscord(username, content);
+        relayMessage(savedMessage);
+        if (String(content).includes('@everyone')) {
+            notifyImportant(`📢 ${username} から全員への連絡`, String(content));
+        }
         // Check for @gemini mention trigger
         const trimmed = content.trim();
         if (trimmed.includes('@gemini')) {
@@ -456,8 +613,9 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
                     const aiResponse = await (0, gemini_js_1.askGemini)(prompt, '簡潔に答えてください。');
                     const botResult = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
              VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, aiResponse, savedMessage.id]);
-                    const aiMessage = { ...botResult.rows[0], sender_username: 'Gemini' };
+                    const [aiMessage] = await attachReplies([{ ...botResult.rows[0], sender_username: 'Gemini' }]);
                     broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
+                    relayMessage(aiMessage);
                 }, 100);
             }
         }
@@ -522,10 +680,20 @@ app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
     try {
         const messageId = parseInt(req.params.messageId, 10);
         const updated = await db_js_1.pool.query(`UPDATE messages SET is_pinned = NOT is_pinned WHERE id = $1 RETURNING *`, [messageId]);
+        if (updated.rows.length === 0)
+            return res.status(404).json({ error: 'メッセージがありません' });
+        const [pinned] = await attachReplies([updated.rows[0]]);
         broadcast({
             type: 'MESSAGE_PIN_UPDATED',
-            payload: updated.rows[0],
+            payload: pinned,
         });
+        logAudit(req.user, pinned.is_pinned ? 'message_pin' : 'message_unpin', 'message', messageId, {
+            message: pinned.is_pinned ? 'メッセージをピン留め' : 'ピン留めを解除',
+            content: pinned.content,
+        });
+        if (pinned.is_pinned) {
+            notifyImportant(`📌 ${req.user.username} がメッセージをピン留め`, `**${pinned.username}**: ${pinned.content}`);
+        }
         res.json(updated.rows[0]);
     }
     catch (err) {
@@ -551,7 +719,13 @@ app.post('/api/assignments', authMiddleware, async (req, res) => {
         const { title, subject, description, deadline, resubmitDeadline } = req.body;
         const result = await db_js_1.pool.query(`INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline) 
        VALUES ($1, $2, $3, $4, $5) RETURNING *`, [title, subject, description, deadline, resubmitDeadline || null]);
-        res.json(result.rows[0]);
+        const created = { ...result.rows[0], my_status: 'unstarted' };
+        broadcast({ type: 'ASSIGNMENT_CREATED', payload: created });
+        logAudit(req.user, 'assignment_create', 'assignment', created.id, { message: `提出物「${title}」を登録`, subject, deadline });
+        notifyImportant(`📝 新しい提出物: ${title}`, `教科: ${subject || '-'}\n締切: ${deadline ? new Date(deadline).toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' }) : '-'}` +
+            `${resubmitDeadline ? `\n再提出締切: ${new Date(resubmitDeadline).toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' })}` : ''}` +
+            `${description ? `\n\n${description}` : ''}\n(登録: ${req.user.username})`);
+        res.json(created);
     }
     catch (err) {
         res.status(500).json({ error: '提出物作成エラー' });
@@ -561,6 +735,7 @@ app.put('/api/assignments/:id', authMiddleware, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
         const { title, subject, description, deadline, resubmitDeadline } = req.body;
+        const before = (await db_js_1.pool.query(`SELECT * FROM assignments WHERE id = $1`, [id])).rows[0];
         const result = await db_js_1.pool.query(`UPDATE assignments 
        SET title = $1, subject = $2, description = $3, deadline = $4, resubmit_deadline = $5 
        WHERE id = $6 RETURNING *`, [title, subject, description, deadline, resubmitDeadline || null, id]);
@@ -569,6 +744,14 @@ app.put('/api/assignments/:id', authMiddleware, async (req, res) => {
         }
         const updated = result.rows[0];
         broadcast({ type: 'ASSIGNMENT_UPDATED', payload: updated });
+        logAudit(req.user, 'assignment_update', 'assignment', id, {
+            message: `提出物「${title}」を編集`,
+            before: before ? { title: before.title, subject: before.subject, deadline: before.deadline, resubmit_deadline: before.resubmit_deadline } : null,
+            after: { title, subject, deadline, resubmit_deadline: resubmitDeadline || null },
+        });
+        if (before && String(before.deadline) !== String(updated.deadline)) {
+            notifyImportant(`⏰ 締切変更: ${title}`, `新しい締切: ${new Date(updated.deadline).toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' })} (変更: ${req.user.username})`);
+        }
         res.json(updated);
     }
     catch (err) {
@@ -579,8 +762,15 @@ app.put('/api/assignments/:id', authMiddleware, async (req, res) => {
 app.delete('/api/assignments/:id', authMiddleware, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
-        await db_js_1.pool.query(`DELETE FROM assignments WHERE id = $1`, [id]);
+        const delRes = await db_js_1.pool.query(`DELETE FROM assignments WHERE id = $1 RETURNING *`, [id]);
         broadcast({ type: 'ASSIGNMENT_DELETED', payload: { id } });
+        const d = delRes.rows[0];
+        if (d) {
+            logAudit(req.user, 'assignment_delete', 'assignment', id, {
+                message: `提出物「${d.title}」を削除`,
+                title: d.title, subject: d.subject, description: d.description, deadline: d.deadline, resubmit_deadline: d.resubmit_deadline,
+            }, true);
+        }
         res.json({ success: true, id });
     }
     catch (err) {
@@ -700,6 +890,8 @@ app.delete('/api/test-scores/:id', authMiddleware, async (req, res) => {
             return res.status(403).json({ error: '削除権限がありません' });
         }
         await db_js_1.pool.query(`DELETE FROM test_scores WHERE id = $1`, [id]);
+        const sc = scoreRes.rows[0];
+        logAudit(req.user, 'test_score_delete', 'test_score', id, { message: `テスト点数を削除 (${sc.exam_name || ''} ${sc.subject}: ${sc.score}/${sc.max_score})` });
         res.json({ success: true, id });
     }
     catch (err) {
@@ -841,30 +1033,140 @@ app.get('/api/timetables', authMiddleware, async (req, res) => {
         res.status(500).json({ error: '時間割取得エラー' });
     }
 });
+const DEFAULT_PERIOD_TIMES = {
+    normal: [
+        { start: '08:50', end: '09:40' }, { start: '09:50', end: '10:40' }, { start: '10:50', end: '11:40' },
+        { start: '11:50', end: '12:40' }, { start: '13:30', end: '14:20' }, { start: '14:30', end: '15:20' },
+        { start: '15:30', end: '16:20' },
+    ],
+    short: [
+        { start: '08:50', end: '09:30' }, { start: '09:40', end: '10:20' }, { start: '10:30', end: '11:10' },
+        { start: '11:20', end: '12:00' }, { start: '12:45', end: '13:25' }, { start: '13:35', end: '14:15' },
+        { start: '14:25', end: '15:05' },
+    ],
+    s_short: [
+        { start: '08:50', end: '09:20' }, { start: '09:30', end: '10:00' }, { start: '10:10', end: '10:40' },
+        { start: '10:50', end: '11:20' }, { start: '11:30', end: '12:00' }, { start: '12:40', end: '13:10' },
+        { start: '13:20', end: '13:50' },
+    ],
+};
+const SCHEDULE_TYPES = ['normal', 'short', 's_short'];
+async function getTimetableConfig() {
+    let periods = DEFAULT_PERIOD_TIMES;
+    try {
+        const saved = JSON.parse(await getSetting('timetable_period_times', '{}'));
+        periods = { ...DEFAULT_PERIOD_TIMES, ...saved };
+    }
+    catch (_) { }
+    const active = await getSetting('timetable_active_schedule', 'normal');
+    return { activeScheduleType: SCHEDULE_TYPES.includes(active) ? active : 'normal', periods };
+}
+// 時程(各時限の時刻)と「今日の時程」: 全員で共有
+app.get('/api/timetables/config', authMiddleware, async (req, res) => {
+    try {
+        res.json(await getTimetableConfig());
+    }
+    catch (err) {
+        res.status(500).json({ error: '時程設定取得エラー' });
+    }
+});
+app.put('/api/timetables/config', authMiddleware, async (req, res) => {
+    try {
+        const { activeScheduleType, periods } = req.body || {};
+        const changes = [];
+        if (activeScheduleType !== undefined) {
+            if (!SCHEDULE_TYPES.includes(activeScheduleType))
+                return res.status(400).json({ error: '時程の種類が不正です' });
+            await setSetting('timetable_active_schedule', activeScheduleType);
+            changes.push(`今日の時程を ${activeScheduleType === 'normal' ? '通常' : activeScheduleType === 'short' ? '短縮' : 'S短'} に変更`);
+        }
+        if (periods !== undefined) {
+            const valid = (list) => Array.isArray(list) && list.length <= 10 &&
+                list.every((p) => /^\d{2}:\d{2}$/.test(p?.start) && /^\d{2}:\d{2}$/.test(p?.end));
+            for (const key of Object.keys(periods)) {
+                if (!SCHEDULE_TYPES.includes(key) || !valid(periods[key]))
+                    return res.status(400).json({ error: '時刻の形式が正しくありません (HH:MM)' });
+            }
+            const current = (await getTimetableConfig()).periods;
+            await setSetting('timetable_period_times', JSON.stringify({ ...current, ...periods }));
+            changes.push('時程の時刻を変更');
+        }
+        const config = await getTimetableConfig();
+        broadcast({ type: 'TIMETABLE_CONFIG_UPDATED', payload: config });
+        logAudit(req.user, 'timetable_config', 'timetable', null, { message: changes.join(' / ') });
+        res.json(config);
+    }
+    catch (err) {
+        res.status(500).json({ error: '時程設定保存エラー' });
+    }
+});
+// コマの登録/変更: 同じ曜日・時限は上書き (持ち物・メモは保持)
 app.post('/api/timetables', authMiddleware, async (req, res) => {
     try {
-        const { dayOfWeek, period, subject, scheduleType } = req.body;
+        const { dayOfWeek, period, subject, scheduleType, items, note } = req.body;
         if (dayOfWeek === undefined || !period || !subject) {
             return res.status(400).json({ error: '曜日、時限、教科名は必須です' });
         }
         const type = scheduleType || 'normal';
-        // 同じ曜日・時限のコマは上書き (重複登録を防ぐ)
-        await db_js_1.pool.query(`DELETE FROM timetables WHERE day_of_week = $1 AND period = $2 AND schedule_type = $3`, [dayOfWeek, period, type]);
-        const result = await db_js_1.pool.query(`INSERT INTO timetables (day_of_week, period, subject, schedule_type)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`, [dayOfWeek, period, subject, type]);
+        const existing = await db_js_1.pool.query(`SELECT * FROM timetables WHERE day_of_week = $1 AND period = $2 AND schedule_type = $3 ORDER BY id ASC`, [dayOfWeek, period, type]);
+        let row;
+        if (existing.rows.length > 0) {
+            const keep = existing.rows[0];
+            // 過去の重複行は掃除
+            if (existing.rows.length > 1) {
+                await db_js_1.pool.query(`DELETE FROM timetables WHERE id = ANY($1::int[])`, [existing.rows.slice(1).map(r => r.id)]);
+            }
+            row = (await db_js_1.pool.query(`UPDATE timetables SET subject = $1, items = COALESCE($2, items), note = COALESCE($3, note) WHERE id = $4 RETURNING *`, [subject, items ?? null, note ?? null, keep.id])).rows[0];
+        }
+        else {
+            row = (await db_js_1.pool.query(`INSERT INTO timetables (day_of_week, period, subject, schedule_type, items, note)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [dayOfWeek, period, subject, type, items || '', note || ''])).rows[0];
+        }
         broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: type } });
-        res.json(result.rows[0]);
+        logAudit(req.user, 'timetable_set', 'timetable', row.id, {
+            message: `時間割 ${['', '月', '火', '水', '木', '金', '土'][dayOfWeek] || dayOfWeek}曜${period}限 を「${subject}」に設定`,
+            scheduleType: type,
+            before: existing.rows[0]?.subject || null,
+        });
+        res.json(row);
     }
     catch (err) {
         res.status(500).json({ error: '時間割登録エラー' });
     }
 });
+// コマの詳細 (教科・持ち物・メモ) を更新
+app.put('/api/timetables/:id', authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const { subject, items, note } = req.body || {};
+        const result = await db_js_1.pool.query(`UPDATE timetables SET subject = COALESCE($1, subject), items = COALESCE($2, items), note = COALESCE($3, note)
+       WHERE id = $4 RETURNING *`, [subject ?? null, items ?? null, note ?? null, id]);
+        if (result.rows.length === 0)
+            return res.status(404).json({ error: 'コマが見つかりません' });
+        const row = result.rows[0];
+        broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: row.schedule_type } });
+        logAudit(req.user, 'timetable_detail', 'timetable', id, {
+            message: `時間割 ${['', '月', '火', '水', '木', '金', '土'][row.day_of_week] || row.day_of_week}曜${row.period}限 (${row.subject}) の詳細を更新`,
+            items: row.items,
+            note: row.note,
+        });
+        res.json(row);
+    }
+    catch (err) {
+        res.status(500).json({ error: '時間割更新エラー' });
+    }
+});
 app.delete('/api/timetables/:id', authMiddleware, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
-        const deleted = await db_js_1.pool.query(`DELETE FROM timetables WHERE id = $1 RETURNING schedule_type`, [id]);
-        broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: deleted.rows[0]?.schedule_type || 'normal' } });
+        const deleted = await db_js_1.pool.query(`DELETE FROM timetables WHERE id = $1 RETURNING *`, [id]);
+        const d = deleted.rows[0];
+        broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: d?.schedule_type || 'normal' } });
+        if (d) {
+            logAudit(req.user, 'timetable_delete', 'timetable', id, {
+                message: `時間割 ${['', '月', '火', '水', '木', '金', '土'][d.day_of_week] || d.day_of_week}曜${d.period}限 (${d.subject}) を削除`,
+            });
+        }
         res.json({ success: true });
     }
     catch (err) {
@@ -914,9 +1216,11 @@ app.post('/api/board/text', authMiddleware, async (req, res) => {
 });
 app.delete('/api/board/clear', authMiddleware, async (req, res) => {
     try {
+        const cnt = await db_js_1.pool.query(`SELECT (SELECT COUNT(*) FROM board_strokes) AS s, (SELECT COUNT(*) FROM board_texts) AS t`);
         await db_js_1.pool.query(`DELETE FROM board_strokes`);
         await db_js_1.pool.query(`DELETE FROM board_texts`);
         broadcast({ type: 'BOARD_CLEARED' });
+        logAudit(req.user, 'board_clear', 'board', null, { message: `ボードを全消去 (線 ${cnt.rows[0].s} 本 / 付箋 ${cnt.rows[0].t} 件)` });
         res.json({ success: true });
     }
     catch (err) {
@@ -1066,11 +1370,51 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req, res) => {
 // Audit Logs & Users List
 app.get('/api/audit-logs', authMiddleware, async (req, res) => {
     try {
-        const result = await db_js_1.pool.query(`SELECT * FROM audit_logs ORDER BY id DESC LIMIT 50`);
+        const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const beforeId = parseInt(req.query.beforeId, 10) || 0;
+        const action = req.query.action || '';
+        const params = [];
+        const where = [];
+        if (beforeId) {
+            params.push(beforeId);
+            where.push(`id < $${params.length}`);
+        }
+        if (action) {
+            params.push(`${action}%`);
+            where.push(`action LIKE $${params.length}`);
+        }
+        params.push(limit);
+        const result = await db_js_1.pool.query(`SELECT * FROM audit_logs ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY id DESC LIMIT $${params.length}`, params);
         res.json(result.rows);
     }
     catch (err) {
         res.status(500).json({ error: '監査ログ取得エラー' });
+    }
+});
+// このログだけ削除 (管理者)
+app.delete('/api/audit-logs/:id', authMiddleware, async (req, res) => {
+    if (req.user.role !== 'admin')
+        return res.status(403).json({ error: '管理者のみ削除できます' });
+    try {
+        const id = parseInt(req.params.id, 10);
+        await db_js_1.pool.query(`DELETE FROM audit_logs WHERE id = $1`, [id]);
+        res.json({ success: true, id });
+    }
+    catch (err) {
+        res.status(500).json({ error: '監査ログ削除エラー' });
+    }
+});
+// 履歴全削除 (管理者)。削除した事実だけは記録を残す
+app.delete('/api/audit-logs', authMiddleware, async (req, res) => {
+    if (req.user.role !== 'admin')
+        return res.status(403).json({ error: '管理者のみ削除できます' });
+    try {
+        const del = await db_js_1.pool.query(`DELETE FROM audit_logs`);
+        logAudit(req.user, 'audit_clear', 'audit', null, { message: `監査ログを全削除 (${del.rowCount} 件)`, ...requestMeta(req) });
+        res.json({ success: true, deleted: del.rowCount });
+    }
+    catch (err) {
+        res.status(500).json({ error: '監査ログ全削除エラー' });
     }
 });
 app.post('/api/audit-logs/:id/restore', authMiddleware, async (req, res) => {
@@ -1092,8 +1436,15 @@ app.post('/api/audit-logs/:id/restore', authMiddleware, async (req, res) => {
         }
         else if (log.target_type === 'assignment' && log.details) {
             const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
-            await db_js_1.pool.query(`INSERT INTO assignments (title, subject, description, deadline) VALUES ($1, $2, $3, $4)`, [details.title, details.subject, details.description, details.deadline || new Date()]);
+            const r = await db_js_1.pool.query(`INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline) VALUES ($1, $2, $3, $4, $5) RETURNING *`, [details.title, details.subject, details.description, details.deadline || new Date(), details.resubmit_deadline || null]);
+            broadcast({ type: 'ASSIGNMENT_CREATED', payload: { ...r.rows[0], my_status: 'unstarted' } });
         }
+        else if (log.target_type === 'message' && log.details) {
+            const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
+            const r = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, created_at) VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, NOW())) RETURNING *`, [details.channel_id, details.author_id || null, details.author || 'unknown', details.content || '', details.created_at || null]);
+            broadcast({ type: 'NEW_MESSAGE', payload: { ...r.rows[0], sender_username: details.author } });
+        }
+        logAudit(req.user, 'restore', log.target_type, log.target_id, { message: `ログ #${id} (${log.action}) から復元` });
         await db_js_1.pool.query(`UPDATE audit_logs SET restored = TRUE WHERE id = $1`, [id]);
         res.json({ success: true, id });
     }
@@ -1148,6 +1499,65 @@ app.post('/api/webhook/test', authMiddleware, async (req, res) => {
         res.status(500).json({ error: err.message || '送信エラー' });
     }
 });
+// Discord / 通知連携設定 (重要通知 Webhook・メッセージ Webhook・ON/OFF・Bot状態)
+app.get('/api/settings/integrations', authMiddleware, async (req, res) => {
+    try {
+        res.json({
+            importantWebhookUrl: await getDiscordWebhookUrl(),
+            messageWebhookUrl: await getSetting('discord_message_webhook_url', ''),
+            importantEnabled: (await getSetting('notify_important_enabled', 'on')) === 'on',
+            messagesEnabled: (await getSetting('notify_messages_enabled', 'on')) === 'on',
+            bot: await (0, discord_js_1.getDiscordStatus)(),
+        });
+    }
+    catch (err) {
+        res.status(500).json({ error: '連携設定取得エラー' });
+    }
+});
+app.post('/api/settings/integrations', authMiddleware, async (req, res) => {
+    try {
+        const { importantWebhookUrl, messageWebhookUrl, importantEnabled, messagesEnabled } = req.body || {};
+        const isWebhook = (u) => typeof u === 'string' && (u === '' || /^https:\/\/(discord|discordapp)\.com\/api\/webhooks\//.test(u));
+        if (importantWebhookUrl !== undefined) {
+            if (!isWebhook(importantWebhookUrl))
+                return res.status(400).json({ error: '重要通知 Webhook URL の形式が正しくありません' });
+            await setSetting('discord_webhook_url', importantWebhookUrl);
+        }
+        if (messageWebhookUrl !== undefined) {
+            if (!isWebhook(messageWebhookUrl))
+                return res.status(400).json({ error: 'メッセージ Webhook URL の形式が正しくありません' });
+            await setSetting('discord_message_webhook_url', messageWebhookUrl);
+        }
+        if (importantEnabled !== undefined)
+            await setSetting('notify_important_enabled', importantEnabled ? 'on' : 'off');
+        if (messagesEnabled !== undefined)
+            await setSetting('notify_messages_enabled', messagesEnabled ? 'on' : 'off');
+        logAudit(req.user, 'settings_update', 'settings', null, {
+            message: '通知・Discord連携設定を変更',
+            changed: Object.keys(req.body || {}),
+        });
+        res.json({ success: true });
+    }
+    catch (err) {
+        res.status(500).json({ error: '連携設定保存エラー' });
+    }
+});
+app.post('/api/settings/integrations/test', authMiddleware, async (req, res) => {
+    try {
+        const { kind } = req.body || {};
+        const url = kind === 'message' ? await getSetting('discord_message_webhook_url', '') : await getDiscordWebhookUrl();
+        if (!url)
+            return res.status(400).json({ error: 'Webhook URL が設定されていません' });
+        await postWebhook(url, {
+            username: kind === 'message' ? '[asdfbase] テスト' : 'asdfbase 重要通知',
+            content: `【asdfbase ${kind === 'message' ? 'メッセージ転送' : '重要通知'}テスト】${req.user.username} から送信`,
+        });
+        res.json({ success: true });
+    }
+    catch (err) {
+        res.status(400).json({ error: `送信に失敗しました: ${err.message}` });
+    }
+});
 // Change Password
 app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
     try {
@@ -1161,6 +1571,7 @@ app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
             return res.status(400).json({ error: '現在のパスワードが正しくありません' });
         const newHash = await bcryptjs_1.default.hash(newPassword, 10);
         await db_js_1.pool.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [newHash, userId]);
+        logAudit(req.user, 'password_change', 'user', userId, { message: 'パスワードを変更', ...requestMeta(req) });
         res.json({ success: true });
     }
     catch (err) {
@@ -1198,6 +1609,7 @@ app.delete('/api/users/:userId', authMiddleware, async (req, res) => {
         }
         await db_js_1.pool.query(`DELETE FROM users WHERE id = $1`, [targetUserId]);
         broadcast({ type: 'USER_DELETED', payload: { userId: targetUserId } });
+        logAudit(req.user, 'user_delete', 'user', targetUserId, { message: `アカウント ${targetUser.rows[0].username} を削除` });
         res.json({ success: true, userId: targetUserId });
     }
     catch (err) {
@@ -1318,9 +1730,12 @@ async function handleClientMessage(user, connId, msg) {
         const { channelId, content, attachments, replyToId, clientNonce } = msg;
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, user.id, user.username, content, JSON.stringify(attachments || []), replyToId || null]);
-        const savedMessage = { ...result.rows[0], sender_username: user.username, client_nonce: clientNonce || null };
+        const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: user.username, client_nonce: clientNonce || null }]);
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
-        relayToDiscord(user.username || 'unknown', content);
+        if (String(content).includes('@everyone')) {
+            notifyImportant(`📢 ${user.username} から全員への連絡`, String(content));
+        }
+        relayMessage(savedMessage);
         const trimmed = String(content || '').trim();
         if (trimmed.includes('@gemini')) {
             const prompt = trimmed.replace(/@gemini/g, '').trim();
@@ -1329,7 +1744,9 @@ async function handleClientMessage(user, connId, msg) {
                     const aiResponse = await (0, gemini_js_1.askGemini)(prompt, '簡潔に答えてください。');
                     const botResult = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
              VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, aiResponse, savedMessage.id]);
-                    broadcast({ type: 'NEW_MESSAGE', payload: { ...botResult.rows[0], sender_username: 'Gemini' } });
+                    const [aiMessage] = await attachReplies([{ ...botResult.rows[0], sender_username: 'Gemini' }]);
+                    broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
+                    relayMessage(aiMessage);
                 }, 100);
             }
         }
@@ -1570,8 +1987,33 @@ server.listen(PORT, async () => {
         await (0, db_js_1.initDb)();
         // 再起動直後は全員オフライン扱いにし、接続/アクセスで復帰させる
         await db_js_1.pool.query(`UPDATE users SET status = 'offline'`);
+        await db_js_1.pool.query(`
+      ALTER TABLE timetables ADD COLUMN IF NOT EXISTS items TEXT DEFAULT '';
+      ALTER TABLE timetables ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
+    `).catch(err => console.warn('Timetable migration warning:', err.message));
     }
     catch (err) {
         console.error('DB Init failed:', err);
+    }
+    try {
+        await (0, discord_js_1.startDiscordBot)({
+            getSetting,
+            setSetting,
+            listAsdfChannels: async () => (await db_js_1.pool.query(`SELECT id, name, type FROM channels ORDER BY position ASC, id ASC`)).rows,
+            ingest: async (asdfChannelId, username, content) => {
+                const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content) VALUES ($1, NULL, $2, $3) RETURNING *`, [asdfChannelId, username, content]);
+                broadcast({ type: 'NEW_MESSAGE', payload: { ...result.rows[0], sender_username: username } });
+            },
+            saveImage: async (buf) => {
+                const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.webp`;
+                await (0, sharp_1.default)(buf, { animated: false }).resize({ width: 1600, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path_1.default.join(UPLOAD_DIR, filename));
+                return `/uploads/${filename}`;
+            },
+            uploadDir: UPLOAD_DIR,
+            audit: (action, details) => logAudit(null, action, 'discord', null, details),
+        });
+    }
+    catch (err) {
+        console.error('Discord bot start failed:', err);
     }
 });
