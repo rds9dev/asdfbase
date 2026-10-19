@@ -87,7 +87,7 @@ export async function chatWithGemini(
   fullPrompt += 'AIとしての返答:';
 
   const defaultInstruction = systemInstruction || 
-    'あなたは学生向けワークスペース「asdfbase」の優秀で親切なAIアシスタントです。提供されたコンテキスト情報も活用し、簡潔かつ分かりやすく日本語で回答してください。';
+    'あなたは中学生向けワークスペース「asdfbase」のAIアシスタントです。コンテキスト情報 (JSON) を必要に応じて活用し、前置きや締めの挨拶を省いて要点だけを日本語で簡潔に答えてください。';
 
   return askGemini(fullPrompt, defaultInstruction);
 }

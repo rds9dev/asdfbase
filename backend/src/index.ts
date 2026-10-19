@@ -13,6 +13,10 @@ import dns from 'dns';
 import { pool, initDb } from './db.js';
 import { askGemini, chatWithGemini, getAvailableKeyCount } from './gemini.js';
 import { startDiscordBot, relayToDiscordBot, getDiscordStatus, refreshDiscordCommands } from './discord.js';
+import {
+  DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo, schoolTimeStatus,
+  type ScheduleDef, type ScheduleType, type TimetableConfig,
+} from './schedule.js';
 
 dotenv.config();
 
@@ -178,6 +182,20 @@ app.get('/api/health', (req, res) => {
 });
 
 // Weather Cache & API (高松市)
+interface WeatherDay {
+  date: string;
+  weatherCode: number;
+  desc: string;
+  tempMax: number | null;
+  tempMin: number | null;
+  precipProb: number | null;
+}
+interface WeatherHour {
+  time: string;
+  temp: number;
+  weatherCode: number;
+  precipProb: number | null;
+}
 interface WeatherInfo {
   temp: number;
   desc: string;
@@ -185,6 +203,13 @@ interface WeatherInfo {
   tempMax: number | null;
   tempMin: number | null;
   precipProb: number | null;
+  humidity?: number | null;
+  feelsLike?: number | null;
+  windSpeed?: number | null;
+  sunrise?: string | null;
+  sunset?: string | null;
+  daily: WeatherDay[];
+  hourly: WeatherHour[];
   source: 'open-meteo' | 'jma' | 'fallback';
   updatedAt: number;
 }
@@ -211,24 +236,58 @@ async function fetchJson(url: string, timeoutMs = 6000): Promise<any> {
   return res.json();
 }
 
+const roundOrNull = (v: any) => (v == null || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)));
+
 async function fetchWeatherOpenMeteo(): Promise<WeatherInfo> {
   const data = await fetchJson(
     'https://api.open-meteo.com/v1/forecast?latitude=34.34&longitude=134.04' +
-    '&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max' +
-    '&forecast_days=1&timezone=Asia%2FTokyo'
+    '&current=temperature_2m,weather_code,relative_humidity_2m,apparent_temperature,wind_speed_10m' +
+    '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset' +
+    '&hourly=temperature_2m,weather_code,precipitation_probability' +
+    '&forecast_days=7&timezone=Asia%2FTokyo&wind_speed_unit=ms'
   );
   const code = Number(data.current.weather_code);
+  const d = data.daily || {};
+  const daily: WeatherDay[] = (d.time || []).map((date: string, i: number) => ({
+    date,
+    weatherCode: Number(d.weather_code?.[i] ?? -1),
+    desc: getWeatherDescription(Number(d.weather_code?.[i] ?? 1)),
+    tempMax: roundOrNull(d.temperature_2m_max?.[i]),
+    tempMin: roundOrNull(d.temperature_2m_min?.[i]),
+    precipProb: d.precipitation_probability_max?.[i] ?? null,
+  }));
+  // 現在時刻から24時間分
+  const h = data.hourly || {};
+  const nowKey = String(data.current.time || '').slice(0, 13);
+  const startIdx = Math.max(0, (h.time || []).findIndex((t: string) => t.slice(0, 13) === nowKey));
+  const hourly: WeatherHour[] = (h.time || []).slice(startIdx, startIdx + 24).map((time: string, i: number) => ({
+    time: time.slice(11, 16),
+    temp: Math.round(h.temperature_2m[startIdx + i]),
+    weatherCode: Number(h.weather_code[startIdx + i]),
+    precipProb: h.precipitation_probability?.[startIdx + i] ?? null,
+  }));
   return {
     temp: Math.round(data.current.temperature_2m),
     desc: getWeatherDescription(code),
     weatherCode: code,
-    tempMax: data.daily?.temperature_2m_max?.[0] != null ? Math.round(data.daily.temperature_2m_max[0]) : null,
-    tempMin: data.daily?.temperature_2m_min?.[0] != null ? Math.round(data.daily.temperature_2m_min[0]) : null,
-    precipProb: data.daily?.precipitation_probability_max?.[0] ?? null,
+    tempMax: daily[0]?.tempMax ?? null,
+    tempMin: daily[0]?.tempMin ?? null,
+    precipProb: daily[0]?.precipProb ?? null,
+    humidity: roundOrNull(data.current.relative_humidity_2m),
+    feelsLike: roundOrNull(data.current.apparent_temperature),
+    windSpeed: data.current.wind_speed_10m != null ? Math.round(Number(data.current.wind_speed_10m) * 10) / 10 : null,
+    sunrise: d.sunrise?.[0] ? String(d.sunrise[0]).slice(11, 16) : null,
+    sunset: d.sunset?.[0] ? String(d.sunset[0]).slice(11, 16) : null,
+    daily,
+    hourly,
     source: 'open-meteo',
     updatedAt: Date.now(),
   };
 }
+
+const jmaDesc = (text: string) => text.includes('雪') ? '雪' : text.includes('雷') ? '雷雨' : text.startsWith('雨') ? '雨'
+  : text.startsWith('くもり') ? '曇り' : text.startsWith('晴') ? '晴れ' : (text.split(/\s/)[0] || '不明');
+const jmaCode = (desc: string) => desc === '晴れ' ? 1 : desc === '曇り' ? 3 : desc === '雨' ? 61 : desc === '雪' ? 71 : desc === '雷雨' ? 95 : 2;
 
 // 気象庁 (香川県) — open-meteo が落ちている時の予備
 async function fetchWeatherJma(): Promise<WeatherInfo> {
@@ -237,17 +296,40 @@ async function fetchWeatherJma(): Promise<WeatherInfo> {
   const weatherText: string = series[0].areas[0].weathers?.[0] || '';
   const pops: string[] = series[1]?.areas?.[0]?.pops || [];
   const temps: string[] = series[2]?.areas?.[0]?.temps || [];
-  const desc = weatherText.includes('雪') ? '雪' : weatherText.includes('雷') ? '雷雨' : weatherText.startsWith('雨') ? '雨'
-    : weatherText.startsWith('くもり') ? '曇り' : weatherText.startsWith('晴') ? '晴れ' : (weatherText.split(/\s/)[0] || '不明');
+  const desc = jmaDesc(weatherText);
   const nums = temps.map(Number).filter(n => Number.isFinite(n));
   const popNums = pops.map(Number).filter(n => Number.isFinite(n));
+  // 週間予報
+  const daily: WeatherDay[] = [];
+  const week = data[1]?.timeSeries;
+  if (week) {
+    const times: string[] = week[0]?.timeDefines || [];
+    const codes: string[] = week[0]?.areas?.[0]?.weatherCodes || [];
+    const wpops: string[] = week[0]?.areas?.[0]?.pops || [];
+    const tmax: string[] = week[1]?.areas?.[0]?.tempsMax || [];
+    const tmin: string[] = week[1]?.areas?.[0]?.tempsMin || [];
+    times.forEach((t, i) => {
+      const c = Number(codes[i]);
+      const d = c >= 400 ? '雪' : c >= 300 ? '雨' : c >= 200 ? '曇り' : '晴れ';
+      daily.push({
+        date: t.slice(0, 10),
+        weatherCode: jmaCode(d),
+        desc: d,
+        tempMax: tmax[i] ? Number(tmax[i]) : null,
+        tempMin: tmin[i] ? Number(tmin[i]) : null,
+        precipProb: wpops[i] ? Number(wpops[i]) : null,
+      });
+    });
+  }
   return {
     temp: nums.length > 0 ? Math.round(nums.reduce((a, b) => a + b, 0) / nums.length) : (weatherCache?.temp ?? 20),
     desc,
-    weatherCode: desc === '晴れ' ? 1 : desc === '曇り' ? 3 : desc === '雨' ? 61 : desc === '雪' ? 71 : 2,
+    weatherCode: jmaCode(desc),
     tempMax: nums.length > 0 ? Math.max(...nums) : null,
     tempMin: nums.length > 1 ? Math.min(...nums) : null,
     precipProb: popNums.length > 0 ? Math.max(...popNums) : null,
+    daily,
+    hourly: [],
     source: 'jma',
     updatedAt: Date.now(),
   };
@@ -267,7 +349,7 @@ async function getWeather(): Promise<WeatherInfo> {
       } catch (err2: any) {
         console.warn('JMA weather failed:', err2.message);
         if (!weatherCache) {
-          return { temp: 20, desc: '取得失敗', weatherCode: -1, tempMax: null, tempMin: null, precipProb: null, source: 'fallback' as const, updatedAt: 0 };
+          return { temp: 20, desc: '取得失敗', weatherCode: -1, tempMax: null, tempMin: null, precipProb: null, daily: [], hourly: [], source: 'fallback' as const, updatedAt: 0 };
         }
       }
     }
@@ -316,6 +398,7 @@ app.post('/api/auth/register', async (req, res) => {
        VALUES ($1, $2, 'register', 'user', $3, $4)`,
       [user.id, user.username, user.id, JSON.stringify({ message: '新規ユーザー登録' })]
     );
+    ensureNoteSlots().catch(err => console.error('Note slot ensure error:', err.message));
 
     res.json({ token, user });
   } catch (err: any) {
@@ -363,6 +446,7 @@ app.post('/api/auth/login', async (req, res) => {
         role: user.role,
         status: user.status,
         custom_status: user.custom_status,
+        avatar_url: user.avatar_url,
       },
     });
   } catch (err) {
@@ -375,7 +459,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, role, status, custom_status, created_at FROM users WHERE id = $1`,
+      `SELECT id, username, role, status, custom_status, avatar_url, created_at FROM users WHERE id = $1`,
       [req.user!.id]
     );
     if (result.rows.length === 0) {
@@ -557,7 +641,7 @@ app.get('/api/messages/since', authMiddleware, async (req, res) => {
 });
 
 // Unread counts per channel based on client's last-read message ids
-app.post('/api/channels/unread-counts', authMiddleware, async (req, res) => {
+app.post('/api/channels/unread-counts', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const lastRead: Record<string, number> = req.body?.lastRead || {};
     const channelIds: number[] = [];
@@ -570,19 +654,24 @@ app.post('/api/channels/unread-counts', authMiddleware, async (req, res) => {
         lastReadIds.push(idNum);
       }
     }
+    // unread: 自分以外の未読 / mentions: そのうち自分宛て (@名前・@everyone・自分への返信)
     const result = await pool.query(
       `SELECT m.channel_id,
               MAX(m.id) AS last_message_id,
-              COUNT(*) FILTER (WHERE r.last_read IS NOT NULL AND m.id > r.last_read) AS unread
+              COUNT(*) FILTER (WHERE r.last_read IS NOT NULL AND m.id > r.last_read AND m.user_id IS DISTINCT FROM $3) AS unread,
+              COUNT(*) FILTER (WHERE r.last_read IS NOT NULL AND m.id > r.last_read AND m.user_id IS DISTINCT FROM $3
+                AND (POSITION($4 IN m.content) > 0 OR POSITION('@everyone' IN m.content) > 0 OR p.user_id = $3)) AS mentions
        FROM messages m
        LEFT JOIN (SELECT unnest($1::int[]) AS ch, unnest($2::int[]) AS last_read) r ON r.ch = m.channel_id
+       LEFT JOIN messages p ON p.id = m.reply_to_id
        GROUP BY m.channel_id`,
-      [channelIds, lastReadIds]
+      [channelIds, lastReadIds, req.user!.id, `@${req.user!.username}`]
     );
     res.json(result.rows.map(r => ({
       channelId: r.channel_id,
       lastMessageId: Number(r.last_message_id),
       unread: Number(r.unread),
+      mentions: Number(r.mentions),
     })));
   } catch (err) {
     console.error('Unread counts error:', err);
@@ -659,6 +748,44 @@ app.put('/api/messages/:messageId', authMiddleware, async (req: AuthRequest, res
   }
 });
 
+// @gemini: チャンネルの直近の会話を履歴として渡して返信する (授業時間中は返信しない)
+const IMAGE_MD_RE = /!\[[^\]]*\]\([^)\s]+\)/g;
+async function replyAsGemini(channelId: number, trigger: { id: number; content: string; username?: string; sender_username?: string }) {
+  if (!/@gemini\b/i.test(String(trigger.content || ''))) return;
+  try {
+    if ((await getSchoolTime()).inSchool) return;
+    const hist = await pool.query(
+      `SELECT m.id, m.content, m.user_id, COALESCE(u.username, m.username) AS username, m.created_at
+       FROM messages m LEFT JOIN users u ON u.id = m.user_id
+       WHERE m.channel_id = $1 AND m.id <= $2 ORDER BY m.id DESC LIMIT 30`,
+      [channelId, trigger.id]
+    );
+    const history = hist.rows.reverse().map(r => {
+      const text = String(r.content || '').replace(IMAGE_MD_RE, '[画像]').slice(0, 2000);
+      return r.username === 'Gemini'
+        ? { role: 'model' as const, content: text }
+        : { role: 'user' as const, content: `${r.username}: ${text}` };
+    });
+    const channel = (await pool.query(`SELECT name FROM channels WHERE id = $1`, [channelId])).rows[0];
+    const asker = trigger.sender_username || trigger.username || '';
+    const reply = await chatWithGemini(history, {
+      channel: channel?.name,
+      asked_by: asker,
+      now: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
+    }, `あなたはチャット「asdfbase」の参加者 Gemini です。会話の流れを踏まえ、最後に @gemini で呼びかけた ${asker} に答えてください。前置きは省き、チャットらしく簡潔に日本語で答えてください。`);
+    const botResult = await pool.query(
+      `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id)
+       VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
+      [channelId, reply, trigger.id]
+    );
+    const [aiMessage] = await attachReplies([{ ...botResult.rows[0], sender_username: 'Gemini' }]);
+    broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
+    relayMessage(aiMessage);
+  } catch (err: any) {
+    console.error('Gemini mention error:', err.message);
+  }
+}
+
 // Post Message with AI @gemini mention support (commands like /ai removed)
 app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRequest, res) => {
   try {
@@ -681,24 +808,7 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
       notifyImportant(`📢 ${username} から全員への連絡`, String(content));
     }
 
-    // Check for @gemini mention trigger
-    const trimmed = content.trim();
-    if (trimmed.includes('@gemini')) {
-      const prompt = trimmed.replace(/@gemini/g, '').trim();
-      if (prompt) {
-        setTimeout(async () => {
-          const aiResponse = await askGemini(prompt, '簡潔に答えてください。');
-          const botResult = await pool.query(
-            `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
-             VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
-            [channelId, aiResponse, savedMessage.id]
-          );
-          const [aiMessage] = await attachReplies([{ ...botResult.rows[0], sender_username: 'Gemini' }]);
-          broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
-          relayMessage(aiMessage);
-        }, 100);
-      }
-    }
+    replyAsGemini(channelId, savedMessage);
 
     res.json(savedMessage);
   } catch (err) {
@@ -946,7 +1056,7 @@ app.put('/api/assignments/:id/progress', authMiddleware, async (req: AuthRequest
 });
 
 // Gemini Summarize Assignment
-app.post('/api/assignments/summarize', authMiddleware, async (req, res) => {
+app.post('/api/assignments/summarize', authMiddleware, aiGuard, async (req, res) => {
   try {
     const { description } = req.body;
     if (!description) return res.status(400).json({ error: '内容が空です' });
@@ -959,44 +1069,58 @@ app.post('/api/assignments/summarize', authMiddleware, async (req, res) => {
   }
 });
 
-// Test Scores & AI Advice
+// Test Scores (中間 / 期末 / 学年末 / 診断テスト) & AI Advice
+const EXAM_TYPES: Record<string, string> = { midterm: '中間テスト', final: '期末テスト', yearend: '学年末テスト', diagnostic: '診断テスト' };
+
 app.get('/api/test-scores', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const requestedUserId = req.query.userId as string;
-    let query = `
-      SELECT t.*, u.username 
-      FROM test_scores t 
-      LEFT JOIN users u ON t.user_id = u.id
-    `;
-    const params: any[] = [];
-    if (requestedUserId && requestedUserId !== 'all') {
-      query += ` WHERE t.user_id = $1`;
-      params.push(parseInt(requestedUserId, 10));
-    } else if (!requestedUserId) {
-      query += ` WHERE t.user_id = $1`;
-      params.push(req.user!.id);
-    }
-    query += ` ORDER BY t.exam_name ASC, t.subject ASC`;
-
-    const result = await pool.query(query, params);
+    const requestedUserId = parseInt(req.query.userId as string, 10);
+    const userId = Number.isFinite(requestedUserId) ? requestedUserId : req.user!.id;
+    const result = await pool.query(
+      `SELECT t.*, u.username FROM test_scores t LEFT JOIN users u ON t.user_id = u.id
+       WHERE t.user_id = $1 ORDER BY t.created_at ASC, t.id ASC`,
+      [userId]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'テスト点数取得エラー' });
   }
 });
 
+// 1回分のテスト (種別 + 回の名前) の点数をまとめて登録。同じ教科は上書き
 app.post('/api/test-scores', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const userId = req.user!.id;
-    const { examName, subject, score, maxScore } = req.body;
-
-    const result = await pool.query(
-      `INSERT INTO test_scores (user_id, exam_name, subject, score, max_score) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [userId, examName, subject, score, maxScore || 100]
-    );
-    res.json({ ...result.rows[0], username: req.user!.username });
+    const examType = EXAM_TYPES[req.body.examType] ? req.body.examType : 'midterm';
+    const examLabel = String(req.body.examLabel || '').trim().slice(0, 100);
+    const entries: { subject: string; score: number; maxScore?: number }[] = Array.isArray(req.body.entries)
+      ? req.body.entries
+      : [{ subject: req.body.subject, score: req.body.score, maxScore: req.body.maxScore }];
+    if (!examLabel) return res.status(400).json({ error: '何回目のテストか (例: 1学期) を入力してください' });
+    const rows = [];
+    for (const e of entries) {
+      const subject = String(e.subject || '').trim();
+      const score = Number(e.score);
+      const maxScore = Number(e.maxScore) || 100;
+      if (!subject || !Number.isFinite(score)) continue;
+      if (score < 0 || score > maxScore) return res.status(400).json({ error: `${subject} の点数が 0〜${maxScore} の範囲外です` });
+      const existing = await pool.query(
+        `SELECT id FROM test_scores WHERE user_id = $1 AND exam_type = $2 AND exam_label = $3 AND subject = $4`,
+        [userId, examType, examLabel, subject]
+      );
+      const r = existing.rows.length > 0
+        ? await pool.query(`UPDATE test_scores SET score = $1, max_score = $2 WHERE id = $3 RETURNING *`, [score, maxScore, existing.rows[0].id])
+        : await pool.query(
+          `INSERT INTO test_scores (user_id, exam_type, exam_label, exam_name, subject, score, max_score)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+          [userId, examType, examLabel, `${EXAM_TYPES[examType]} ${examLabel}`, subject, score, maxScore]
+        );
+      rows.push({ ...r.rows[0], username: req.user!.username });
+    }
+    if (rows.length === 0) return res.status(400).json({ error: '点数を1つ以上入力してください' });
+    res.json(rows);
   } catch (err) {
+    console.error('Test score save error:', err);
     res.status(500).json({ error: 'テスト点数登録エラー' });
   }
 });
@@ -1026,26 +1150,38 @@ app.delete('/api/test-scores/:id', authMiddleware, async (req: AuthRequest, res)
   }
 });
 
-app.post('/api/test-scores/advice', authMiddleware, async (req: AuthRequest, res) => {
+// 種別ごとに、回を追った推移から学習アドバイス
+app.post('/api/test-scores/advice', authMiddleware, aiGuard, async (req: AuthRequest, res) => {
   try {
     const userId = req.user!.id;
-    const scores = await pool.query(`SELECT subject, score, max_score FROM test_scores WHERE user_id = $1`, [userId]);
+    const examType = EXAM_TYPES[req.body?.examType] ? req.body.examType : 'midterm';
+    const scores = await pool.query(
+      `SELECT exam_label, subject, score, max_score FROM test_scores WHERE user_id = $1 AND exam_type = $2 ORDER BY created_at ASC, id ASC`,
+      [userId, examType]
+    );
     if (scores.rows.length === 0) {
-      return res.status(400).json({ error: 'テスト点数が記録されていません' });
+      return res.status(400).json({ error: `${EXAM_TYPES[examType]} の点数がまだ記録されていません` });
     }
 
-    const scoreSummary = scores.rows.map(s => `${s.subject}: ${s.score}/${s.max_score}点`).join(', ');
-    const prompt = `私のテスト結果は以下の通りです:\n${scoreSummary}\n合計点や得点傾向を分析し、今後の勉強方針や苦手克服のための具体的なアドバイスを教えてください。`;
+    const byLabel = new Map<string, string[]>();
+    for (const s of scores.rows) {
+      const list = byLabel.get(s.exam_label || '(回の指定なし)') || [];
+      list.push(`${s.subject} ${Number(s.score)}/${Number(s.max_score)}`);
+      byLabel.set(s.exam_label || '(回の指定なし)', list);
+    }
+    const summary = Array.from(byLabel.entries()).map(([label, list]) => `【${label}】${list.join(', ')}`).join('\n');
+    const prompt = `中学生の${EXAM_TYPES[examType]}の結果です (古い順):\n${summary}\n\n教科ごとの得点傾向と推移を分析し、次のテストに向けた具体的な勉強方法を教えてください。`;
 
-    const advice = await askGemini(prompt, '高校生・学生向けの親身で具体的な学習アドバイザーとして回答してください。');
+    const advice = await askGemini(prompt, '中学生向けの学習アドバイザーです。前置きや挨拶は省き、Markdown の見出しと箇条書きで簡潔に答えてください。');
     res.json({ advice });
   } catch (err) {
+    console.error('Advice error:', err);
     res.status(500).json({ error: 'アドバイス生成エラー' });
   }
 });
 
 // AI Chat Endpoint (for AI Tab) with Smart # and @ contextual resolver
-app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
+app.post('/api/ai/chat', authMiddleware, aiGuard, async (req: AuthRequest, res) => {
   try {
     const { messages, contextData, systemInstruction } = req.body;
     if (!messages || !Array.isArray(messages)) {
@@ -1135,7 +1271,7 @@ app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
 });
 
 // Memo AI Assistant (Summarize, Proofread, Explain Code)
-app.post('/api/ai/memo-assist', authMiddleware, async (req: AuthRequest, res) => {
+app.post('/api/ai/memo-assist', authMiddleware, aiGuard, async (req: AuthRequest, res) => {
   try {
     const { content, type, customPrompt } = req.body;
     if (!content && !customPrompt) {
@@ -1148,7 +1284,7 @@ app.post('/api/ai/memo-assist', authMiddleware, async (req: AuthRequest, res) =>
     if (type === 'summarize') {
       prompt = `以下のメモ内容を3行以内の重要ポイントに箇条書きで要約してください:\n\n${content}`;
     } else if (type === 'proofread') {
-      prompt = `以下の文章の誤字脱字、表現の不自然さを校正し、改善後の文章を提示してください:\n\n${content}`;
+      prompt = `以下の文章の誤字脱字・表現の不自然さを直した「校正後の全文」だけを出力してください。説明・前置き・コードブロックの囲みは不要です。Markdown の書式はそのまま残してください:\n\n${content}`;
     } else if (type === 'explain_code') {
       prompt = `以下のプログラムコードの処理内容、引数、戻り値、改善点を分かりやすく解説してください:\n\n${content}`;
       instruction = 'プログラミング講師として簡潔かつ明快に解説してください。';
@@ -1180,36 +1316,40 @@ app.get('/api/timetables', authMiddleware, async (req, res) => {
   }
 });
 
-const DEFAULT_PERIOD_TIMES: Record<string, { start: string; end: string }[]> = {
-  normal: [
-    { start: '08:50', end: '09:40' }, { start: '09:50', end: '10:40' }, { start: '10:50', end: '11:40' },
-    { start: '11:50', end: '12:40' }, { start: '13:30', end: '14:20' }, { start: '14:30', end: '15:20' },
-    { start: '15:30', end: '16:20' },
-  ],
-  short: [
-    { start: '08:50', end: '09:30' }, { start: '09:40', end: '10:20' }, { start: '10:30', end: '11:10' },
-    { start: '11:20', end: '12:00' }, { start: '12:45', end: '13:25' }, { start: '13:35', end: '14:15' },
-    { start: '14:25', end: '15:05' },
-  ],
-  s_short: [
-    { start: '08:50', end: '09:20' }, { start: '09:30', end: '10:00' }, { start: '10:10', end: '10:40' },
-    { start: '10:50', end: '11:20' }, { start: '11:30', end: '12:00' }, { start: '12:40', end: '13:10' },
-    { start: '13:20', end: '13:50' },
-  ],
-};
-const SCHEDULE_TYPES = ['normal', 'short', 's_short'];
-
-async function getTimetableConfig() {
-  let periods = DEFAULT_PERIOD_TIMES;
+async function getTimetableConfig(): Promise<TimetableConfig & { activeDate: string }> {
+  let schedules: Record<ScheduleType, ScheduleDef> = { ...DEFAULT_SCHEDULES };
+  let dayPeriodCounts = { ...DEFAULT_DAY_PERIOD_COUNTS };
   try {
-    const saved = JSON.parse(await getSetting('timetable_period_times', '{}'));
-    periods = { ...DEFAULT_PERIOD_TIMES, ...saved };
+    const saved = JSON.parse(await getSetting('timetable_config_v2', '{}'));
+    for (const t of SCHEDULE_TYPES) {
+      if (isValidSchedule(saved.schedules?.[t])) schedules[t] = saved.schedules[t];
+    }
+    if (saved.dayPeriodCounts) dayPeriodCounts = { ...dayPeriodCounts, ...saved.dayPeriodCounts };
   } catch (_) {}
+  // 「今日の時程」は設定した日だけ有効。日付が変わったら通常時程へ戻る
   const active = await getSetting('timetable_active_schedule', 'normal');
-  return { activeScheduleType: SCHEDULE_TYPES.includes(active) ? active : 'normal', periods };
+  const activeDate = await getSetting('timetable_active_date', '');
+  const today = nowInTokyo().date;
+  const activeScheduleType = (SCHEDULE_TYPES as readonly string[]).includes(active) && activeDate === today ? active as ScheduleType : 'normal';
+  return { activeScheduleType, activeDate: today, schedules, dayPeriodCounts };
 }
 
-// 時程(各時限の時刻)と「今日の時程」: 全員で共有
+async function getSchoolTime() {
+  return schoolTimeStatus(await getTimetableConfig());
+}
+
+// 授業時間中は AI を使わせない
+async function aiGuard(req: Request, res: Response, next: NextFunction) {
+  try {
+    const st = await getSchoolTime();
+    if (st.inSchool) {
+      return res.status(403).json({ error: `授業時間中は AI を使えません (${st.until} まで)`, code: 'SCHOOL_TIME', until: st.until });
+    }
+  } catch (_) {}
+  next();
+}
+
+// 時程(朝の会・各時限・帰りの会)と「今日の時程」: 全員で共有
 app.get('/api/timetables/config', authMiddleware, async (req, res) => {
   try {
     res.json(await getTimetableConfig());
@@ -1220,22 +1360,37 @@ app.get('/api/timetables/config', authMiddleware, async (req, res) => {
 
 app.put('/api/timetables/config', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { activeScheduleType, periods } = req.body || {};
+    const { activeScheduleType, schedules, dayPeriodCounts } = req.body || {};
     const changes: string[] = [];
     if (activeScheduleType !== undefined) {
-      if (!SCHEDULE_TYPES.includes(activeScheduleType)) return res.status(400).json({ error: '時程の種類が不正です' });
+      if (!(SCHEDULE_TYPES as readonly string[]).includes(activeScheduleType)) return res.status(400).json({ error: '時程の種類が不正です' });
       await setSetting('timetable_active_schedule', activeScheduleType);
+      await setSetting('timetable_active_date', nowInTokyo().date);
       changes.push(`今日の時程を ${activeScheduleType === 'normal' ? '通常' : activeScheduleType === 'short' ? '短縮' : 'S短'} に変更`);
     }
-    if (periods !== undefined) {
-      const valid = (list: any) => Array.isArray(list) && list.length <= 10 &&
-        list.every((p: any) => /^\d{2}:\d{2}$/.test(p?.start) && /^\d{2}:\d{2}$/.test(p?.end));
-      for (const key of Object.keys(periods)) {
-        if (!SCHEDULE_TYPES.includes(key) || !valid(periods[key])) return res.status(400).json({ error: '時刻の形式が正しくありません (HH:MM)' });
+    if (schedules !== undefined || dayPeriodCounts !== undefined) {
+      const current = await getTimetableConfig();
+      const nextSchedules = { ...current.schedules };
+      if (schedules !== undefined) {
+        for (const key of Object.keys(schedules)) {
+          if (!(SCHEDULE_TYPES as readonly string[]).includes(key) || !isValidSchedule(schedules[key])) {
+            return res.status(400).json({ error: '時刻の形式が正しくありません (HH:MM)' });
+          }
+          nextSchedules[key as ScheduleType] = schedules[key];
+        }
+        changes.push('時程の時刻を変更');
       }
-      const current = (await getTimetableConfig()).periods;
-      await setSetting('timetable_period_times', JSON.stringify({ ...current, ...periods }));
-      changes.push('時程の時刻を変更');
+      const nextCounts = { ...current.dayPeriodCounts };
+      if (dayPeriodCounts !== undefined) {
+        for (const [day, count] of Object.entries(dayPeriodCounts)) {
+          if (!['1', '2', '3', '4', '5'].includes(day) || ![5, 6].includes(Number(count))) {
+            return res.status(400).json({ error: '授業数は 5 か 6 を指定してください' });
+          }
+          nextCounts[day] = Number(count);
+        }
+        changes.push('曜日ごとの授業数を変更');
+      }
+      await setSetting('timetable_config_v2', JSON.stringify({ schedules: nextSchedules, dayPeriodCounts: nextCounts }));
     }
     const config = await getTimetableConfig();
     broadcast({ type: 'TIMETABLE_CONFIG_UPDATED', payload: config });
@@ -1427,65 +1582,68 @@ app.put('/api/clipboard', authMiddleware, async (req: AuthRequest, res) => {
 });
 
 // Notes (Slots 1-10 Common + Slots 11+ Dedicated Monaco) API
+// メモスロットの確保・整理 (起動時とユーザー登録時だけ実行。GET のたびに走らせると重い)
+async function ensureNoteSlots() {
+  // 1. スロット1〜10の確保
+  for (let i = 1; i <= 10; i++) {
+    await pool.query(`
+      INSERT INTO notes (slot_index, title, content, mode) 
+      VALUES ($1, $2, '', 'markdown') 
+      ON CONFLICT (slot_index) DO NOTHING
+    `, [i, `メモ ${i}`]);
+  }
+
+  // 2. 既存スロット1〜10の「メモ #1」などの重複タイトルをクリーンアップ
+  await pool.query(`
+    UPDATE notes 
+    SET title = REGEXP_REPLACE(title, '^メモ\\s*#([0-9]+)', 'メモ \\1') 
+    WHERE slot_index <= 10 AND title LIKE '%#%'
+  `).catch(() => {});
+
+  // 3. 全利用メンバーの専用Monacoエディタスロット（スロット11以降: 10 + user.id 固定）を自動確保
+  const usersRes = await pool.query(`SELECT id, username FROM users ORDER BY id ASC`);
+  for (const u of usersRes.rows) {
+    const slotIndex = 10 + u.id; // ユーザーID固定スロット
+    await pool.query(`
+      INSERT INTO notes (slot_index, title, content, mode, assigned_user_id)
+      VALUES ($1, $2, '', 'monaco', $3)
+      ON CONFLICT (slot_index) DO UPDATE 
+      SET assigned_user_id = EXCLUDED.assigned_user_id,
+          title = CASE WHEN notes.title LIKE '%の専用エディタ' THEN EXCLUDED.title ELSE notes.title END
+    `, [slotIndex, `${u.username}の専用エディタ`, u.id]);
+  }
+
+  // 4. 旧方式(11 + 並び順)で作られた重複専用スロットを正規スロット(10 + user.id)へ統合して削除
+  const strayRes = await pool.query(`
+    SELECT n.slot_index, n.content, n.assigned_user_id
+    FROM notes n
+    WHERE n.slot_index > 10
+      AND (n.assigned_user_id IS NULL
+           OR n.slot_index <> 10 + n.assigned_user_id
+           OR NOT EXISTS (SELECT 1 FROM users u WHERE u.id = n.assigned_user_id))
+  `);
+  for (const stray of strayRes.rows) {
+    const owner = usersRes.rows.find(u => u.id === stray.assigned_user_id);
+    if (owner) {
+      const canonical = 10 + owner.id;
+      // 正規スロットが空なら内容を引き継ぐ
+      if (stray.content) {
+        await pool.query(
+          `UPDATE notes SET content = $1, updated_at = NOW() WHERE slot_index = $2 AND (content IS NULL OR content = '')`,
+          [stray.content, canonical]
+        );
+      }
+      await pool.query(`UPDATE note_history SET slot_index = $1 WHERE slot_index = $2`, [canonical, stray.slot_index]);
+      await pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
+    } else if (!stray.content) {
+      // 削除済みユーザーの空スロット
+      await pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
+    }
+  }
+}
+
 app.get('/api/notes', authMiddleware, async (req, res) => {
   try {
-    // 1. スロット1〜10の確保
-    for (let i = 1; i <= 10; i++) {
-      await pool.query(`
-        INSERT INTO notes (slot_index, title, content, mode) 
-        VALUES ($1, $2, '', 'markdown') 
-        ON CONFLICT (slot_index) DO NOTHING
-      `, [i, `メモ ${i}`]);
-    }
-
-    // 2. 既存スロット1〜10の「メモ #1」などの重複タイトルをクリーンアップ
-    await pool.query(`
-      UPDATE notes 
-      SET title = REGEXP_REPLACE(title, '^メモ\\s*#([0-9]+)', 'メモ \\1') 
-      WHERE slot_index <= 10 AND title LIKE '%#%'
-    `).catch(() => {});
-
-    // 3. 全利用メンバーの専用Monacoエディタスロット（スロット11以降: 10 + user.id 固定）を自動確保
-    const usersRes = await pool.query(`SELECT id, username FROM users ORDER BY id ASC`);
-    for (const u of usersRes.rows) {
-      const slotIndex = 10 + u.id; // ユーザーID固定スロット
-      await pool.query(`
-        INSERT INTO notes (slot_index, title, content, mode, assigned_user_id)
-        VALUES ($1, $2, '', 'monaco', $3)
-        ON CONFLICT (slot_index) DO UPDATE 
-        SET assigned_user_id = EXCLUDED.assigned_user_id,
-            title = CASE WHEN notes.title LIKE '%の専用エディタ' THEN EXCLUDED.title ELSE notes.title END
-      `, [slotIndex, `${u.username}の専用エディタ`, u.id]);
-    }
-
-    // 4. 旧方式(11 + 並び順)で作られた重複専用スロットを正規スロット(10 + user.id)へ統合して削除
-    const strayRes = await pool.query(`
-      SELECT n.slot_index, n.content, n.assigned_user_id
-      FROM notes n
-      WHERE n.slot_index > 10
-        AND (n.assigned_user_id IS NULL
-             OR n.slot_index <> 10 + n.assigned_user_id
-             OR NOT EXISTS (SELECT 1 FROM users u WHERE u.id = n.assigned_user_id))
-    `);
-    for (const stray of strayRes.rows) {
-      const owner = usersRes.rows.find(u => u.id === stray.assigned_user_id);
-      if (owner) {
-        const canonical = 10 + owner.id;
-        // 正規スロットが空なら内容を引き継ぐ
-        if (stray.content) {
-          await pool.query(
-            `UPDATE notes SET content = $1, updated_at = NOW() WHERE slot_index = $2 AND (content IS NULL OR content = '')`,
-            [stray.content, canonical]
-          );
-        }
-        await pool.query(`UPDATE note_history SET slot_index = $1 WHERE slot_index = $2`, [canonical, stray.slot_index]);
-        await pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
-      } else if (!stray.content) {
-        // 削除済みユーザーの空スロット
-        await pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
-      }
-    }
-
     const result = await pool.query(`
       SELECT n.*, u.username as assigned_username 
       FROM notes n 
@@ -1785,11 +1943,136 @@ app.post('/api/auth/change-password', authMiddleware, async (req: AuthRequest, r
 app.get('/api/users', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, role, status, custom_status, last_active_at FROM users ORDER BY username ASC`
+      `SELECT id, username, role, status, custom_status, avatar_url, last_active_at FROM users ORDER BY username ASC`
     );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'ユーザー一覧取得エラー' });
+  }
+});
+
+// アイコン画像 (正方形 256px の WebP に変換)
+app.post('/api/users/me/avatar', authMiddleware, upload.single('image'), async (req: AuthRequest, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '画像ファイルが見つかりません' });
+    const filename = `avatar-${req.user!.id}-${Date.now()}.webp`;
+    await sharp(req.file.buffer, { animated: false })
+      .resize({ width: 256, height: 256, fit: 'cover' })
+      .webp({ quality: 82 })
+      .toFile(path.join(UPLOAD_DIR, filename));
+    const avatarUrl = `/uploads/${filename}`;
+    const prev = (await pool.query(`SELECT avatar_url FROM users WHERE id = $1`, [req.user!.id])).rows[0]?.avatar_url;
+    await pool.query(`UPDATE users SET avatar_url = $1 WHERE id = $2`, [avatarUrl, req.user!.id]);
+    if (prev && String(prev).startsWith('/uploads/avatar-')) {
+      fs.promises.unlink(path.join(UPLOAD_DIR, path.basename(prev))).catch(() => {});
+    }
+    broadcast({ type: 'USER_UPDATED', payload: { id: req.user!.id, avatar_url: avatarUrl } });
+    res.json({ avatar_url: avatarUrl });
+  } catch (err) {
+    console.error('Avatar upload error:', err);
+    res.status(500).json({ error: 'アイコンの保存に失敗しました' });
+  }
+});
+
+app.delete('/api/users/me/avatar', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const prev = (await pool.query(`SELECT avatar_url FROM users WHERE id = $1`, [req.user!.id])).rows[0]?.avatar_url;
+    await pool.query(`UPDATE users SET avatar_url = NULL WHERE id = $1`, [req.user!.id]);
+    if (prev && String(prev).startsWith('/uploads/avatar-')) {
+      fs.promises.unlink(path.join(UPLOAD_DIR, path.basename(prev))).catch(() => {});
+    }
+    broadcast({ type: 'USER_UPDATED', payload: { id: req.user!.id, avatar_url: null } });
+    res.json({ avatar_url: null });
+  } catch (err) {
+    res.status(500).json({ error: 'アイコンの削除に失敗しました' });
+  }
+});
+
+// カレンダー: 各自が予定を書き込み、全員で見られる
+const formatEvent = (r: any) => ({
+  ...r,
+  event_date: r.event_date instanceof Date
+    ? `${r.event_date.getFullYear()}-${String(r.event_date.getMonth() + 1).padStart(2, '0')}-${String(r.event_date.getDate()).padStart(2, '0')}`
+    : String(r.event_date).slice(0, 10),
+});
+
+app.get('/api/calendar', authMiddleware, async (req, res) => {
+  try {
+    const from = String(req.query.from || '');
+    const to = String(req.query.to || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return res.status(400).json({ error: '期間 (from, to) を YYYY-MM-DD で指定してください' });
+    }
+    const result = await pool.query(
+      `SELECT e.*, u.avatar_url FROM calendar_events e LEFT JOIN users u ON u.id = e.user_id
+       WHERE e.event_date BETWEEN $1::date AND $2::date ORDER BY e.event_date ASC, e.event_time ASC, e.id ASC`,
+      [from, to]
+    );
+    res.json(result.rows.map(formatEvent));
+  } catch (err) {
+    res.status(500).json({ error: '予定の取得に失敗しました' });
+  }
+});
+
+function parseEventBody(body: any) {
+  const date = String(body?.date || '');
+  const time = String(body?.time || '');
+  const title = String(body?.title || '').trim().slice(0, 100);
+  const note = String(body?.note || '').slice(0, 2000);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { error: '日付が正しくありません' };
+  if (time && !/^\d{2}:\d{2}$/.test(time)) return { error: '時刻が正しくありません' };
+  if (!title) return { error: '予定の名前を入力してください' };
+  return { date, time, title, note };
+}
+
+app.post('/api/calendar', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const ev = parseEventBody(req.body);
+    if ('error' in ev) return res.status(400).json({ error: ev.error });
+    const result = await pool.query(
+      `INSERT INTO calendar_events (user_id, username, event_date, event_time, title, note) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [req.user!.id, req.user!.username, ev.date, ev.time, ev.title, ev.note]
+    );
+    const created = formatEvent(result.rows[0]);
+    broadcast({ type: 'CALENDAR_UPDATED', payload: created });
+    res.json(created);
+  } catch (err) {
+    res.status(500).json({ error: '予定の保存に失敗しました' });
+  }
+});
+
+app.put('/api/calendar/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const current = (await pool.query(`SELECT * FROM calendar_events WHERE id = $1`, [id])).rows[0];
+    if (!current) return res.status(404).json({ error: '予定が見つかりません' });
+    if (current.user_id !== req.user!.id && req.user!.role !== 'admin') return res.status(403).json({ error: '他の人の予定は編集できません' });
+    const ev = parseEventBody(req.body);
+    if ('error' in ev) return res.status(400).json({ error: ev.error });
+    const result = await pool.query(
+      `UPDATE calendar_events SET event_date = $1, event_time = $2, title = $3, note = $4 WHERE id = $5 RETURNING *`,
+      [ev.date, ev.time, ev.title, ev.note, id]
+    );
+    const updated = formatEvent(result.rows[0]);
+    broadcast({ type: 'CALENDAR_UPDATED', payload: updated });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: '予定の保存に失敗しました' });
+  }
+});
+
+app.delete('/api/calendar/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const current = (await pool.query(`SELECT * FROM calendar_events WHERE id = $1`, [id])).rows[0];
+    if (!current) return res.status(404).json({ error: '予定が見つかりません' });
+    if (current.user_id !== req.user!.id && req.user!.role !== 'admin') return res.status(403).json({ error: '他の人の予定は削除できません' });
+    await pool.query(`DELETE FROM calendar_events WHERE id = $1`, [id]);
+    broadcast({ type: 'CALENDAR_DELETED', payload: { id } });
+    logAudit(req.user!, 'calendar_delete', 'calendar', id, { message: `予定「${current.title}」を削除`, date: formatEvent(current).event_date });
+    res.json({ success: true, id });
+  } catch (err) {
+    res.status(500).json({ error: '予定の削除に失敗しました' });
   }
 });
 
@@ -1986,23 +2269,7 @@ async function handleClientMessage(user: { id: number; username: string }, connI
     }
     relayMessage(savedMessage);
 
-    const trimmed = String(content || '').trim();
-    if (trimmed.includes('@gemini')) {
-      const prompt = trimmed.replace(/@gemini/g, '').trim();
-      if (prompt) {
-        setTimeout(async () => {
-          const aiResponse = await askGemini(prompt, '簡潔に答えてください。');
-          const botResult = await pool.query(
-            `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id) 
-             VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
-            [channelId, aiResponse, savedMessage.id]
-          );
-          const [aiMessage] = await attachReplies([{ ...botResult.rows[0], sender_username: 'Gemini' }]);
-          broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
-          relayMessage(aiMessage);
-        }, 100);
-      }
-    }
+    replyAsGemini(channelId, savedMessage);
     return;
   }
 
@@ -2040,6 +2307,15 @@ async function handleClientMessage(user: { id: number; username: string }, connI
       type: 'VC_STATE_CHANGED',
       payload: { userId: user.id, username: user.username, channelId, isMuted, isDeafened, isScreenSharing },
     });
+    return;
+  }
+
+  // 入力中表示 (送信元タブ以外へ。古いものはクライアント側で捨てる)
+  if (msg.type === 'TYPING') {
+    publish({
+      type: 'USER_TYPING',
+      payload: { userId: user.id, username: user.username, channelId: Number(msg.channelId), t: Date.now() },
+    }, { excludeConnId: connId });
     return;
   }
 
@@ -2255,6 +2531,7 @@ server.listen(PORT, async () => {
       ALTER TABLE timetables ADD COLUMN IF NOT EXISTS items TEXT DEFAULT '';
       ALTER TABLE timetables ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
     `).catch(err => console.warn('Timetable migration warning:', err.message));
+    await ensureNoteSlots();
   } catch (err) {
     console.error('DB Init failed:', err);
   }

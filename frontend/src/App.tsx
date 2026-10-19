@@ -73,7 +73,12 @@ import {
   Moon,
   Sunrise,
   PenTool,
-  Umbrella
+  Menu,
+  Umbrella,
+  Undo2,
+  BellRing,
+  WifiOff,
+  ChevronDown,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -84,12 +89,26 @@ import {
   type ConnectionRoute, type RealtimeTransport,
 } from './config';
 import { RealtimeClient, type RealtimeStatus, type ConcreteTransport } from './realtime';
+import { UiHost, HoverCard, Modal, confirmDialog, toast } from './ui';
+import {
+  DEFAULT_CONFIG, SCHEDULE_LABELS, DAY_LABELS, MAX_PERIODS, SUBJECTS,
+  computeSchoolStatus, daySlots, schoolTime, periodCountFor, closingFor,
+  type ScheduleType, type ScheduleDef, type TimetableConfig, type TimetableItem,
+} from './schedule';
+import { renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates } from './chatText';
+import { setFaviconBadge } from './favicon';
+import AiTab from './AiTab';
+import TestScoresTab from './TestScoresTab';
+import HelpTab from './HelpTab';
+import { WeatherDetail, WeatherHoverSummary, weatherIcon, type WeatherInfo } from './WeatherPanel';
+import { CalendarHoverSummary, CalendarPanel, monthRange, ymd, type CalendarEvent } from './CalendarPanel';
 
 interface User {
   id: number;
   username: string;
   role: string;
   status: string;
+  avatar_url?: string | null;
 }
 
 interface Message {
@@ -160,6 +179,48 @@ function avatarColorFor(name: string): string {
   return AVATAR_COLORS[h % AVATAR_COLORS.length];
 }
 
+// アイコン画像があれば画像、なければ頭文字
+function Avatar({ name, url, size = 'w-9 h-9 text-sm', dim = false }: { name: string; url?: string | null; size?: string; dim?: boolean }) {
+  const clean = name.replace('[Discord] ', '');
+  if (url) {
+    return <img src={url} alt="" loading="lazy" className={`${size} rounded-full object-cover shrink-0 border border-stone-800 ${dim ? 'opacity-50' : ''}`} />;
+  }
+  return (
+    <div className={`${size} rounded-full flex items-center justify-center font-bold uppercase shrink-0 border ${
+      dim ? 'bg-stone-900 text-stone-600 border-stone-800' : clean === 'Gemini' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : avatarColorFor(clean)
+    }`}>
+      {clean === 'Gemini' ? 'AI' : clean[0]}
+    </div>
+  );
+}
+
+const LS = {
+  get(key: string, fallback = ''): string {
+    try {
+      return localStorage.getItem(key) ?? fallback;
+    } catch {
+      return fallback;
+    }
+  },
+  set(key: string, value: string) {
+    try {
+      localStorage.setItem(key, value);
+    } catch (_) {}
+  },
+};
+
+type TabId = 'chat' | 'memo' | 'ai' | 'assignments' | 'board' | 'more' | 'settings' | 'help';
+const TABS: { id: TabId; label: string; icon: any }[] = [
+  { id: 'chat', label: 'チャット', icon: MessageSquare },
+  { id: 'memo', label: 'メモ', icon: FileText },
+  { id: 'ai', label: 'AI', icon: Bot },
+  { id: 'assignments', label: '提出物', icon: CheckSquare },
+  { id: 'board', label: 'ボード', icon: Layout },
+  { id: 'more', label: 'その他', icon: MoreHorizontal },
+  { id: 'settings', label: '設定', icon: Settings },
+  { id: 'help', label: 'ヘルプ', icon: HelpCircle },
+];
+
 function CornerReplyIcon() {
   return (
     <svg width="22" height="10" viewBox="0 0 22 10" className="shrink-0 text-stone-600" aria-hidden="true">
@@ -187,61 +248,6 @@ interface MemoSlot {
   updated_at: string;
 }
 
-interface TimetableItem {
-  id: number;
-  day_of_week: number;
-  period: number;
-  subject: string;
-  schedule_type: string;
-  items?: string;
-  note?: string;
-}
-
-type ScheduleType = 'normal' | 'short' | 's_short';
-type PeriodTime = { start: string; end: string };
-const SCHEDULE_LABELS: Record<ScheduleType, string> = { normal: '通常時程', short: '短縮時程', s_short: 'S短時程' };
-const DAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
-
-function toMinutes(hhmm: string): number {
-  const [h, m] = hhmm.split(':').map(Number);
-  return h * 60 + m;
-}
-
-// ヘッダーに出す「今」の状態: 休み / 朝 / 授業中 / 休み時間 / 昼休み / 放課後
-function computeSchoolStatus(now: Date, periods: PeriodTime[], today: TimetableItem[]) {
-  const dow = now.getDay();
-  const subjectOf = (p: number) => today.find(t => t.period === p)?.subject || '';
-  if (dow === 0 || dow === 6) {
-    return { kind: 'holiday' as const, label: '休み', sub: dow === 6 ? '土曜日' : '日曜日' };
-  }
-  if (periods.length === 0) return { kind: 'holiday' as const, label: '時程未設定', sub: '' };
-  const registered = today.map(t => t.period);
-  const lastPeriod = registered.length > 0 ? Math.min(Math.max(...registered), periods.length) : periods.length;
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const first = periods[0];
-  if (nowMin < toMinutes(first.start)) {
-    return { kind: 'morning' as const, label: '朝', sub: `1限 ${subjectOf(1) || ''} ${first.start}~`.replace(/\s+/g, ' ') };
-  }
-  for (let i = 0; i < lastPeriod; i++) {
-    const p = periods[i];
-    const start = toMinutes(p.start);
-    const end = toMinutes(p.end);
-    if (nowMin >= start && nowMin < end) {
-      return { kind: 'class' as const, label: `${i + 1}限 ${subjectOf(i + 1) || '授業中'}`, sub: `~${p.end}` };
-    }
-    const next = periods[i + 1];
-    if (next && i + 1 < lastPeriod && nowMin >= end && nowMin < toMinutes(next.start)) {
-      const isLunch = toMinutes(next.start) - end >= 30;
-      return {
-        kind: 'break' as const,
-        label: `Next: ${i + 2}限 ${subjectOf(i + 2) || ''}`.trim(),
-        sub: `${isLunch ? '昼休み' : '休み時間'} · ${next.start}~`,
-      };
-    }
-  }
-  return { kind: 'after' as const, label: '放課後', sub: `${lastPeriod}限まで終了` };
-}
-
 interface Assignment {
   id: number;
   title: string;
@@ -251,16 +257,6 @@ interface Assignment {
   resubmit_deadline?: string;
   my_status: 'unstarted' | 'in_progress' | 'submitted' | 'resubmit' | 'passed';
   is_archived: boolean;
-}
-
-interface TestScore {
-  id: number;
-  user_id?: number;
-  username?: string;
-  exam_name: string;
-  subject: string;
-  score: number;
-  max_score: number;
 }
 
 export default function App() {
@@ -290,35 +286,34 @@ export default function App() {
     }
   };
   
-  // Navigation Tabs
-  const [activeTab, setActiveTab] = useState<'chat' | 'memo' | 'ai' | 'assignments' | 'board' | 'more' | 'settings'>('chat');
+  // Navigation Tabs (リロードしても同じタブを開く)
+  const [activeTab, setActiveTabState] = useState<TabId>(() => {
+    const saved = LS.get('asdf_active_tab') as TabId;
+    return TABS.some(t => t.id === saved) ? saved : 'chat';
+  });
+  const setActiveTab = (tab: TabId) => {
+    setActiveTabState(tab);
+    LS.set('asdf_active_tab', tab);
+  };
+  const isSmallScreen = () => typeof window !== 'undefined' && window.innerWidth < 768;
 
   // Header Data
-  const [currentTime, setCurrentTime] = useState<string>('');
-  const [weather, setWeather] = useState<{ temp: number | null; desc: string; weatherCode?: number; tempMax?: number | null; tempMin?: number | null; precipProb?: number | null; source?: string }>({ temp: null, desc: '取得中' });
-  const [nextSubject, setNextSubject] = useState<{ name: string; time: string }>({ name: '数学', time: '10:45~' });
+  const [now, setNow] = useState<Date>(() => new Date());
+  const [weather, setWeather] = useState<WeatherInfo>({ temp: null, desc: '取得中' });
+  const [showWeather, setShowWeather] = useState(false);
+  const [showCalendar, setShowCalendar] = useState(false);
+  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
+  const [notifyBannerDismissed, setNotifyBannerDismissed] = useState(() => LS.get('asdf_notify_banner_dismissed') === '1');
+  const [notifyPermission, setNotifyPermission] = useState<string>(() => ('Notification' in window ? Notification.permission : 'unsupported'));
   const [showCamera, setShowCamera] = useState<boolean>(false);
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [cameraError, setCameraError] = useState<string>('');
 
-  // AI Tab State
-  const [aiMessages, setAiMessages] = useState<{ id: number; role: 'user' | 'model'; content: string; timestamp: string }[]>([
-    {
-      id: 1,
-      role: 'model',
-      content: 'こんにちは！asdfbaseのAIアシスタントです。学校生活、課題の要約、勉強の質問、プログラミングの質問など何でも聞いてください。',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    }
-  ]);
-  const [aiInput, setAiInput] = useState('');
-  const [isLoadingAi, setIsLoadingAi] = useState(false);
-  const [includeContextInAi, setIncludeContextInAi] = useState(true);
-  const aiEndRef = useRef<HTMLDivElement | null>(null);
-
-  // Memo AI State
+  // Memo AI State (校正だけはメモへ反映でき、反映前の内容に戻せる)
   const [isMemoAiLoading, setIsMemoAiLoading] = useState(false);
-  const [memoAiResultModal, setMemoAiResultModal] = useState<string | null>(null);
+  const [memoAiResultModal, setMemoAiResultModal] = useState<{ type: 'summarize' | 'proofread' | 'explain_code'; result: string } | null>(null);
+  const [memoUndo, setMemoUndo] = useState<{ slot: number; content: string } | null>(null);
 
   // Timetables State & Modal
   const [isTimetableModalOpen, setIsTimetableModalOpen] = useState(false);
@@ -332,10 +327,15 @@ export default function App() {
   const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
   const [editingContent, setEditingContent] = useState('');
   const [replyToMessage, setReplyToMessage] = useState<Message | null>(null);
-  const [showMentionSuggestions, setShowMentionSuggestions] = useState(false);
-  const [mentionFilter, setMentionFilter] = useState('');
-  const [isMembersCollapsed, setIsMembersCollapsed] = useState(false);
-  const [isChannelsCollapsed, setIsChannelsCollapsed] = useState(false);
+  // @メンション / #チャンネル の補完 (Tab・↑↓で選択、Enterで決定)
+  const [completion, setCompletion] = useState<{ kind: '@' | '#'; query: string; start: number; index: number } | null>(null);
+  const composerBackdropRef = useRef<HTMLDivElement | null>(null);
+  // 入力中のユーザー (userId → 表示期限)
+  const [typingUsers, setTypingUsers] = useState<Record<number, { username: string; channelId: number; until: number }>>({});
+  const lastTypingSentRef = useRef(0);
+  const [isMembersCollapsed, setIsMembersCollapsed] = useState(() => typeof window !== 'undefined' && window.innerWidth < 1024);
+  const [isChannelsCollapsed, setIsChannelsCollapsed] = useState(isSmallScreen);
+  const [isMemoListOpen, setIsMemoListOpen] = useState(false);
   const [isCheckingAuth, setIsCheckingAuth] = useState(Boolean(localStorage.getItem('asdf_token')));
   const [isNewChannelModalOpen, setIsNewChannelModalOpen] = useState(false);
   const [newChannelName, setNewChannelName] = useState('');
@@ -350,9 +350,9 @@ export default function App() {
   // ブラウザ通知: 重要 (メンション・返信・@everyone・新しい提出物) / 全メッセージ / 通知音
   const [notifyPrefs, setNotifyPrefs] = useState<{ important: boolean; messages: boolean; sound: boolean }>(() => {
     try {
-      return { important: true, messages: false, sound: true, ...JSON.parse(localStorage.getItem('asdf_notify_prefs') || '{}') };
+      return { important: true, messages: false, sound: false, ...JSON.parse(localStorage.getItem('asdf_notify_prefs') || '{}') };
     } catch {
-      return { important: true, messages: false, sound: true };
+      return { important: true, messages: false, sound: false };
     }
   });
   const notifyPrefsRef = useRef(notifyPrefs);
@@ -362,8 +362,17 @@ export default function App() {
     setNotifyPrefs(next);
     try { localStorage.setItem('asdf_notify_prefs', JSON.stringify(next)); } catch (_) {}
     if ((patch.important || patch.messages) && 'Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission().catch(() => {});
+      requestNotifyPermission();
     }
+  };
+  const requestNotifyPermission = async () => {
+    if (!('Notification' in window)) return;
+    try {
+      const result = await Notification.requestPermission();
+      setNotifyPermission(result);
+      if (result === 'granted') toast('通知をオンにしました', { kind: 'success' });
+      else if (result === 'denied') toast('通知がブロックされました。アドレスバーのサイト設定から許可できます', { kind: 'error' });
+    } catch (_) {}
   };
   const [integrations, setIntegrations] = useState<any>(null);
   const [integrationStatus, setIntegrationStatus] = useState('');
@@ -390,8 +399,15 @@ export default function App() {
     { id: 1, name: 'general', type: 'text' },
     { id: 2, name: 'homework', type: 'text' },
   ]);
-  const [activeChannelId, setActiveChannelId] = useState<number>(1);
+  const [activeChannelId, setActiveChannelIdState] = useState<number>(() => Number(LS.get('asdf_active_channel', '1')) || 1);
+  const setActiveChannelId = (id: number) => {
+    setActiveChannelIdState(id);
+    LS.set('asdf_active_channel', String(id));
+    if (isSmallScreen()) setIsChannelsCollapsed(true);
+  };
   const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
+  // 自分宛て (メンション・返信・@everyone) の未読数。赤い数字はこれだけ
+  const [mentionCounts, setMentionCounts] = useState<Record<number, number>>({});
   const [lastReadMessageIds, setLastReadMessageIds] = useState<Record<number, number>>(() => {
     try {
       return JSON.parse(localStorage.getItem('asdf_last_read') || '{}');
@@ -432,16 +448,18 @@ export default function App() {
   const [isSavingMemo, setIsSavingMemo] = useState(false);
 
   // Phase 3 State: Timetables & Assignments
-  // scheduleType: 時間割エディタで表示・編集中の時程 / todaySchedule: 全員共通の「今日の時程」
+  // scheduleType: 時間割エディタで表示・編集中の時程 / ttConfig.activeScheduleType: 全員共通の「今日の時程」(その日だけ有効)
   const [scheduleType, setScheduleType] = useState<ScheduleType>('normal');
-  const [todaySchedule, setTodaySchedule] = useState<ScheduleType>('normal');
-  const [periodTimes, setPeriodTimes] = useState<Record<string, PeriodTime[]>>({});
+  const [ttConfig, setTtConfig] = useState<TimetableConfig>(DEFAULT_CONFIG);
+  const todaySchedule = ttConfig.activeScheduleType;
+  // 授業時間中 (朝の会〜帰りの会) は AI を使えない
+  const aiLock = schoolTime(now, ttConfig);
   const [todayTimetables, setTodayTimetables] = useState<TimetableItem[]>([]);
   const [selectedTtCell, setSelectedTtCell] = useState<{ day: number; period: number } | null>(null);
   const [ttDetailDraft, setTtDetailDraft] = useState<{ subject: string; items: string; note: string }>({ subject: '', items: '', note: '' });
   const [ttSaveStatus, setTtSaveStatus] = useState('');
   const [isEditingPeriods, setIsEditingPeriods] = useState(false);
-  const [periodDraft, setPeriodDraft] = useState<PeriodTime[]>([]);
+  const [periodDraft, setPeriodDraft] = useState<ScheduleDef | null>(null);
   const [timetables, setTimetables] = useState<TimetableItem[]>([]);
   const scheduleTypeRef = useRef(scheduleType);
   scheduleTypeRef.current = scheduleType;
@@ -451,21 +469,12 @@ export default function App() {
   const [assignmentFilter, setAssignmentFilter] = useState<'all' | 'unstarted' | 'in_progress' | 'submitted' | 'passed'>('all');
   const [newAssignTitle, setNewAssignTitle] = useState('');
   const [newAssignSubject, setNewAssignSubject] = useState('数学');
+  const [isAssignFormOpen, setIsAssignFormOpen] = useState(false);
   const [newAssignDeadline, setNewAssignDeadline] = useState('');
   const [newAssignResubmitDeadline, setNewAssignResubmitDeadline] = useState('');
   const [newAssignDesc, setNewAssignDesc] = useState('');
   const [isSummarizingAI, setIsSummarizingAI] = useState<number | null>(null);
   const [summarizedTexts, setSummarizedTexts] = useState<Record<number, string>>({});
-
-  // Phase 3 State: Test Scores & AI
-  const [testScores, setTestScores] = useState<TestScore[]>([]);
-  const [testScoreUserFilter, setTestScoreUserFilter] = useState<string>('me');
-  const [newExamName, setNewExamName] = useState('中間考査');
-  const [newExamSubject, setNewExamSubject] = useState('英語');
-  const [newExamScore, setNewExamScore] = useState<number>(85);
-  const [newExamMaxScore, setNewExamMaxScore] = useState<number>(100);
-  const [aiAdvice, setAiAdvice] = useState<string>('');
-  const [isLoadingAdvice, setIsLoadingAdvice] = useState(false);
 
   // Phase 4 State: Collaborative Whiteboard
   const [boardStrokes, setBoardStrokes] = useState<any[]>([]);
@@ -483,6 +492,8 @@ export default function App() {
   const [clipboardText, setClipboardText] = useState<string>('');
   const [clipboardUpdatedBy, setClipboardUpdatedBy] = useState<string>('');
   const [isCopiedToOS, setIsCopiedToOS] = useState(false);
+  const [isClipboardOpen, setIsClipboardOpen] = useState(() => !isSmallScreen());
+  const clipboardTimerRef = useRef<any>(null);
 
   // Phase 4 State: Ctrl+K Command Palette
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
@@ -518,12 +529,19 @@ export default function App() {
     return saved ? parseFloat(saved) : 100;
   });
   const [chatAutoScrollMode, setChatAutoScrollMode] = useState<'always' | 'unread_anchor' | 'off'>(() => {
-    return (localStorage.getItem('asdf_chat_scroll_mode') as any) || 'always';
+    // 旧設定値 (unread_stop / manual) も読み替える
+    const v = LS.get('asdf_chat_scroll_mode', 'always');
+    return v === 'unread_stop' || v === 'unread_anchor' ? 'unread_anchor' : v === 'manual' || v === 'off' ? 'off' : 'always';
   });
+  // メモ自動保存までの待ち時間 (ミリ秒, 0 = 手動のみ)
   const [memoAutoSaveInterval, setMemoAutoSaveInterval] = useState<number>(() => {
-    const saved = localStorage.getItem('asdf_memo_autosave_interval');
-    return saved ? parseInt(saved, 10) : 3;
+    const v = parseInt(LS.get('asdf_memo_autosave_ms', ''), 10);
+    return [0, 1000, 2000, 5000].includes(v) ? v : 1000;
   });
+  const memoAutoSaveIntervalRef = useRef(memoAutoSaveInterval);
+  memoAutoSaveIntervalRef.current = memoAutoSaveInterval;
+  const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
 
   // Realtime refs (WS/ポーリングのコールバックから最新値を参照するため)
   const tokenRef = useRef(token);
@@ -538,6 +556,13 @@ export default function App() {
   const isSyncingRef = useRef(false);
   const isNearBottomRef = useRef(true);
   const pendingScrollRestoreRef = useRef<{ height: number; top: number } | null>(null);
+  const hasBeenOnlineRef = useRef(false);
+  const lastRtStatusRef = useRef<RealtimeStatus>('connecting');
+  const retryFailedMessagesRef = useRef<() => void>(() => {});
+  // メモに未保存の変更があるか (他人の保存で上書きしない / 自動保存の対象)
+  const memoDirtyRef = useRef(false);
+  // チャンネルを開いた時点の最新ID。これより新しいメッセージだけ登場アニメーション
+  const lastSeenAtMountRef = useRef(Number.MAX_SAFE_INTEGER);
 
   // React の描画確定後 (2フレーム後) に最下部へ。smooth は手動ボタン用
   const scheduleScrollToBottom = (smooth = false) => {
@@ -554,6 +579,7 @@ export default function App() {
 
   const markChannelRead = (channelId: number, messageId: number) => {
     setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
+    setMentionCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
     if (messageId > 0 && (lastReadMessageIdsRef.current[channelId] || 0) < messageId) {
       setLastReadMessageIds(prev => ({ ...prev, [channelId]: messageId }));
     }
@@ -565,11 +591,13 @@ export default function App() {
     } catch (_) {}
   }, [lastReadMessageIds]);
 
-  // 総未読数をタブタイトルに表示
+  // 赤い数字はメンションだけ。普通の未読はハイライトのみ
   const totalUnread = Object.values(unreadCounts).reduce((a, b) => a + (b || 0), 0);
+  const totalMentions = Object.values(mentionCounts).reduce((a, b) => a + (b || 0), 0);
   useEffect(() => {
-    document.title = totalUnread > 0 ? `(${totalUnread}) asdfbase` : 'asdfbase';
-  }, [totalUnread]);
+    document.title = totalMentions > 0 ? `(${totalMentions}) asdfbase` : totalUnread > 0 ? '• asdfbase' : 'asdfbase';
+    setFaviconBadge(totalMentions);
+  }, [totalUnread, totalMentions]);
 
   useEffect(() => {
     if (showCamera) {
@@ -623,14 +651,7 @@ export default function App() {
 
   // Live Clock
   useEffect(() => {
-    const updateTime = () => {
-      const now = new Date();
-      const pad = (n: number) => n.toString().padStart(2, '0');
-      const formatted = `${now.getFullYear()}/${pad(now.getMonth() + 1)}/${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-      setCurrentTime(formatted);
-    };
-    updateTime();
-    const interval = setInterval(updateTime, 1000);
+    const interval = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(interval);
   }, []);
 
@@ -644,15 +665,7 @@ export default function App() {
         if (res && res.ok) {
           const data = await res.json();
           if (data && typeof data.temp === 'number') {
-            setWeather({
-              temp: data.source === 'fallback' ? null : data.temp,
-              desc: data.desc || '不明',
-              weatherCode: data.weatherCode,
-              tempMax: data.tempMax,
-              tempMin: data.tempMin,
-              precipProb: data.precipProb,
-              source: data.source,
-            });
+            setWeather({ ...data, temp: data.source === 'fallback' ? null : data.temp, desc: data.desc || '不明' });
           }
         }
       } catch (e) {
@@ -737,12 +750,22 @@ export default function App() {
     const isActiveChannel = newMsg.channel_id === activeChannelIdRef.current;
     const isViewing = isActiveChannel && activeTabRef.current === 'chat' && !document.hidden;
 
+    const isImportant = Boolean(
+      me && !isMine && newMsg.sender_username !== me.username &&
+      (newMsg.content?.includes(`@${me.username}`) || newMsg.content?.includes('@everyone') || newMsg.reply_to?.user_id === me.id)
+    );
+    if (newMsg.user_id) {
+      setTypingUsers(prev => {
+        if (!prev[newMsg.user_id]) return prev;
+        const next = { ...prev };
+        delete next[newMsg.user_id];
+        return next;
+      });
+    }
+
     // 通知: 重要 (メンション・自分への返信・@everyone) と 通常メッセージ を別々に ON/OFF
     if (me && !isMine && newMsg.sender_username !== me.username) {
       const prefs = notifyPrefsRef.current;
-      const isImportant = Boolean(
-        newMsg.content?.includes(`@${me.username}`) || newMsg.content?.includes('@everyone') || newMsg.reply_to?.user_id === me.id
-      );
       const sender = newMsg.sender_username || newMsg.username;
       const channelName = channelsRef.current.find(c => c.id === newMsg.channel_id)?.name || '';
       if (isImportant && prefs.important) {
@@ -771,6 +794,9 @@ export default function App() {
         ...prev,
         [newMsg.channel_id]: (prev[newMsg.channel_id] || 0) + 1,
       }));
+      if (isImportant) {
+        setMentionCounts(prev => ({ ...prev, [newMsg.channel_id]: (prev[newMsg.channel_id] || 0) + 1 }));
+      }
     }
   };
   const ingestNewMessageRef = useRef(ingestNewMessage);
@@ -838,8 +864,9 @@ export default function App() {
       body: JSON.stringify({ lastRead: lastReadMessageIdsRef.current }),
     })
       .then(res => (res.ok ? res.json() : []))
-      .then((rows: { channelId: number; lastMessageId: number; unread: number }[]) => {
+      .then((rows: { channelId: number; lastMessageId: number; unread: number; mentions?: number }[]) => {
         const counts: Record<number, number> = {};
+        const mentions: Record<number, number> = {};
         const initRead: Record<number, number> = {};
         let maxId = 0;
         for (const r of rows) {
@@ -849,12 +876,14 @@ export default function App() {
             initRead[r.channelId] = r.lastMessageId;
           } else if (r.channelId !== activeChannelIdRef.current && r.unread > 0) {
             counts[r.channelId] = r.unread;
+            if (r.mentions) mentions[r.channelId] = r.mentions;
           }
         }
         if (Object.keys(initRead).length > 0) {
           setLastReadMessageIds(prev => ({ ...initRead, ...prev }));
         }
         setUnreadCounts(counts);
+        setMentionCounts(mentions);
         lastSeenMessageIdRef.current = Math.max(lastSeenMessageIdRef.current, maxId);
         syncReadyRef.current = true;
         // 初期化中に届いた分を補完
@@ -874,8 +903,10 @@ export default function App() {
       } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
         setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
       } else if (msg.type === 'NOTE_UPDATED') {
-        setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? msg.payload : n));
-        if (msg.payload.slot_index === selectedSlotIndexRef.current) {
+        setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? { ...n, ...msg.payload, assigned_username: msg.payload.assigned_username || (n as any).assigned_username } : n));
+        // 自分の保存の反映は無視 (保存中に打った文字が巻き戻らないように)
+        const isOwnSave = msg.sender && msg.sender === currentUserRef.current?.username;
+        if (msg.payload.slot_index === selectedSlotIndexRef.current && !isOwnSave && !memoDirtyRef.current) {
           setMemoTitle(msg.payload.title);
           setMemoContent(msg.payload.content);
           setMemoMode(msg.payload.mode);
@@ -897,6 +928,17 @@ export default function App() {
         }
       } else if (msg.type === 'TIMETABLE_CONFIG_UPDATED') {
         applyTimetableConfigRef.current(msg.payload);
+      } else if (msg.type === 'USER_UPDATED') {
+        setOnlineUsers(prev => prev.map(u => (u.id === msg.payload.id ? { ...u, ...msg.payload } : u)));
+        if (currentUserRef.current?.id === msg.payload.id) setCurrentUser(u => (u ? { ...u, ...msg.payload } : u));
+      } else if (msg.type === 'USER_TYPING') {
+        const p = msg.payload || {};
+        if (p.userId === currentUserRef.current?.id || Date.now() - (p.t || 0) > 6000) return;
+        setTypingUsers(prev => ({ ...prev, [p.userId]: { username: p.username, channelId: p.channelId, until: Date.now() + 5000 } }));
+      } else if (msg.type === 'CALENDAR_UPDATED') {
+        setCalendarEvents(prev => [...prev.filter(e => e.id !== msg.payload.id), msg.payload]);
+      } else if (msg.type === 'CALENDAR_DELETED') {
+        setCalendarEvents(prev => prev.filter(e => e.id !== msg.payload.id));
       } else if (msg.type === 'BOARD_NEW_STROKE') {
         setBoardStrokes(prev => [...prev, msg.payload]);
       } else if (msg.type === 'BOARD_NEW_TEXT') {
@@ -984,14 +1026,21 @@ export default function App() {
         setWsStatus(status);
         setActiveTransport(transport);
         if (status === 'online') {
-          // 接続/再接続のたびに取りこぼしを補完
+          // 接続/再接続のたびに取りこぼしを補完。切断から戻った時は表示中のデータも取り直す
           syncMissedMessagesRef.current();
+          if (hasBeenOnlineRef.current && lastRtStatusRef.current !== 'online') {
+            refreshActiveChannelRef.current();
+            loadInitialDataRef.current();
+            retryFailedMessagesRef.current();
+          }
+          hasBeenOnlineRef.current = true;
         }
+        lastRtStatusRef.current = status;
       },
       onReset: () => {
         syncMissedMessagesRef.current();
         refreshActiveChannelRef.current();
-        reloadUsersRef.current();
+        loadInitialDataRef.current();
       },
     });
     realtimeRef.current = client;
@@ -1011,85 +1060,67 @@ export default function App() {
   }, [token, rtTransport, rtPollInterval, connRoute]);
 
 
-  // Initial Data Load
-  useEffect(() => {
-    if (!token) return;
-
-    safeFetch('/api/channels', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => setChannels(data))
-      .catch(console.error);
-
-    safeFetch('/api/users', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => setOnlineUsers(data))
-      .catch(console.error);
-
-    safeFetch('/api/notes', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => {
+  // Initial Data Load: リロード直後 (プロキシの起動待ちなど) に失敗しても再試行する
+  const loadInitialData = async (attempt = 0) => {
+    const tk = tokenRef.current;
+    if (!tk) return;
+    const headers = { Authorization: `Bearer ${tk}` };
+    const get = async (path: string) => {
+      const res = await safeFetch(path, { headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    };
+    const results = await Promise.allSettled([
+      get('/api/channels').then(data => Array.isArray(data) && setChannels(data)),
+      get('/api/users').then(data => Array.isArray(data) && setOnlineUsers(data)),
+      get('/api/notes').then((data: MemoSlot[]) => {
+        if (!Array.isArray(data)) return;
         setMemoSlots(data);
-        if (data.length > 0) {
-          const first = data[0];
-          setSelectedSlotIndex(first.slot_index);
-          setMemoTitle(first.title);
-          setMemoContent(first.content);
-          setMemoMode(first.mode);
-          setMemoAssignedUser(first.assigned_user_id);
+        // 編集中のメモは上書きしない
+        if (memoDirtyRef.current) return;
+        const current = data.find(n => n.slot_index === selectedSlotIndexRef.current) || data[0];
+        if (current) {
+          setSelectedSlotIndex(current.slot_index);
+          setMemoTitle(current.title);
+          setMemoContent(current.content);
+          setMemoMode(current.slot_index >= 11 ? 'monaco' : current.mode === 'monaco' ? 'markdown' : current.mode);
+          setMemoAssignedUser(current.assigned_user_id ?? null);
         }
-      })
-      .catch(console.error);
-
-    safeFetch('/api/assignments', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => setAssignments(data))
-      .catch(console.error);
-
-    safeFetch('/api/assignments/progress/all', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then((data: { assignment_id: number; user_id: number; status: string; username: string }[]) => {
+      }),
+      get('/api/assignments').then(data => Array.isArray(data) && setAssignments(data)),
+      get('/api/assignments/progress/all').then((data: { assignment_id: number; user_id: number; status: string; username: string }[]) => {
         const grouped: Record<number, { userId: number; username: string; status: string }[]> = {};
         for (const row of data) {
           if (!grouped[row.assignment_id]) grouped[row.assignment_id] = [];
-          grouped[row.assignment_id].push({
-            userId: row.user_id,
-            username: row.username,
-            status: row.status
-          });
+          grouped[row.assignment_id].push({ userId: row.user_id, username: row.username, status: row.status });
         }
         setAssignmentMembersProgress(grouped);
-      })
-      .catch(console.error);
-
-    safeFetch('/api/test-scores', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => setTestScores(data))
-      .catch(console.error);
-
-    safeFetch('/api/board', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => {
+      }),
+      get('/api/board').then(data => {
         if (data.strokes) setBoardStrokes(data.strokes);
         if (data.texts) setBoardTexts(data.texts);
-      })
-      .catch(console.error);
-
-    safeFetch('/api/clipboard', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => {
-        if (data.content) {
+      }),
+      get('/api/clipboard').then(data => {
+        if (typeof data.content === 'string') {
           setClipboardText(data.content);
           setClipboardUpdatedBy(data.updated_by || 'system');
         }
-      })
-      .catch(console.error);
+      }),
+      fetchTimetableConfig(),
+      fetchTodayTimetables(),
+    ]);
+    if (results.some(r => r.status === 'rejected') && attempt < 4 && tokenRef.current === tk) {
+      setTimeout(() => loadInitialDataRef.current(attempt + 1), 1500 * 2 ** attempt);
+    }
+  };
+  const loadInitialDataRef = useRef(loadInitialData);
+  loadInitialDataRef.current = loadInitialData;
 
-    safeFetch('/api/settings/webhook', { headers: { Authorization: `Bearer ${token}` } })
-      .then(res => res.json())
-      .then(data => {
-        if (data.webhookUrl) setWebhookUrlInput(data.webhookUrl);
-      })
-      .catch(console.error);
+  useEffect(() => {
+    if (!token) return;
+    loadInitialData();
+    const { from, to } = monthRange(new Date().getFullYear(), new Date().getMonth());
+    loadCalendarRange(from, to);
   }, [token]);
 
   // Tab switch to board: reload latest strokes & texts (Proxy synchronization)
@@ -1112,6 +1143,10 @@ export default function App() {
         e.preventDefault();
         setIsPaletteOpen(prev => !prev);
       }
+      // ブラウザ標準の Tab によるフォーカス移動は使わない (補完・インデントは各入力欄で処理)
+      if (e.key === 'Tab' && !e.defaultPrevented && !(e.target as HTMLElement)?.closest?.('[data-allow-tab]')) {
+        e.preventDefault();
+      }
       if (e.key === 'Escape') {
         setIsPaletteOpen(false);
         setIsTimetableModalOpen(false);
@@ -1119,11 +1154,39 @@ export default function App() {
         setMemoAiResultModal(null);
         setIsSearchOpen(false);
         setLightbox(null);
+        setShowWeather(false);
+        setShowCalendar(false);
+        setEditingAssignment(null);
+        setShowMemberProgressModalId(null);
+        setFloatingAiSummary(null);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
+
+  // 入力中表示の期限切れを掃除
+  useEffect(() => {
+    const t = setInterval(() => {
+      setTypingUsers(prev => {
+        const nowMs = Date.now();
+        const alive = Object.entries(prev).filter(([, v]) => v.until > nowMs);
+        return alive.length === Object.keys(prev).length ? prev : Object.fromEntries(alive);
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const loadCalendarRange = async (from: string, to: string) => {
+    const tk = tokenRef.current;
+    if (!tk) return;
+    try {
+      const res = await safeFetch(`/api/calendar?from=${from}&to=${to}`, { headers: { Authorization: `Bearer ${tk}` } });
+      if (!res.ok) return;
+      const rows: CalendarEvent[] = await res.json();
+      setCalendarEvents(prev => [...prev.filter(e => e.event_date < from || e.event_date > to), ...rows]);
+    } catch (_) {}
+  };
 
   // Messages Load & Channel Switch with unread line tracking
   useEffect(() => {
@@ -1135,6 +1198,7 @@ export default function App() {
     setNewBelowCount(0);
     setMessages([]);
     setHasMoreMessages(true);
+    lastSeenAtMountRef.current = Number.MAX_SAFE_INTEGER;
     safeFetch(`${API_BASE_URL}/api/channels/${channelId}/messages?limit=50`, {
       headers: { Authorization: `Bearer ${token}` }
     })
@@ -1142,6 +1206,7 @@ export default function App() {
       .then((data: Message[]) => {
         if (channelId !== activeChannelIdRef.current) return;
         const maxId = data.length > 0 ? data[data.length - 1].id : 0;
+        lastSeenAtMountRef.current = maxId;
         // 読み込み中に WS で届いた分は保持
         setMessages(prev => [...data, ...prev.filter(m => m.channel_id === channelId && (m.id > maxId || m.id < 0))]);
         data.forEach(m => {
@@ -1155,9 +1220,10 @@ export default function App() {
         // Scroll behavior based on unread position and user preference
         setTimeout(() => {
           const hasUnread = anchorId > 0 && maxId > anchorId;
-          if (chatAutoScrollMode === 'unread_anchor' && hasUnread && unreadMessageRef.current) {
+          const mode = chatAutoScrollModeRef.current;
+          if (mode === 'unread_anchor' && hasUnread && unreadMessageRef.current) {
             unreadMessageRef.current.scrollIntoView({ behavior: 'auto', block: 'center' });
-          } else if (chatAutoScrollMode !== 'off') {
+          } else if (mode !== 'off' || !hasUnread) {
             scheduleScrollToBottom(false);
           }
         }, 50);
@@ -1165,17 +1231,28 @@ export default function App() {
       .catch(console.error);
   }, [token, activeChannelId]);
 
-  // チャットタブに戻った時: 表示中チャンネルを既読化
+  // チャットタブに戻った時: 表示中チャンネルを既読化し、スクロール位置を戻す
+  const chatScrollTopRef = useRef<number | null>(null);
   useEffect(() => {
     if (activeTab !== 'chat') return;
     const realMsgs = messages.filter(m => m.id > 0);
     const last = realMsgs[realMsgs.length - 1];
     if (last) markChannelRead(activeChannelId, last.id);
+    // タブを開き直すと表示が作り直されるので、自動スクロールが有効なら最新へ
+    if (chatAutoScrollModeRef.current !== 'off' || chatScrollTopRef.current === null) {
+      scheduleScrollToBottom(false);
+    } else {
+      const top = chatScrollTopRef.current;
+      requestAnimationFrame(() => {
+        if (chatScrollContainerRef.current) chatScrollContainerRef.current.scrollTop = top;
+      });
+    }
   }, [activeTab]);
 
   const handleChatScroll = () => {
     const el = chatScrollContainerRef.current;
     if (!el) return;
+    chatScrollTopRef.current = el.scrollTop;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     isNearBottomRef.current = nearBottom;
     if (nearBottom && newBelowCount > 0) setNewBelowCount(0);
@@ -1253,7 +1330,12 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    const ok = await confirmDialog({ title: 'ログアウトしますか？', confirmLabel: 'ログアウト', danger: true });
+    if (!ok) return;
+    forceLogout();
+  };
+  const forceLogout = () => {
     localStorage.removeItem('asdf_token');
     setToken(null);
     setCurrentUser(null);
@@ -1279,9 +1361,12 @@ export default function App() {
         const clientNonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
         await postChatMessage(`![image](${data.url})`, activeChannelId, clientNonce, null);
         scheduleScrollToBottom();
+      } else {
+        toast(data.error || '画像を送信できませんでした', { kind: 'error' });
       }
     } catch (err) {
       console.error('Image upload error:', err);
+      toast('画像を送信できませんでした', { kind: 'error' });
     } finally {
       setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -1322,8 +1407,12 @@ export default function App() {
     const clientNonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const replyTarget = replyToMessage && replyToMessage.channel_id === targetChannelId ? replyToMessage : null;
     setChatInput('');
-    setShowMentionSuggestions(false);
+    setCompletion(null);
     setReplyToMessage(null);
+    lastTypingSentRef.current = 0;
+    if (/@gemini\b/i.test(content) && aiLock.inSchool) {
+      toast(`授業時間中は @gemini は返信しません (${aiLock.until} まで)`, { kind: 'error' });
+    }
 
     const me = currentUserRef.current;
     const optimistic: Message = {
@@ -1393,6 +1482,19 @@ export default function App() {
     setMessages(prev => prev.filter(x => x.id !== m.id));
   };
 
+  // オンライン復帰時: 送れなかったメッセージを自動で再送
+  retryFailedMessagesRef.current = () => {
+    messages.filter(m => m.failed && m.client_nonce).forEach(m => handleRetryMessage(m));
+  };
+
+  // 入力中であることを3秒おきに知らせる
+  const notifyTyping = () => {
+    const nowMs = Date.now();
+    if (nowMs - lastTypingSentRef.current < 3000) return;
+    lastTypingSentRef.current = nowMs;
+    rtSend({ type: 'TYPING', channelId: activeChannelIdRef.current });
+  };
+
   // Reorder Channels (Up / Down)
   const handleMoveChannel = async (e: React.MouseEvent, index: number, direction: 'up' | 'down') => {
     e.stopPropagation();
@@ -1458,6 +1560,8 @@ export default function App() {
 
   const handleDeleteMessage = async (messageId: number) => {
     if (!token) return;
+    const ok = await confirmDialog({ title: 'メッセージを削除しますか？', message: '削除したメッセージは監査ログから復元できます。', confirmLabel: '削除する', danger: true });
+    if (!ok) return;
     try {
       await safeFetch(`${API_BASE_URL}/api/messages/${messageId}`, {
         method: 'DELETE',
@@ -1516,7 +1620,9 @@ export default function App() {
 
   const handleDeleteChannel = async (channelId: number) => {
     if (!token || channels.length <= 1) return;
-    if (!confirm('このチャンネルを削除しますか？')) return;
+    const name = channels.find(c => c.id === channelId)?.name;
+    const ok = await confirmDialog({ title: `#${name} を削除しますか？`, message: 'チャンネル内のメッセージもすべて削除されます。元に戻せません。', confirmLabel: '削除する', danger: true });
+    if (!ok) return;
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/channels/${channelId}`, {
         method: 'DELETE',
@@ -1534,81 +1640,36 @@ export default function App() {
     }
   };
 
-  // AI Tab Send Handler (with context JSON support)
-  const handleSendAiMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!aiInput.trim() || !token || isLoadingAi) return;
-
-    const userText = aiInput.trim();
-    const newMsg = {
-      id: Date.now(),
-      role: 'user' as const,
-      content: userText,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  // AI に毎回渡すアプリの状態
+  const buildAiContext = () => {
+    const d = new Date();
+    const todayRowsNow = todayTimetables.filter(t => t.day_of_week === d.getDay());
+    const today = ymd(d);
+    return {
+      current_user: currentUser?.username,
+      now: d.toLocaleString('ja-JP'),
+      today_schedule: SCHEDULE_LABELS[todaySchedule],
+      today_timetable: daySlots(ttConfig, d.getDay(), todayRowsNow).map(s => ({
+        name: s.label, time: `${s.time.start}-${s.time.end}`, subject: s.subject || undefined,
+        items: todayRowsNow.find(t => `p${t.period}` === s.key)?.items || undefined,
+      })),
+      assignments: assignments.filter(a => !a.is_archived).map(a => ({
+        title: a.title, subject: a.subject, deadline: a.deadline, resubmit_deadline: a.resubmit_deadline, my_status: a.my_status,
+      })),
+      upcoming_events: calendarEvents.filter(e => e.event_date >= today).slice(0, 20).map(e => ({ date: e.event_date, time: e.event_time, title: e.title, by: e.username })),
+      channels: channels.map(c => c.name),
+      memo_slots: memoSlots.filter(m => m.slot_index <= 10).map(m => ({ slot: m.slot_index, title: m.title })),
+      weather: { temp: weather.temp, desc: weather.desc, max: weather.tempMax, min: weather.tempMin, precip: weather.precipProb },
     };
-
-    const nextMessages = [...aiMessages, newMsg];
-    setAiMessages(nextMessages);
-    setAiInput('');
-    setIsLoadingAi(true);
-
-    try {
-      let contextData: any = undefined;
-      if (includeContextInAi) {
-        contextData = {
-          current_user: currentUser?.username,
-          active_tab: activeTab,
-          channels: channels.map(c => ({ id: c.id, name: c.name, type: c.type })),
-          memo_slots: memoSlots.map(m => ({ slot: m.slot_index, title: m.title, mode: m.mode })),
-          assignments: assignments.map(a => ({ title: a.title, subject: a.subject, deadline: a.deadline })),
-          weather: weather,
-          next_subject: nextSubject,
-        };
-      }
-
-      const res = await safeFetch(`${API_BASE_URL}/api/ai/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          messages: nextMessages.map(m => ({ role: m.role, content: m.content })),
-          contextData
-        })
-      });
-
-      const data = await res.json();
-      if (data.reply) {
-        setAiMessages(prev => [
-          ...prev,
-          {
-            id: Date.now() + 1,
-            role: 'model',
-            content: data.reply,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          }
-        ]);
-      }
-    } catch (err) {
-      console.error(err);
-      setAiMessages(prev => [
-        ...prev,
-        {
-          id: Date.now() + 1,
-          role: 'model',
-          content: '申し訳ありません。AIの応答中にエラーが発生しました。',
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]);
-    } finally {
-      setIsLoadingAi(false);
-    }
   };
 
   // Memo AI Assistant Handler
-  const handleMemoAiAssist = async (type: 'summarize' | 'proofread' | 'explain_code' | 'continue') => {
+  const handleMemoAiAssist = async (type: 'summarize' | 'proofread' | 'explain_code') => {
     if (!token || !memoContent.trim() || isMemoAiLoading) return;
+    if (aiLock.inSchool) {
+      toast(`授業時間中は AI を使えません (${aiLock.until} まで)`, { kind: 'error' });
+      return;
+    }
     setIsMemoAiLoading(true);
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/ai/memo-assist`, {
@@ -1622,16 +1683,39 @@ export default function App() {
           type
         })
       });
-      const data = await res.json();
-      if (data.result) {
-        setMemoAiResultModal(data.result);
-      }
-    } catch (err) {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.result) throw new Error(data.error || 'AI の実行に失敗しました');
+      setMemoAiResultModal({ type, result: data.result });
+    } catch (err: any) {
       console.error('Memo AI error:', err);
-      alert('AIアシストの実行に失敗しました');
+      toast(err.message || 'AI の実行に失敗しました', { kind: 'error' });
     } finally {
       setIsMemoAiLoading(false);
     }
+  };
+
+  // AI 校正の結果をメモに反映 (確認 → 反映 → 元に戻せる)
+  const applyProofread = async (result: string) => {
+    const ok = await confirmDialog({
+      title: '校正結果をメモに反映しますか？',
+      message: `メモ #${selectedSlotIndex} の本文が校正後の文章に置き換わります。反映後も「元に戻す」で戻せます。`,
+      confirmLabel: '反映する',
+    });
+    if (!ok) return;
+    const slot = selectedSlotIndexRef.current;
+    setMemoUndo({ slot, content: memoContent });
+    setMemoAiResultModal(null);
+    handleMemoContentChange(result);
+    toast('校正結果を反映しました', { kind: 'success', action: { label: '元に戻す', onClick: () => undoMemoAi() } });
+  };
+
+  const undoMemoAiRef = useRef<() => void>(() => {});
+  const undoMemoAi = () => undoMemoAiRef.current();
+  undoMemoAiRef.current = () => {
+    if (!memoUndo || memoUndo.slot !== selectedSlotIndexRef.current) return;
+    handleMemoContentChange(memoUndo.content);
+    setMemoUndo(null);
+    toast('校正前の内容に戻しました', { kind: 'success' });
   };
 
   const handleFetchTimetables = async () => {
@@ -1650,33 +1734,35 @@ export default function App() {
   };
 
   const fetchTodayTimetables = async (type: ScheduleType = todayScheduleRef.current) => {
-    if (!token) return;
-    try {
-      const res = await safeFetch(`/api/timetables?scheduleType=${type}`, { headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) setTodayTimetables(await res.json());
-    } catch (_) {}
+    const tk = tokenRef.current;
+    if (!tk) return;
+    const res = await safeFetch(`/api/timetables?scheduleType=${type}`, { headers: { Authorization: `Bearer ${tk}` } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    setTodayTimetables(await res.json());
   };
 
   const fetchTimetableConfig = async () => {
-    if (!token) return;
-    try {
-      const res = await safeFetch('/api/timetables/config', { headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) applyTimetableConfig(await res.json());
-    } catch (_) {}
+    const tk = tokenRef.current;
+    if (!tk) return;
+    const res = await safeFetch('/api/timetables/config', { headers: { Authorization: `Bearer ${tk}` } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    applyTimetableConfig(await res.json());
   };
 
-  const applyTimetableConfig = (config: { activeScheduleType: ScheduleType; periods: Record<string, PeriodTime[]> }) => {
-    setPeriodTimes(config.periods || {});
-    if (config.activeScheduleType && config.activeScheduleType !== todayScheduleRef.current) {
-      setTodaySchedule(config.activeScheduleType);
-    }
+  const applyTimetableConfig = (config: Partial<TimetableConfig>) => {
+    if (!config || !config.schedules) return;
+    setTtConfig({
+      activeScheduleType: config.activeScheduleType || 'normal',
+      schedules: { ...DEFAULT_CONFIG.schedules, ...config.schedules },
+      dayPeriodCounts: { ...DEFAULT_CONFIG.dayPeriodCounts, ...(config.dayPeriodCounts || {}) },
+    });
   };
   const applyTimetableConfigRef = useRef(applyTimetableConfig);
   applyTimetableConfigRef.current = applyTimetableConfig;
 
   handleFetchTimetablesRef.current = () => {
     handleFetchTimetables();
-    fetchTodayTimetables();
+    fetchTodayTimetables().catch(() => {});
   };
 
   // 時程切替時・ログイン時に時間割を取り直す
@@ -1685,12 +1771,14 @@ export default function App() {
   }, [scheduleType, token]);
 
   useEffect(() => {
-    fetchTodayTimetables(todaySchedule);
+    fetchTodayTimetables(todaySchedule).catch(() => {});
   }, [todaySchedule, token]);
 
+  // 日付が変わったら「今日の時程」を取り直す (前日の短縮時程が残らないように)
+  const todayKey = ymd(now);
   useEffect(() => {
-    fetchTimetableConfig();
-  }, [token]);
+    fetchTimetableConfig().catch(() => {});
+  }, [token, todayKey]);
 
   // 指定コマに教科を保存 (プリセットのワンクリック保存もこれ)
   const saveTimetableSubject = async (day: number, period: number, subject: string, extra: { items?: string; note?: string } = {}) => {
@@ -1705,7 +1793,7 @@ export default function App() {
       if (!res.ok) throw new Error();
       const row: TimetableItem = await res.json();
       setTimetables(prev => [...prev.filter(t => !(t.day_of_week === day && t.period === period)), row]);
-      if (scheduleType === todaySchedule) fetchTodayTimetables();
+      if (scheduleType === todaySchedule) fetchTodayTimetables().catch(() => {});
       setTtSaveStatus(`${DAY_LABELS[day]}曜${period}限 を「${row.subject}」に保存しました`);
       return row;
     } catch {
@@ -1728,8 +1816,9 @@ export default function App() {
     const cell = selectedTtCell || { day: newTtDay, period: newTtPeriod };
     const row = await saveTimetableSubject(cell.day, cell.period, subj);
     if (!row) return;
-    const nextPeriod = cell.period < 7 ? cell.period + 1 : 1;
-    const nextDay = cell.period < 7 ? cell.day : (cell.day < 5 ? cell.day + 1 : 1);
+    const lastPeriod = periodCountFor(ttConfig, cell.day);
+    const nextPeriod = cell.period < lastPeriod ? cell.period + 1 : 1;
+    const nextDay = cell.period < lastPeriod ? cell.day : (cell.day < 5 ? cell.day + 1 : 1);
     setSelectedTtCell({ day: nextDay, period: nextPeriod });
     setNewTtDay(nextDay);
     setNewTtPeriod(nextPeriod);
@@ -1746,32 +1835,56 @@ export default function App() {
     });
   };
 
+  // 「今日の時程」は全員の表示が変わるので確認してから。翌日には通常時程へ戻る
   const handleSetTodaySchedule = async (type: ScheduleType) => {
-    setTodaySchedule(type);
-    if (!token) return;
+    if (!token || type === todaySchedule) return;
+    const ok = await confirmDialog({
+      title: `今日の時程を「${SCHEDULE_LABELS[type]}」にしますか？`,
+      message: '全員のヘッダー表示が変わります。明日になると自動で通常時程に戻ります。',
+      confirmLabel: '変更する',
+    });
+    if (!ok) return;
     const res = await safeFetch('/api/timetables/config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ activeScheduleType: type }),
     }).catch(() => null);
-    if (res && res.ok) applyTimetableConfig(await res.json());
+    if (res && res.ok) {
+      applyTimetableConfig(await res.json());
+      toast(`今日の時程を${SCHEDULE_LABELS[type]}にしました`, { kind: 'success' });
+    } else {
+      toast('時程を変更できませんでした', { kind: 'error' });
+    }
   };
 
-  const handleSavePeriodTimes = async () => {
-    if (!token) return;
+  const saveTimetableConfig = async (body: object, okMessage: string) => {
+    if (!token) return false;
     const res = await safeFetch('/api/timetables/config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ periods: { [scheduleType]: periodDraft } }),
+      body: JSON.stringify(body),
     }).catch(() => null);
     if (res && res.ok) {
       applyTimetableConfig(await res.json());
-      setIsEditingPeriods(false);
-      setTtSaveStatus(`${SCHEDULE_LABELS[scheduleType]} の時刻を保存しました`);
-    } else {
-      const d = res ? await res.json().catch(() => ({})) : {};
-      setTtSaveStatus(d.error || '時刻の保存に失敗しました');
+      setTtSaveStatus(okMessage);
+      return true;
     }
+    const d = res ? await res.json().catch(() => ({})) : {};
+    setTtSaveStatus(d.error || '保存に失敗しました');
+    return false;
+  };
+
+  const handleSavePeriodTimes = async () => {
+    if (!periodDraft) return;
+    if (await saveTimetableConfig({ schedules: { [scheduleType]: periodDraft } }, `${SCHEDULE_LABELS[scheduleType]} の時刻を保存しました`)) {
+      setIsEditingPeriods(false);
+    }
+  };
+
+  // 曜日ごとに 5限 / 6限 を切り替え
+  const handleToggleDayPeriods = (day: number) => {
+    const next = periodCountFor(ttConfig, day) === 6 ? 5 : 6;
+    saveTimetableConfig({ dayPeriodCounts: { [day]: next } }, `${DAY_LABELS[day]}曜日を ${next}限授業にしました`);
   };
 
   const handleCreateTimetableEntry = async (e: React.FormEvent) => {
@@ -1783,6 +1896,8 @@ export default function App() {
 
   const handleDeleteTimetableEntry = async (id: number) => {
     if (!token) return;
+    const ok = await confirmDialog({ title: 'このコマを削除しますか？', message: '教科・持ち物・メモが消えます。', confirmLabel: '削除する', danger: true });
+    if (!ok) return;
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/timetables/${id}`, {
         method: 'DELETE',
@@ -1827,17 +1942,23 @@ export default function App() {
 
   const handleDeleteAccount = async () => {
     if (!token || !currentUser) return;
-    if (!confirm('本当にアカウントを削除しますか？この操作は元に戻せません。')) return;
+    const ok = await confirmDialog({
+      title: '本当にアカウントを削除しますか？',
+      message: 'この操作は元に戻せません。メモの担当やテストの記録も消えます。',
+      confirmLabel: 'アカウントを削除',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/users/${currentUser.id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
-        handleLogout();
+        forceLogout();
       } else {
         const d = await res.json();
-        alert(d.error || '削除できませんでした');
+        toast(d.error || '削除できませんでした', { kind: 'error' });
       }
     } catch (err) {
       console.error(err);
@@ -1916,31 +2037,37 @@ export default function App() {
 
   const deleteAuditLog = async (id: number) => {
     if (!token) return;
+    const ok = await confirmDialog({ title: 'このログを削除しますか？', message: '削除したログからは復元できなくなります。', confirmLabel: '削除する', danger: true });
+    if (!ok) return;
     const r = await safeFetch(`/api/audit-logs/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
     if (r.ok) setAuditLogs(prev => prev.filter(l => l.id !== id));
-    else alert((await r.json().catch(() => ({}))).error || '削除に失敗しました');
+    else toast((await r.json().catch(() => ({}))).error || '削除に失敗しました', { kind: 'error' });
   };
 
   const clearAuditLogs = async () => {
-    if (!token || !confirm('監査ログをすべて削除しますか？この操作は取り消せません。')) return;
+    if (!token) return;
+    const ok = await confirmDialog({ title: '監査ログをすべて削除しますか？', message: 'この操作は取り消せません。削除したものは復元もできなくなります。', confirmLabel: 'すべて削除', danger: true });
+    if (!ok) return;
     const r = await safeFetch('/api/audit-logs', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
     if (r.ok) loadAuditLogs();
-    else alert((await r.json().catch(() => ({}))).error || '削除に失敗しました');
+    else toast((await r.json().catch(() => ({}))).error || '削除に失敗しました', { kind: 'error' });
   };
 
   const handleRestoreAuditLog = async (logId: number) => {
     if (!token) return;
+    const ok = await confirmDialog({ title: 'このログの内容を復元しますか？', confirmLabel: '復元する' });
+    if (!ok) return;
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/audit-logs/${logId}/restore`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
-        alert('復元が完了しました');
+        toast('復元しました', { kind: 'success' });
         loadAuditLogs();
       } else {
         const d = await res.json();
-        alert(d.error || '復元に失敗しました');
+        toast(d.error || '復元に失敗しました', { kind: 'error' });
       }
     } catch (err) {
       console.error(err);
@@ -1948,57 +2075,91 @@ export default function App() {
   };
 
 
-  const handleSaveMemo = async (explicitContent?: string, explicitTitle?: string, explicitMode?: string) => {
+  // メモ保存: 保存先スロットは呼び出し時点で固定する (保存待ちの間にスロットを切り替えても混ざらない)
+  const memoStateRef = useRef({ title: memoTitle, content: memoContent, mode: memoMode });
+  memoStateRef.current = { title: memoTitle, content: memoContent, mode: memoMode };
+  const pendingMemoSaveRef = useRef<{ slot: number; timer: any } | null>(null);
+
+  const handleSaveMemo = async (slot = selectedSlotIndexRef.current, data = memoStateRef.current) => {
     if (!token) return;
+    if (pendingMemoSaveRef.current?.slot === slot) {
+      clearTimeout(pendingMemoSaveRef.current.timer);
+      pendingMemoSaveRef.current = null;
+    }
     setIsSavingMemo(true);
     setAutoSaveStatus('saving');
-    const targetSlot = selectedSlotIndexRef.current;
-    const contentToSave = explicitContent !== undefined ? explicitContent : memoContent;
-    const titleToSave = explicitTitle !== undefined ? explicitTitle : memoTitle;
-    const modeToSave = explicitMode !== undefined ? explicitMode : memoMode;
-
     try {
-      const res = await safeFetch(`${API_BASE_URL}/api/notes/${targetSlot}`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/notes/${slot}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({
-          title: titleToSave,
-          content: contentToSave,
-          mode: modeToSave,
-          assigned_user_id: memoAssignedUser
-        })
+        body: JSON.stringify({ title: data.title, content: data.content, mode: data.mode })
       });
       if (res.ok) {
         const updated = await res.json();
-        setMemoSlots(prev => prev.map(m => m.slot_index === targetSlot ? updated : m));
-        setAutoSaveStatus('saved');
+        setMemoSlots(prev => prev.map(m => m.slot_index === slot ? { ...m, ...updated, assigned_username: (m as any).assigned_username } : m));
+        // 保存中にさらに編集されていなければ保存済み
+        const cur = memoStateRef.current;
+        if (slot === selectedSlotIndexRef.current && cur.content === data.content && cur.title === data.title) {
+          memoDirtyRef.current = false;
+          setAutoSaveStatus('saved');
+        }
       } else {
-        const err = await res.json();
-        console.warn('Memo save failed:', err.error);
-        setAutoSaveStatus('dirty');
+        const err = await res.json().catch(() => ({}));
+        if (slot === selectedSlotIndexRef.current) setAutoSaveStatus('dirty');
+        toast(err.error || 'メモを保存できませんでした', { kind: 'error' });
       }
     } catch (err) {
       console.error(err);
-      setAutoSaveStatus('dirty');
+      if (slot === selectedSlotIndexRef.current) setAutoSaveStatus('dirty');
     } finally {
       setIsSavingMemo(false);
     }
   };
 
-  const handleMemoContentChange = (newVal: string) => {
-    setMemoContent(newVal);
-    setAutoSaveStatus('dirty');
+  // 入力が止まったら自動保存
+  const scheduleMemoAutoSave = (data: typeof memoStateRef.current) => {
+    const slot = selectedSlotIndexRef.current;
+    if (pendingMemoSaveRef.current) clearTimeout(pendingMemoSaveRef.current.timer);
+    pendingMemoSaveRef.current = null;
+    const wait = memoAutoSaveIntervalRef.current;
+    if (wait <= 0) return;
+    pendingMemoSaveRef.current = { slot, timer: setTimeout(() => handleSaveMemo(slot, data), wait) };
+  };
 
-    // Realtime broadcast to other users
+  // スロットを切り替える前に、保存待ちの変更をすぐ保存
+  const flushMemoSave = () => {
+    const pending = pendingMemoSaveRef.current;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingMemoSaveRef.current = null;
+      handleSaveMemo(pending.slot, { ...memoStateRef.current });
+    }
+  };
+
+  const selectMemoSlot = (slot: MemoSlot) => {
+    if (slot.slot_index === selectedSlotIndexRef.current) return;
+    flushMemoSave();
+    memoDirtyRef.current = false;
+    setAutoSaveStatus('saved');
+    setMemoUndo(null);
+    setSelectedSlotIndex(slot.slot_index);
+    setMemoTitle(slot.title);
+    setMemoContent(slot.content);
+    setMemoMode(slot.slot_index >= 11 ? 'monaco' : slot.mode === 'monaco' ? 'markdown' : slot.mode);
+    setMemoAssignedUser(slot.assigned_user_id ?? null);
+    setIsMemoListOpen(false);
+  };
+
+  const broadcastNoteSync = (content: string, title: string) => {
     // HTTP系トランスポートでは1文字ごとに送らず200msに間引く
     pendingNoteSyncRef.current = {
       type: 'NOTE_CONTENT_SYNC',
       slotIndex: selectedSlotIndexRef.current,
-      content: newVal,
-      title: memoTitle
+      content,
+      title
     };
     if (realtimeRef.current?.transport === 'ws') {
       rtSend(pendingNoteSyncRef.current);
@@ -2010,15 +2171,41 @@ export default function App() {
         pendingNoteSyncRef.current = null;
       }, 200);
     }
+  };
 
-    // Auto-save debounce
-    if (memoAutoSaveTimerRef.current) {
-      clearTimeout(memoAutoSaveTimerRef.current);
-    }
-    const intervalMs = Math.max(1, memoAutoSaveInterval) * 1000;
-    memoAutoSaveTimerRef.current = setTimeout(() => {
-      handleSaveMemo(newVal, memoTitle, memoMode);
-    }, intervalMs);
+  const flushMemoSaveRef = useRef(flushMemoSave);
+  flushMemoSaveRef.current = flushMemoSave;
+
+  const handleMemoContentChange = (newVal: string) => {
+    setMemoContent(newVal);
+    memoDirtyRef.current = true;
+    setAutoSaveStatus('dirty');
+    broadcastNoteSync(newVal, memoStateRef.current.title);
+    scheduleMemoAutoSave({ ...memoStateRef.current, content: newVal });
+  };
+
+  const handleMemoTitleChange = (newTitle: string) => {
+    setMemoTitle(newTitle);
+    memoDirtyRef.current = true;
+    setAutoSaveStatus('dirty');
+    broadcastNoteSync(memoStateRef.current.content, newTitle);
+    scheduleMemoAutoSave({ ...memoStateRef.current, title: newTitle });
+  };
+
+  const handleMemoModeChange = (mode: 'markdown' | 'plain') => {
+    setMemoMode(mode);
+    handleSaveMemo(selectedSlotIndexRef.current, { ...memoStateRef.current, mode });
+  };
+
+  // メモ欄で Tab を押したら字下げ (フォーカスは移動しない)
+  const handleMemoTextareaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== 'Tab' || e.nativeEvent.isComposing) return;
+    e.preventDefault();
+    const el = e.currentTarget;
+    const { selectionStart, selectionEnd, value } = el;
+    const next = `${value.slice(0, selectionStart)}  ${value.slice(selectionEnd)}`;
+    handleMemoContentChange(next);
+    requestAnimationFrame(() => el.setSelectionRange(selectionStart + 2, selectionStart + 2));
   };
 
   // Phase 3: Create Assignment
@@ -2043,10 +2230,14 @@ export default function App() {
       });
       if (res.ok) {
         const created = await res.json();
-        setAssignments(prev => [...prev, { ...created, my_status: 'unstarted' }]);
+        setAssignments(prev => (prev.some(a => a.id === created.id) ? prev : [...prev, { ...created, my_status: 'unstarted' }]));
         setNewAssignTitle('');
         setNewAssignDesc('');
         setNewAssignResubmitDeadline('');
+        setIsAssignFormOpen(false);
+        toast(`「${created.title}」を登録しました`, { kind: 'success' });
+      } else {
+        toast('登録できませんでした', { kind: 'error' });
       }
     } catch (err) {
       console.error(err);
@@ -2074,7 +2265,9 @@ export default function App() {
   };
 
   const handleDeleteAssignment = async (id: number) => {
-    if (!confirm('この提出物を削除しますか？')) return;
+    const target = assignments.find(a => a.id === id);
+    const ok = await confirmDialog({ title: `「${target?.title || ''}」を削除しますか？`, message: '全員の進捗も消えます。監査ログから復元できます。', confirmLabel: '削除する', danger: true });
+    if (!ok) return;
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/assignments/${id}`, {
         method: 'DELETE',
@@ -2113,7 +2306,7 @@ export default function App() {
         setEditingAssignment(null);
       } else {
         const err = await res.json();
-        alert(err.error || '提出物の更新に失敗しました');
+        toast(err.error || '提出物の更新に失敗しました', { kind: 'error' });
       }
     } catch (err) {
       console.error(err);
@@ -2123,6 +2316,10 @@ export default function App() {
   // Phase 3: Gemini Summarize Assignment (opens clean floating modal)
   const handleSummarizeAssignment = async (assignment: Assignment) => {
     if (!token || !assignment.description) return;
+    if (aiLock.inSchool) {
+      toast(`授業時間中は AI を使えません (${aiLock.until} まで)`, { kind: 'error' });
+      return;
+    }
     setIsSummarizingAI(assignment.id);
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/assignments/summarize`, {
@@ -2133,99 +2330,18 @@ export default function App() {
         },
         body: JSON.stringify({ description: assignment.description })
       });
-      const data = await res.json();
-      if (data.summary) {
-        setSummarizedTexts(prev => ({ ...prev, [assignment.id]: data.summary }));
-        setFloatingAiSummary({
-          id: assignment.id,
-          title: assignment.title,
-          summary: data.summary
-        });
-      }
-    } catch (err) {
-      console.error(err);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.summary) throw new Error(data.error || '要約できませんでした');
+      setSummarizedTexts(prev => ({ ...prev, [assignment.id]: data.summary }));
+      setFloatingAiSummary({
+        id: assignment.id,
+        title: assignment.title,
+        summary: data.summary
+      });
+    } catch (err: any) {
+      toast(err.message || '要約できませんでした', { kind: 'error' });
     } finally {
       setIsSummarizingAI(null);
-    }
-  };
-
-  // Phase 3: Test Scores Handlers
-  const handleFetchTestScores = async (userFilter: string) => {
-    if (!token) return;
-    setTestScoreUserFilter(userFilter);
-    const query = userFilter === 'me' ? '' : `?userId=${userFilter}`;
-    try {
-      const res = await safeFetch(`${API_BASE_URL}/api/test-scores${query}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setTestScores(data);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleDeleteTestScore = async (id: number) => {
-    if (!confirm('このテスト記録を削除しますか？')) return;
-    try {
-      const res = await safeFetch(`${API_BASE_URL}/api/test-scores/${id}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        setTestScores(prev => prev.filter(t => t.id !== id));
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleCreateTestScore = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!token) return;
-
-    try {
-      const res = await safeFetch(`${API_BASE_URL}/api/test-scores`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          examName: newExamName,
-          subject: newExamSubject,
-          score: newExamScore,
-          maxScore: newExamMaxScore
-        })
-      });
-      if (res.ok) {
-        const created = await res.json();
-        setTestScores(prev => [...prev, created]);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  // Phase 3: Get AI Advice on Test Scores
-  const handleGetAiAdvice = async () => {
-    if (!token) return;
-    setIsLoadingAdvice(true);
-    try {
-      const res = await safeFetch(`${API_BASE_URL}/api/test-scores/advice`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = await res.json();
-      if (data.advice) {
-        setAiAdvice(data.advice);
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsLoadingAdvice(false);
     }
   };
 
@@ -2421,7 +2537,9 @@ export default function App() {
   };
 
   const handleClearBoard = async () => {
-    if (!token || !confirm('ホワイトボードを全員分クリアしますか？')) return;
+    if (!token) return;
+    const ok = await confirmDialog({ title: 'ボードを全員分消しますか？', message: '描いた線と付箋がすべて消えます。元に戻せません。', confirmLabel: 'すべて消す', danger: true });
+    if (!ok) return;
     try {
       await safeFetch(`${API_BASE_URL}/api/board/clear`, {
         method: 'DELETE',
@@ -2487,25 +2605,25 @@ export default function App() {
   };
 
   // Phase 4: Shared Clipboard Handlers
-  const handleUpdateClipboard = async (newText: string) => {
+  // 1文字ごとに送らず、入力が止まってから共有
+  const handleUpdateClipboard = (newText: string) => {
     setClipboardText(newText);
     if (!token) return;
-    try {
-      await safeFetch(`${API_BASE_URL}/api/clipboard`, {
+    clearTimeout(clipboardTimerRef.current);
+    clipboardTimerRef.current = setTimeout(() => {
+      safeFetch(`${API_BASE_URL}/api/clipboard`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({ content: newText })
-      });
-    } catch (err) {
-      console.error(err);
-    }
+      }).catch(err => console.error(err));
+    }, 400);
   };
 
   const handleCopyClipboardToOS = () => {
-    navigator.clipboard.writeText(clipboardText);
+    navigator.clipboard.writeText(clipboardText).catch(() => toast('コピーできませんでした', { kind: 'error' }));
     setIsCopiedToOS(true);
     setTimeout(() => setIsCopiedToOS(false), 2000);
   };
@@ -2539,9 +2657,48 @@ export default function App() {
     return a.my_status === assignmentFilter && !a.is_archived;
   });
 
-  // Test Scores Total calculation
-  const totalScore = testScores.reduce((acc, curr) => acc + Number(curr.score), 0);
-  const totalMaxScore = testScores.reduce((acc, curr) => acc + Number(curr.max_score), 0);
+  // アイコン画像の変更
+  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !token) return;
+    setIsUploadingAvatar(true);
+    try {
+      const form = new FormData();
+      form.append('image', file);
+      const res = await safeFetch('/api/users/me/avatar', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'アイコンを変更できませんでした');
+      setCurrentUser(u => (u ? { ...u, avatar_url: data.avatar_url } : u));
+      setOnlineUsers(prev => prev.map(u => (u.id === currentUser?.id ? { ...u, avatar_url: data.avatar_url } : u)));
+      toast('アイコンを変更しました', { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    } finally {
+      setIsUploadingAvatar(false);
+    }
+  };
+
+  const handleRemoveAvatar = async () => {
+    if (!token) return;
+    const ok = await confirmDialog({ title: 'アイコンを削除しますか？', message: '頭文字の表示に戻ります。', confirmLabel: '削除する', danger: true });
+    if (!ok) return;
+    const res = await safeFetch('/api/users/me/avatar', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+    if (res && res.ok) {
+      setCurrentUser(u => (u ? { ...u, avatar_url: null } : u));
+      setOnlineUsers(prev => prev.map(u => (u.id === currentUser?.id ? { ...u, avatar_url: null } : u)));
+      toast('アイコンを削除しました', { kind: 'success' });
+    }
+  };
+
+  // 画面を離れる時は保存待ちのメモをすぐ保存
+  useEffect(() => {
+    const onHide = () => {
+      if (document.hidden) flushMemoSaveRef.current();
+    };
+    document.addEventListener('visibilitychange', onHide);
+    return () => document.removeEventListener('visibilitychange', onHide);
+  }, []);
 
   if (isCheckingAuth) {
     return (
@@ -2591,7 +2748,7 @@ export default function App() {
             </div>
           )}
 
-          <form onSubmit={handleAuthSubmit} className="space-y-4 font-mono text-sm">
+          <form onSubmit={handleAuthSubmit} data-allow-tab className="space-y-4 font-mono text-sm">
             <div>
               <label className="block text-xs text-stone-400 mb-1.5 uppercase tracking-wider">Username</label>
               <input
@@ -2642,17 +2799,66 @@ export default function App() {
     );
   }
 
-  // ヘッダー: 今日の時程と時間割から「休み / 朝 / 授業中 / 休み時間 / 放課後」を算出 (時計と一緒に毎秒更新)
-  const nowForStatus = new Date();
+  // ヘッダー: 今日の時程と時間割から「休み / 登校前 / 朝の会 / 授業中 / 休み時間 / 帰りの会 / 放課後」を算出 (毎秒更新)
+  const nowForStatus = now;
   const todayRows = todayTimetables.filter(t => t.day_of_week === nowForStatus.getDay());
-  const schoolStatus = computeSchoolStatus(nowForStatus, periodTimes[todaySchedule] || [], todayRows);
+  const schoolStatus = computeSchoolStatus(nowForStatus, ttConfig, todayRows);
+  const todaySlots = daySlots(ttConfig, nowForStatus.getDay(), todayRows);
   const todayItems = todayRows
     .filter(t => t.items && t.items.trim())
     .sort((a, b) => a.period - b.period)
     .map(t => `${t.period}限 ${t.subject}: ${t.items}`);
-  const StatusIcon = schoolStatus.kind === 'holiday' ? Sun : schoolStatus.kind === 'morning' ? Sunrise : schoolStatus.kind === 'after' ? Moon : BookOpen;
-  const code = weather.weatherCode ?? -1;
-  const WeatherIcon = code < 0 ? CloudSun : code <= 1 ? Sun : code <= 3 ? Cloud : code >= 51 ? CloudRain : CloudSun;
+  const StatusIcon = schoolStatus.kind === 'holiday' ? Sun : schoolStatus.kind === 'before' ? Sunrise : schoolStatus.kind === 'after' ? Moon : BookOpen;
+  const WeatherIcon = weatherIcon(weather.weatherCode);
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  const clockText = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
+  const dateText = `${now.getMonth() + 1}/${now.getDate()}(${DAY_LABELS[now.getDay()]})`;
+  const showNotifyBanner = notifyPermission === 'default' && !notifyBannerDismissed && (notifyPrefs.important || notifyPrefs.messages);
+  const userById = new Map(onlineUsers.map(u => [u.id, u]));
+  const knownUsernames = new Set(onlineUsers.map(u => u.username));
+  const channelByName = new Map(channels.filter(c => c.type !== 'voice').map(c => [c.name, c.id]));
+  const typingHere = Object.entries(typingUsers).filter(([, v]) => v.channelId === activeChannelId).map(([, v]) => v.username);
+  const activeChannelName = channels.find(c => c.id === activeChannelId)?.name || 'chat';
+
+  // 補完候補
+  const completionItems: { key: string; label: string; insert: string; sub?: string; avatar?: string | null }[] = (() => {
+    if (!completion) return [];
+    if (completion.kind === '@') {
+      const pool = [
+        { key: 'everyone', label: 'everyone', insert: '@everyone', sub: '全員に通知' },
+        ...(aiLock.inSchool ? [] : [{ key: 'gemini', label: 'gemini', insert: '@gemini', sub: 'AI に質問' }]),
+        ...onlineUsers.filter(u => u.id !== currentUser.id).map(u => ({ key: `u${u.id}`, label: u.username, insert: `@${u.username}`, avatar: u.avatar_url, sub: u.status === 'online' ? 'オンライン' : undefined })),
+      ];
+      return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
+    }
+    const pool = channels.filter(c => c.type !== 'voice').map(c => ({ key: `c${c.id}`, label: c.name, insert: `#${c.name}` }));
+    return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
+  })();
+
+  const updateCompletion = (value: string, caret: number) => {
+    const tok = findCompletionToken(value, caret);
+    setCompletion(prev => (tok ? { ...tok, index: prev && prev.kind === tok.kind && prev.start === tok.start ? prev.index : 0 } : null));
+  };
+
+  const applyCompletion = (item: { insert: string }) => {
+    if (!completion) return;
+    const el = chatInputRef.current;
+    const caret = el ? el.selectionStart : chatInput.length;
+    const before = chatInput.slice(0, completion.start);
+    const after = chatInput.slice(caret).replace(/^\S*/, '');
+    const inserted = `${item.insert} `;
+    const next = `${before}${inserted}${after.replace(/^\s/, '')}`;
+    setChatInput(next);
+    setCompletion(null);
+    requestAnimationFrame(() => {
+      if (!el) return;
+      el.focus();
+      const pos = before.length + inserted.length;
+      el.setSelectionRange(pos, pos);
+    });
+  };
+
+  const headerChip = 'flex items-center gap-1.5 border px-2 sm:px-2.5 py-1 rounded-lg transition hover:-translate-y-px';
 
   return (
     <div 
@@ -2661,44 +2867,40 @@ export default function App() {
       style={{ zoom: `${uiScale}%`, height: `calc(100dvh * ${100 / uiScale})` }}
     >
       {/* 1. TOP BAR */}
-      <header className="h-14 shrink-0 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md z-50 px-2 sm:px-4 flex items-center justify-between select-none overflow-x-auto gap-2">
-        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+      <header className="relative h-12 md:h-14 shrink-0 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md z-50 px-2 sm:px-4 flex items-center justify-between select-none gap-2">
+        <div className="flex items-center gap-1 sm:gap-2 min-w-0">
           <div 
             onClick={() => setActiveTab('chat')}
-            className="logo-container mr-1 sm:mr-3 font-['Space_Grotesk'] font-extrabold text-base sm:text-lg flex items-center tracking-wider"
+            className="logo-container mr-1 lg:mr-3 font-['Space_Grotesk'] font-extrabold text-base sm:text-lg flex items-center tracking-wider shrink-0"
           >
             <span className="text-white">asdfbase</span>
             <span className="logo-dot">.</span>
           </div>
 
-          <nav className="flex items-center gap-0.5 sm:gap-1 font-mono text-[11px] sm:text-xs">
-            {[
-              { id: 'chat', label: 'チャット', icon: MessageSquare },
-              { id: 'memo', label: 'メモ', icon: FileText },
-              { id: 'ai', label: 'AI', icon: Bot },
-              { id: 'assignments', label: '提出物', icon: CheckSquare },
-              { id: 'board', label: 'ボード', icon: Layout },
-              { id: 'more', label: 'その他', icon: MoreHorizontal },
-              { id: 'settings', label: '設定', icon: Settings },
-            ].map(tab => {
+          <nav className="hidden md:flex items-center gap-0.5 lg:gap-1 font-mono text-xs">
+            {TABS.map(tab => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
               return (
                 <button
                   key={tab.id}
-                  onClick={() => setActiveTab(tab.id as any)}
-                  className={`px-2 sm:px-2.5 py-1.5 rounded-lg flex items-center gap-1 sm:gap-1.5 transition whitespace-nowrap ${
+                  onClick={() => setActiveTab(tab.id)}
+                  title={tab.label}
+                  className={`relative px-2 lg:px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 whitespace-nowrap border ${
                     isActive 
-                      ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30' 
-                      : 'text-stone-400 hover:text-stone-200 hover:bg-stone-900/60'
+                      ? 'bg-amber-500/10 text-amber-400 border-amber-500/30' 
+                      : 'text-stone-400 border-transparent hover:text-stone-100 hover:bg-stone-800/70 hover:border-stone-700/60'
                   }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">{tab.label}</span>
-                  {tab.id === 'chat' && totalUnread > 0 && (
-                    <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold leading-[18px] text-center">
-                      {totalUnread > 99 ? '99+' : totalUnread}
+                  <span className="hidden lg:inline">{tab.label}</span>
+                  {tab.id === 'chat' && totalMentions > 0 && (
+                    <span className="anim-badge min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold leading-[18px] text-center">
+                      {totalMentions > 99 ? '99+' : totalMentions}
                     </span>
+                  )}
+                  {tab.id === 'chat' && totalMentions === 0 && totalUnread > 0 && activeTab !== 'chat' && (
+                    <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,0.8)]" />
                   )}
                 </button>
               );
@@ -2706,61 +2908,105 @@ export default function App() {
           </nav>
         </div>
 
-        {/* Right Header Block */}
-        <div className="flex items-center gap-1.5 sm:gap-2.5 font-mono text-[11px] sm:text-xs shrink-0">
-          <button
+        {/* Right Header Block: ホバーで概要、クリックで詳細 */}
+        <div className="flex items-center gap-1 sm:gap-2 font-mono text-[11px] sm:text-xs shrink-0">
+          <HoverCard
+            title="時間割"
             onClick={() => {
               handleFetchTimetables();
               setIsTimetableModalOpen(true);
             }}
-            title={`${SCHEDULE_LABELS[todaySchedule]}${todayItems.length > 0 ? `\n今日の持ち物:\n${todayItems.join('\n')}` : ''}\n(クリックで時間割を開く)`}
-            className={`flex items-center gap-1.5 border px-2.5 py-1 rounded-lg transition interactive-btn cursor-pointer ${
-              schoolStatus.kind === 'holiday' || schoolStatus.kind === 'after'
-                ? 'bg-stone-900/60 border-stone-800 text-stone-300 hover:bg-stone-800/60'
+            className={`${headerChip} ${
+              schoolStatus.kind === 'holiday' || schoolStatus.kind === 'after' || schoolStatus.kind === 'before'
+                ? 'bg-stone-900/60 border-stone-800 text-stone-300 hover:bg-stone-800/80 hover:border-stone-600'
                 : 'bg-amber-500/15 border-amber-500/30 text-amber-300 hover:bg-amber-500/25'
             }`}
+            trigger={
+              <>
+                <StatusIcon className="w-3.5 h-3.5 text-amber-400" />
+                <span className="font-bold max-w-[7rem] sm:max-w-none truncate">{schoolStatus.label}</span>
+                {schoolStatus.sub && <span className="text-stone-400 text-[10px] hidden xl:inline">({schoolStatus.sub})</span>}
+                {todayItems.length > 0 && <Backpack className="w-3 h-3 text-stone-400 hidden sm:block" />}
+                {todaySchedule !== 'normal' && (
+                  <span className="text-[9px] px-1 rounded bg-amber-500 text-black font-bold">{todaySchedule === 'short' ? '短縮' : 'S短'}</span>
+                )}
+              </>
+            }
           >
-            <StatusIcon className="w-3.5 h-3.5 text-amber-400" />
-            <span className="font-bold">{schoolStatus.label}</span>
-            {schoolStatus.sub && <span className="text-stone-400 text-[10px] hidden sm:inline">({schoolStatus.sub})</span>}
-            {todayItems.length > 0 && <Backpack className="w-3 h-3 text-stone-400" />}
-            {todaySchedule !== 'normal' && (
-              <span className="text-[9px] px-1 rounded bg-amber-500 text-black font-bold">{todaySchedule === 'short' ? '短縮' : 'S短'}</span>
-            )}
-          </button>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-white font-bold">今日の時間割</span>
+                <span className="text-stone-500">{SCHEDULE_LABELS[todaySchedule]}</span>
+              </div>
+              {schoolStatus.kind === 'holiday' ? (
+                <div className="text-stone-500">今日は休みです</div>
+              ) : (
+                <div className="space-y-0.5">
+                  {todaySlots.map(slot => (
+                    <div
+                      key={slot.key}
+                      className={`flex items-center gap-2 px-2 py-1 rounded-lg ${slot.key === schoolStatus.currentKey ? 'bg-amber-500/15 text-amber-200' : 'text-stone-300'}`}
+                    >
+                      <span className="w-14 shrink-0 font-bold text-amber-400/90">{slot.label}</span>
+                      <span className="flex-1 truncate">{slot.subject || (slot.key.startsWith('p') ? '—' : '')}</span>
+                      <span className="text-stone-500 tabular-nums text-[10px]">{slot.time.start}〜{slot.time.end}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {todayItems.length > 0 && (
+                <div className="pt-2 border-t border-stone-800 space-y-0.5">
+                  <div className="text-stone-400 font-bold flex items-center gap-1"><Backpack className="w-3 h-3" /> 持ち物</div>
+                  {todayItems.map(item => <div key={item} className="text-stone-300">{item}</div>)}
+                </div>
+              )}
+              <div className="text-[10px] text-stone-600 text-right">クリックで時間割を開く</div>
+            </div>
+          </HoverCard>
 
-          <div
-            className="flex items-center gap-1.5 text-stone-300 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70"
-            title={weather.source === 'jma' ? '気象庁 (香川県) の予報' : 'Open-Meteo の現在の天気'}
+          <HoverCard
+            title="天気"
+            onClick={() => setShowWeather(true)}
+            className={`${headerChip} text-stone-300 bg-stone-900/60 border-stone-800/70 hover:bg-stone-800/80 hover:border-stone-600`}
+            trigger={
+              <>
+                <WeatherIcon className="w-3.5 h-3.5 text-amber-400" />
+                <span className="tabular-nums">{weather.temp === null ? '--' : weather.temp}℃</span>
+                <span className="hidden sm:inline">{weather.desc}</span>
+                {weather.precipProb != null && (
+                  <span className="hidden lg:inline-flex items-center gap-0.5 text-[10px] text-sky-300">
+                    <Umbrella className="w-3 h-3" />{weather.precipProb}%
+                  </span>
+                )}
+              </>
+            }
           >
-            <WeatherIcon className="w-3.5 h-3.5 text-amber-400" />
-            <span>高松 {weather.temp === null ? '--' : weather.temp}℃ {weather.desc}</span>
-            {weather.tempMax != null && weather.tempMin != null && (
-              <span className="hidden lg:inline text-[10px]">
-                <span className="text-red-300">{weather.tempMax}°</span>/<span className="text-sky-300">{weather.tempMin}°</span>
-              </span>
-            )}
-            {weather.precipProb != null && (
-              <span className="hidden lg:inline-flex items-center gap-0.5 text-[10px] text-sky-300">
-                <Umbrella className="w-3 h-3" />{weather.precipProb}%
-              </span>
-            )}
-          </div>
+            <WeatherHoverSummary weather={weather} />
+          </HoverCard>
 
-          <div className="hidden md:flex items-center gap-1.5 text-stone-400 bg-stone-900/60 px-2.5 py-1 rounded-lg border border-stone-800/70">
-            <CalendarClock className="w-3.5 h-3.5 text-stone-500" />
-            <span>{currentTime || 'Loading...'}</span>
-          </div>
-
-
+          <HoverCard
+            title="カレンダー"
+            onClick={() => setShowCalendar(true)}
+            panelClassName="w-72"
+            className={`${headerChip} text-stone-300 bg-stone-900/60 border-stone-800/70 hover:bg-stone-800/80 hover:border-stone-600`}
+            trigger={
+              <>
+                <CalendarClock className="w-3.5 h-3.5 text-amber-400 hidden sm:block" />
+                <span className="hidden lg:inline text-stone-400">{dateText}</span>
+                <span className="tabular-nums">{clockText}<span className="hidden xl:inline text-stone-500">:{pad2(now.getSeconds())}</span></span>
+              </>
+            }
+          >
+            <CalendarHoverSummary now={now} events={calendarEvents} />
+          </HoverCard>
 
           <button
             onClick={() => setShowCamera(!showCamera)}
             title="カメラ小窓"
-            className={`p-1.5 rounded-lg border transition ${
+            className={`hidden sm:block p-1.5 rounded-lg border ${
               showCamera 
                 ? 'bg-amber-500 text-black border-amber-400' 
-                : 'bg-stone-900/80 border-stone-800 text-stone-400 hover:text-amber-400'
+                : 'bg-stone-900/80 border-stone-800 text-stone-400 hover:text-amber-400 hover:border-stone-600'
             }`}
           >
             <Camera className="w-3.5 h-3.5" />
@@ -2769,27 +3015,62 @@ export default function App() {
           <button
             onClick={handleLogout}
             title="ログアウト"
-            className="p-1.5 rounded-lg bg-stone-900/80 border border-stone-800 text-stone-500 hover:text-red-400 hover:border-red-900 transition"
+            className="hidden sm:block p-1.5 rounded-lg bg-stone-900/80 border border-stone-800 text-stone-500 hover:text-red-400 hover:border-red-900"
           >
             <LogOut className="w-3.5 h-3.5" />
           </button>
         </div>
       </header>
 
+      {/* 通知の許可・オフライン表示 */}
+      {showNotifyBanner && (
+        <div className="shrink-0 flex items-center gap-2 px-3 sm:px-4 py-2 bg-amber-500/10 border-b border-amber-500/20 text-xs text-amber-200 anim-fade">
+          <BellRing className="w-4 h-4 text-amber-400 shrink-0" />
+          <span className="flex-1 min-w-0">メンションや新しい提出物を通知で受け取るには、通知を許可してください</span>
+          <button onClick={requestNotifyPermission} className="shrink-0 px-3 py-1 rounded-lg btn-primary font-bold">許可する</button>
+          <button
+            onClick={() => {
+              setNotifyBannerDismissed(true);
+              LS.set('asdf_notify_banner_dismissed', '1');
+            }}
+            className="shrink-0 p-1 rounded text-amber-300/70 hover:text-white"
+            aria-label="閉じる"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+      {wsStatus === 'offline' && (
+        <div className="shrink-0 flex items-center justify-center gap-2 px-3 py-1.5 bg-red-950/50 border-b border-red-900/60 text-xs text-red-200 anim-fade">
+          <WifiOff className="w-3.5 h-3.5" /> オフラインです。つながると自動で同期します
+        </div>
+      )}
+
       {/* 2. MAIN CONTENT BODY */}
       <main className="flex-1 min-h-0 flex overflow-hidden">
         {/* TAB 1: リアルタイムチャット (3ペイン: チャンネル / チャット / メンバー) */}
         {activeTab === 'chat' && (
-          <div className="flex-1 min-h-0 flex overflow-hidden">
-            {/* Channels Sidebar: Small screen / Chromebook responsive toggle */}
+          <div className="flex-1 min-h-0 flex overflow-hidden relative anim-tab">
+            {/* スマホ: チャンネル・メンバー一覧はドロワー */}
+            {(!isChannelsCollapsed || !isMembersCollapsed) && (
+              <div
+                className={`absolute inset-0 bg-black/50 z-30 anim-fade ${!isChannelsCollapsed ? 'md:hidden' : 'lg:hidden'}`}
+                onClick={() => {
+                  if (isSmallScreen()) setIsChannelsCollapsed(true);
+                  if (window.innerWidth < 1024) setIsMembersCollapsed(true);
+                }}
+              />
+            )}
+
+            {/* Channels Sidebar */}
             {!isChannelsCollapsed && (
-              <aside className="w-48 sm:w-56 border-r border-stone-800 bg-[#0C0D10] flex flex-col shrink-0 min-h-0 overflow-hidden">
+              <aside className="absolute md:static inset-y-0 left-0 z-40 w-64 md:w-56 border-r border-stone-800 bg-[#0C0D10] flex flex-col shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
                 <div className="flex-1 min-h-0 flex flex-col p-2.5 sm:p-3">
                   <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold shrink-0">
                     <span>チャンネル</span>
                     <button
                       onClick={() => setIsNewChannelModalOpen(true)}
-                      className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800 transition"
+                      className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800"
                       title="チャンネルを作成"
                     >
                       <Plus className="w-3.5 h-3.5" />
@@ -2798,8 +3079,9 @@ export default function App() {
                   {/* チャンネル一覧: 収まらない時はこの中だけスクロール */}
                   <div className="flex-1 min-h-0 overflow-y-auto space-y-0.5 pr-1">
                     {channels.filter(ch => ch.type !== 'voice').map((ch, idx, textChannels) => {
-                      const unread = activeChannelId === ch.id ? 0 : (unreadCounts[ch.id] || 0);
                       const isActiveCh = activeChannelId === ch.id;
+                      const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0);
+                      const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0);
                       return (
                       <div
                         key={ch.id}
@@ -2807,7 +3089,7 @@ export default function App() {
                           isActiveCh
                             ? 'bg-amber-500/15 text-amber-300 font-bold'
                             : unread > 0
-                              ? 'text-white font-bold hover:bg-stone-800/60'
+                              ? 'text-white font-bold bg-white/[0.04] hover:bg-stone-800/60'
                               : 'text-stone-500 hover:bg-stone-900/60 hover:text-stone-300'
                         }`}
                       >
@@ -2815,23 +3097,21 @@ export default function App() {
                         {isActiveCh ? (
                           <span className="absolute left-0 top-1.5 bottom-1.5 w-1 rounded-r bg-amber-400" />
                         ) : unread > 0 ? (
-                          <span className="absolute -left-0.5 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-white" />
+                          <span className="absolute -left-0.5 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-white anim-badge" />
                         ) : null}
                         <button
                           onClick={() => setActiveChannelId(ch.id)}
                           className="flex items-center gap-2 flex-1 text-left truncate min-w-0"
                         >
-                          {ch.type === 'voice'
-                            ? <Mic className={`w-4 h-4 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
-                            : <Hash className={`w-4 h-4 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />}
+                          <Hash className={`w-4 h-4 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
                           <span className="truncate">{ch.name}</span>
                         </button>
 
                         <div className="flex items-center gap-1 shrink-0 ml-1">
-                          {/* 未読バッジ */}
-                          {unread > 0 && (
-                            <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold leading-5 text-center shadow">
-                              {unread > 99 ? '99+' : unread}
+                          {/* メンションされた時だけ赤い数字 */}
+                          {mentions > 0 && (
+                            <span className="anim-badge min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold leading-5 text-center shadow">
+                              {mentions > 99 ? '99+' : mentions}
                             </span>
                           )}
 
@@ -2840,7 +3120,7 @@ export default function App() {
                             {idx > 0 && (
                               <button
                                 onClick={e => handleMoveChannel(e, idx, 'up')}
-                                className="p-0.5 hover:text-amber-400 text-stone-500 transition"
+                                className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
                                 title="上へ移動"
                               >
                                 ▲
@@ -2849,7 +3129,7 @@ export default function App() {
                             {idx < textChannels.length - 1 && (
                               <button
                                 onClick={e => handleMoveChannel(e, idx, 'down')}
-                                className="p-0.5 hover:text-amber-400 text-stone-500 transition"
+                                className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
                                 title="下へ移動"
                               >
                                 ▼
@@ -2860,7 +3140,7 @@ export default function App() {
                           {channels.length > 1 && currentUser?.role === 'admin' && (
                             <button
                               onClick={() => handleDeleteChannel(ch.id)}
-                              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600 transition"
+                              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600"
                               title="チャンネル削除"
                             >
                               <Trash2 className="w-3 h-3" />
@@ -2872,25 +3152,27 @@ export default function App() {
                     })}
                   </div>
                 </div>
-
               </aside>
             )}
 
             {/* Center: メインチャット */}
             <section className="flex-1 min-w-0 min-h-0 flex flex-col bg-[#090A0C] overflow-hidden">
-              <div className="h-12 border-b border-stone-800/80 px-3 sm:px-4 flex items-center justify-between bg-[#0C0D10]/50 font-mono text-xs">
-                <div className="flex items-center gap-2 font-bold text-white">
+              <div className="h-12 shrink-0 border-b border-stone-800/80 px-2 sm:px-4 flex items-center justify-between gap-2 bg-[#0C0D10]/50 font-mono text-xs">
+                <div className="flex items-center gap-2 font-bold text-white min-w-0">
                   <button
                     onClick={() => setIsChannelsCollapsed(!isChannelsCollapsed)}
-                    className="p-1 rounded hover:bg-stone-800 text-stone-400 hover:text-amber-400 transition"
-                    title={isChannelsCollapsed ? 'チャンネル一覧を開く' : 'チャンネル一覧を隠す'}
+                    className="relative p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white hover:border-stone-600 shrink-0"
+                    title={isChannelsCollapsed ? 'チャンネル一覧を表示' : 'チャンネル一覧を隠す'}
                   >
-                    <Layout className="w-3.5 h-3.5" />
+                    {isChannelsCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
+                    {isChannelsCollapsed && totalMentions > 0 && (
+                      <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 border-2 border-[#0C0D10]" />
+                    )}
                   </button>
-                  <Hash className="w-4 h-4 text-amber-400" />
-                  <span className="text-sm">{channels.find(c => c.id === activeChannelId)?.name || 'chat'}</span>
+                  <Hash className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="text-sm truncate">{activeChannelName}</span>
                   <span
-                    className={`ml-1 flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-normal cursor-pointer ${
+                    className={`ml-1 flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-normal cursor-pointer shrink-0 ${
                       wsStatus === 'online'
                         ? 'border-emerald-700/60 text-emerald-400 bg-emerald-950/30'
                         : wsStatus === 'offline'
@@ -2905,23 +3187,23 @@ export default function App() {
                     }`} />
                     <span className="hidden sm:inline">
                       {wsStatus === 'online'
-                        ? `リアルタイム${activeTransport && activeTransport !== 'ws' ? ` (${TRANSPORT_LABELS[activeTransport]})` : ''}`
+                        ? `接続中${activeTransport && activeTransport !== 'ws' ? ` (${TRANSPORT_LABELS[activeTransport]})` : ''}`
                         : wsStatus === 'offline' ? 'オフライン' : wsStatus === 'connecting' ? '接続中…' : '再接続中…'}
                     </span>
                   </span>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5 shrink-0">
                   {isSearchOpen ? (
-                    <div className="flex items-center gap-1.5 bg-[#16181D] border border-stone-800 px-2 py-1 rounded-lg">
+                    <div className="flex items-center gap-1.5 bg-[#16181D] border border-stone-800 px-2 py-1 rounded-lg anim-fade">
                       <Search className="w-3.5 h-3.5 text-stone-500" />
                       <input
                         type="text"
                         autoFocus
-                        placeholder="メッセージを検索..."
+                        placeholder="検索"
                         value={chatSearchQuery}
                         onChange={e => setChatSearchQuery(e.target.value)}
-                        className="bg-transparent text-white focus:outline-none w-36 sm:w-48 text-[11px]"
+                        className="bg-transparent text-white focus:outline-none w-24 sm:w-44 text-[11px]"
                       />
                       <button onClick={() => { setIsSearchOpen(false); setChatSearchQuery(''); }} className="text-stone-500 hover:text-white">
                         <X className="w-3 h-3" />
@@ -2930,7 +3212,7 @@ export default function App() {
                   ) : (
                     <button
                       onClick={() => setIsSearchOpen(true)}
-                      className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white transition"
+                      className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white hover:border-stone-600"
                       title="検索"
                     >
                       <Search className="w-3.5 h-3.5" />
@@ -2939,7 +3221,7 @@ export default function App() {
 
                   <button
                     onClick={() => setIsMembersCollapsed(!isMembersCollapsed)}
-                    className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white transition"
+                    className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white hover:border-stone-600"
                     title={isMembersCollapsed ? 'メンバー一覧を表示' : 'メンバー一覧を隠す'}
                   >
                     {isMembersCollapsed ? <ChevronLeft className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
@@ -2948,24 +3230,24 @@ export default function App() {
               </div>
 
               <div className="relative flex-1 min-h-0 flex flex-col">
-              <div ref={chatScrollContainerRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto px-2 sm:px-4 py-3">
+              <div ref={chatScrollContainerRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto px-1.5 sm:px-4 py-3">
                 {/* 過去ログ読み込み (上端で自動 / 手動ボタン) */}
                 {hasMoreMessages && messages.length > 0 && !chatSearchQuery && (
                   <div className="flex justify-center py-2">
                     <button
                       onClick={handleLoadMoreMessages}
                       disabled={isLoadingMoreMessages}
-                      className="px-4 py-1.5 rounded-full bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 text-xs transition flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+                      className="px-4 py-1.5 rounded-full bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 text-xs flex items-center gap-1.5 shadow-sm disabled:opacity-50"
                     >
                       {isLoadingMoreMessages ? (
                         <>
                           <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
-                          <span>過去ログを読み込み中...</span>
+                          <span>読み込み中…</span>
                         </>
                       ) : (
                         <>
                           <ArrowDown className="w-3.5 h-3.5 rotate-180 text-amber-400" />
-                          <span>過去のメッセージを読み込む</span>
+                          <span>過去のメッセージ</span>
                         </>
                       )}
                     </button>
@@ -2974,14 +3256,14 @@ export default function App() {
 
                 {!hasMoreMessages && messages.length > 0 && !chatSearchQuery && (
                   <div className="text-center text-[11px] text-stone-600 py-3">
-                    #{channels.find(c => c.id === activeChannelId)?.name} の最初のメッセージです
+                    #{activeChannelName} の最初のメッセージです
                   </div>
                 )}
 
                 {messages.filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
-                  <div className="h-full flex flex-col items-center justify-center text-stone-600 text-xs space-y-2">
+                  <div className="h-full flex flex-col items-center justify-center text-stone-600 text-xs space-y-2 anim-fade">
                     <MessageSquare className="w-8 h-8 opacity-40 text-amber-400" />
-                    <p>メッセージはありません。@gemini でAIと会話できます。</p>
+                    <p>{chatSearchQuery ? '見つかりませんでした' : 'まだメッセージはありません'}</p>
                   </div>
                 ) : (
                   messages
@@ -3004,12 +3286,12 @@ export default function App() {
                         created.getTime() - (prevCreated?.getTime() || 0) < 5 * 60 * 1000
                       );
                       const isMentioningMe = Boolean(
-                        currentUser && !isMine && (m.content.includes(`@${currentUser.username}`) || m.content.includes('@everyone'))
+                        currentUser && !isMine && (m.content.includes(`@${currentUser.username}`) || m.content.includes('@everyone') || m.reply_to?.user_id === currentUser.id)
                       );
                       const timeLabel = created.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
                       return (
-                        <React.Fragment key={m.id}>
+                        <React.Fragment key={m.client_nonce || m.id}>
                           {isNewDay && (
                             <div className="flex items-center gap-3 my-4">
                               <div className="flex-1 h-px bg-stone-800" />
@@ -3029,22 +3311,18 @@ export default function App() {
 
                           <div
                             id={`msg-${m.id}`}
-                            className={`flex items-start gap-3 group relative px-2 rounded-lg transition hover:bg-white/[0.03] ${
+                            className={`flex items-start gap-2.5 sm:gap-3 group relative px-2 rounded-lg transition-colors hover:bg-white/[0.03] ${
                               isGrouped ? 'py-0.5' : 'pt-2 pb-0.5 mt-1.5'
                             } ${m.is_pinned ? 'bg-amber-500/5 border-l-2 border-amber-500/60' : ''} ${
                               isMentioningMe ? 'bg-amber-500/10 border-l-2 border-amber-400' : ''
-                            } ${m.pending ? 'opacity-60' : ''}`}
+                            } ${m.pending ? 'opacity-60' : ''} ${m.id > lastSeenAtMountRef.current || m.id < 0 ? 'anim-msg' : ''}`}
                           >
                             {isGrouped ? (
                               <div className="w-9 shrink-0 text-[10px] text-stone-600 text-right pt-1 opacity-0 group-hover:opacity-100 select-none">
                                 {timeLabel}
                               </div>
                             ) : (
-                              <div className={`w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold uppercase shrink-0 border ${
-                                isGemini ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : avatarColorFor(senderName)
-                              }`}>
-                                {isGemini ? 'AI' : senderName.replace('[Discord] ', '')[0]}
-                              </div>
+                              <Avatar name={senderName} url={m.user_id ? userById.get(m.user_id)?.avatar_url : null} />
                             )}
 
                             <div className="flex-1 min-w-0">
@@ -3081,7 +3359,7 @@ export default function App() {
                               )}
 
                               {editingMessageId === m.id ? (
-                                <div className="flex items-start gap-2 mt-1">
+                                <div className="flex flex-col sm:flex-row items-stretch sm:items-start gap-2 mt-1">
                                   <textarea
                                     value={editingContent}
                                     rows={Math.min(8, Math.max(1, editingContent.split('\n').length))}
@@ -3101,19 +3379,21 @@ export default function App() {
                                     onFocus={e => e.currentTarget.setSelectionRange(e.currentTarget.value.length, e.currentTarget.value.length)}
                                     className="flex-1 bg-[#16181D] border border-amber-500 rounded-lg px-2.5 py-1 text-sm text-white focus:outline-none resize-none"
                                   />
-                                  <button
-                                    onClick={() => handleEditMessage(m.id)}
-                                    className="px-2.5 py-1 bg-amber-500 text-black font-bold rounded-lg text-xs"
-                                  >
-                                    保存
-                                  </button>
-                                  <button
-                                    onClick={cancelEditing}
-                                    className="px-2.5 py-1 bg-stone-800 text-stone-400 rounded-lg text-xs"
-                                    title="Esc"
-                                  >
-                                    キャンセル
-                                  </button>
+                                  <div className="flex gap-2">
+                                    <button
+                                      onClick={() => handleEditMessage(m.id)}
+                                      className="px-2.5 py-1 btn-primary font-bold rounded-lg text-xs"
+                                    >
+                                      保存
+                                    </button>
+                                    <button
+                                      onClick={cancelEditing}
+                                      className="px-2.5 py-1 btn-ghost rounded-lg text-xs"
+                                      title="Esc"
+                                    >
+                                      キャンセル
+                                    </button>
+                                  </div>
                                 </div>
                               ) : (
                                 <div className={`text-[15px] leading-relaxed whitespace-pre-wrap break-words ${
@@ -3136,10 +3416,21 @@ export default function App() {
                                     />
                                   ) : m.content === VIDEO_NOTICE ? (
                                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 text-xs">
-                                      <Film className="w-3.5 h-3.5" /> 動画が送信されています (asdfbase では表示されません)
+                                      <Film className="w-3.5 h-3.5" /> 動画 (asdfbase では表示できません)
                                     </span>
+                                  ) : isGemini ? (
+                                    <div className="markdown-body whitespace-normal">
+                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                                    </div>
                                   ) : (
-                                    <span>{m.content}</span>
+                                    <span>
+                                      {renderMessageText(m.content, {
+                                        usernames: knownUsernames,
+                                        channels: channelByName,
+                                        me: currentUser.username,
+                                        onChannelClick: id => setActiveChannelId(id),
+                                      })}
+                                    </span>
                                   )}
                                 </div>
                               )}
@@ -3151,7 +3442,7 @@ export default function App() {
                                 <div className="flex items-center gap-2 text-[11px] text-red-400 mt-0.5">
                                   <span>送信に失敗しました</span>
                                   <button onClick={() => handleRetryMessage(m)} className="underline hover:text-red-300">再送</button>
-                                  <button onClick={() => handleDiscardFailedMessage(m)} className="underline text-stone-500 hover:text-stone-300">削除</button>
+                                  <button onClick={() => handleDiscardFailedMessage(m)} className="underline text-stone-500 hover:text-stone-300">取り消す</button>
                                 </div>
                               )}
 
@@ -3161,10 +3452,10 @@ export default function App() {
                                     <button
                                       key={emoji}
                                       onClick={() => handleToggleReaction(m.id, emoji)}
-                                      className={`text-xs px-2 py-0.5 rounded-md border flex items-center gap-1 transition ${
+                                      className={`text-xs px-2 py-0.5 rounded-md border flex items-center gap-1 ${
                                         userIds.includes(currentUser?.id)
                                           ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                                          : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-700'
+                                          : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-600'
                                       }`}
                                     >
                                       <span>{emoji}</span>
@@ -3176,59 +3467,31 @@ export default function App() {
                             </div>
 
                             {m.id > 0 && (
-                            <div className="opacity-0 group-hover:opacity-100 transition absolute right-2 -top-3 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-1 shadow-md z-10">
-                              <button
-                                onClick={() => startReply(m)}
-                                title="返信"
-                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
-                              >
-                                <Reply className="w-3 h-3" />
+                            <div className="opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition absolute right-2 -top-3 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-0.5 shadow-md z-10">
+                              <button onClick={() => startReply(m)} title="返信" className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400">
+                                <Reply className="w-3.5 h-3.5" />
                               </button>
-                              <button
-                                onClick={() => handleToggleReaction(m.id, '👍')}
-                                title="いいね"
-                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400 text-xs"
-                              >
+                              <button onClick={() => handleToggleReaction(m.id, '👍')} title="いいね" className="p-1 hover:bg-stone-800 rounded text-xs">
                                 👍
                               </button>
-                              <button
-                                onClick={() => handleToggleReaction(m.id, '❤️')}
-                                title="ハート"
-                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400 text-xs"
-                              >
+                              <button onClick={() => handleToggleReaction(m.id, '❤️')} title="ハート" className="p-1 hover:bg-stone-800 rounded text-xs">
                                 ❤️
                               </button>
-                              <button
-                                onClick={() => handleTogglePin(m.id)}
-                                title="ピン留め"
-                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
-                              >
-                                <Pin className="w-3 h-3" />
+                              <button onClick={() => handleTogglePin(m.id)} title={m.is_pinned ? 'ピン留めを外す' : 'ピン留め'} className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400">
+                                <Pin className="w-3.5 h-3.5" />
                               </button>
-                              <button
-                                onClick={() => handleCopyMessageLink(m.id)}
-                                title="メッセージリンクをコピー"
-                                className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-white"
-                              >
-                                {copiedLinkMessageId === m.id ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                              <button onClick={() => handleCopyMessageLink(m.id)} title="リンクをコピー" className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-white">
+                                {copiedLinkMessageId === m.id ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
                               </button>
                               {(m.user_id === currentUser?.id || currentUser?.role === 'admin') && (
                                 <>
                                   {m.user_id === currentUser?.id && (
-                                    <button
-                                      onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content); }}
-                                      title="編集"
-                                      className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400"
-                                    >
-                                      <Edit3 className="w-3 h-3" />
+                                    <button onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content); }} title="編集" className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400">
+                                      <Edit3 className="w-3.5 h-3.5" />
                                     </button>
                                   )}
-                                  <button
-                                    onClick={() => handleDeleteMessage(m.id)}
-                                    title="削除"
-                                    className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-red-400"
-                                  >
-                                    <Trash2 className="w-3 h-3" />
+                                  <button onClick={() => handleDeleteMessage(m.id)} title="削除" className="p-1 hover:bg-red-950/60 rounded text-stone-400 hover:text-red-400">
+                                    <Trash2 className="w-3.5 h-3.5" />
                                   </button>
                                 </>
                               )}
@@ -3246,7 +3509,7 @@ export default function App() {
                 {newBelowCount > 0 ? (
                   <button
                     onClick={scrollToBottom}
-                    className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold shadow-lg flex items-center gap-1 transition z-20"
+                    className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full btn-primary text-xs font-bold shadow-lg flex items-center gap-1 z-20 anim-pop"
                   >
                     <ArrowDown className="w-3.5 h-3.5" />
                     新着 {newBelowCount} 件
@@ -3254,7 +3517,7 @@ export default function App() {
                 ) : (
                   <button
                     onClick={scrollToBottom}
-                    className="absolute bottom-3 right-4 p-1.5 rounded-full bg-[#16181D]/90 border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-amber-500/50 transition shadow-lg z-20"
+                    className="absolute bottom-3 right-4 p-1.5 rounded-full bg-[#16181D]/90 border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-amber-500/50 shadow-lg z-20"
                     title="最下部へスクロール"
                   >
                     <ArrowDown className="w-3.5 h-3.5" />
@@ -3262,33 +3525,53 @@ export default function App() {
                 )}
               </div>
 
-              {/* Chat Input: Fixed at bottom with shrink-0 */}
-              <div className="relative p-3 border-t border-stone-800/80 bg-[#0C0D10]/95 shrink-0">
-                {showMentionSuggestions && (
-                  <div className="absolute bottom-full left-4 mb-2 w-64 bg-[#111214] border border-stone-800 rounded-xl shadow-2xl p-2 font-mono text-xs space-y-1 z-30">
-                    <div className="text-[10px] text-stone-500 uppercase px-2 font-bold">メンバー補完</div>
-                    {[{ id: 0, username: 'gemini' }, ...onlineUsers]
-                      .filter(u => u.username.toLowerCase().includes(mentionFilter.toLowerCase()))
-                      .map(u => (
-                        <button
-                          key={u.id}
-                          onClick={() => {
-                            const lastAt = chatInput.lastIndexOf('@');
-                            const prefix = chatInput.substring(0, lastAt);
-                            setChatInput(`${prefix}@${u.username} `);
-                            setShowMentionSuggestions(false);
-                          }}
-                          className="w-full px-2 py-1.5 rounded-lg flex items-center gap-2 hover:bg-stone-800 text-stone-300 hover:text-white transition text-left"
-                        >
-                          <span className="text-amber-400">@{u.username}</span>
-                        </button>
-                      ))}
+              {/* Chat Input */}
+              <div className="relative px-2 sm:px-3 pt-1 pb-2 sm:pb-3 border-t border-stone-800/80 bg-[#0C0D10]/95 shrink-0">
+                {/* 入力中表示 */}
+                <div className="h-5 px-1 text-[11px] text-stone-400 flex items-center gap-1.5">
+                  {typingHere.length > 0 && (
+                    <span className="flex items-center gap-1.5 anim-fade">
+                      <span className="typing-dots"><i /><i /><i /></span>
+                      <span className="truncate">
+                        <b className="text-stone-200">{typingHere.slice(0, 3).join('、')}</b>
+                        {typingHere.length > 3 ? ` ほか${typingHere.length - 3}人` : ''} が入力中…
+                      </span>
+                    </span>
+                  )}
+                </div>
+
+                {completion && completionItems.length > 0 && (
+                  <div className="absolute bottom-full left-2 sm:left-4 mb-1 w-[calc(100%-1rem)] sm:w-72 bg-[#111214] border border-stone-700/80 rounded-xl shadow-2xl p-1.5 text-xs z-30 anim-pop-down">
+                    <div className="flex items-center justify-between px-2 py-1 text-[10px] text-stone-500">
+                      <span>{completion.kind === '@' ? 'メンション' : 'チャンネル'}</span>
+                      <span><kbd className="kbd">Tab</kbd> 選択 · <kbd className="kbd">Enter</kbd> 決定</span>
+                    </div>
+                    {completionItems.map((item, i) => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        onMouseDown={e => e.preventDefault()}
+                        onMouseEnter={() => setCompletion(c => (c ? { ...c, index: i } : c))}
+                        onClick={() => applyCompletion(item)}
+                        className={`w-full px-2 py-1.5 rounded-lg flex items-center gap-2 text-left ${
+                          i === completion.index % completionItems.length ? 'bg-amber-500/15 text-white' : 'text-stone-300'
+                        }`}
+                      >
+                        {completion.kind === '@' ? (
+                          item.key.startsWith('u') ? <Avatar name={item.label} url={item.avatar} size="w-5 h-5 text-[10px]" /> : <Bot className="w-4 h-4 text-amber-400" />
+                        ) : (
+                          <Hash className="w-4 h-4 text-emerald-400" />
+                        )}
+                        <span className={completion.kind === '@' ? 'text-sky-300 font-bold' : 'text-emerald-300 font-bold'}>{item.insert}</span>
+                        {item.sub && <span className="ml-auto text-[10px] text-stone-500">{item.sub}</span>}
+                      </button>
+                    ))}
                   </div>
                 )}
 
                 <form onSubmit={handleSendMessage}>
                   {replyToMessage && (
-                    <div className="flex items-center gap-2 px-3 py-1.5 mb-1 rounded-lg bg-stone-900/80 border border-stone-800 text-xs text-stone-400">
+                    <div className="flex items-center gap-2 px-3 py-1.5 mb-1 rounded-lg bg-stone-900/80 border border-stone-800 text-xs text-stone-400 anim-fade">
                       <Reply className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                       <span className="shrink-0">
                         <span className="text-amber-300 font-bold">{replyToMessage.sender_username || replyToMessage.username}</span> に返信
@@ -3304,7 +3587,7 @@ export default function App() {
                       </button>
                     </div>
                   )}
-                  <div className="flex items-end gap-2 bg-[#14161C] border border-stone-800 rounded-xl px-3 py-2 focus-within:border-amber-500/60 transition">
+                  <div className="flex items-end gap-2 bg-[#14161C] border border-stone-800 rounded-xl px-2.5 sm:px-3 py-2 focus-within:border-amber-500/60 transition">
                     <input
                       type="file"
                       accept="image/*"
@@ -3316,54 +3599,82 @@ export default function App() {
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
                       disabled={isUploading}
-                      title="画像添付 (自動WebP圧縮)"
-                      className="p-1 rounded-lg text-stone-400 hover:text-amber-400 transition"
+                      title="画像を送る"
+                      className="p-1 rounded-lg text-stone-400 hover:text-amber-400 hover:bg-stone-800"
                     >
                       {isUploading ? <RefreshCw className="w-4 h-4 animate-spin text-amber-400" /> : <Image className="w-4 h-4" />}
                     </button>
 
-                    <textarea
-                      ref={chatInputRef}
-                      rows={1}
-                      value={chatInput}
-                      onChange={e => {
-                        const val = e.target.value;
-                        setChatInput(val);
-                        // 入力に合わせて高さを自動調整 (最大約8行)
-                        e.target.style.height = 'auto';
-                        e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
-                        const lastAt = val.lastIndexOf('@');
-                        if (lastAt !== -1 && !val.substring(lastAt).includes(' ')) {
-                          setShowMentionSuggestions(true);
-                          setMentionFilter(val.substring(lastAt + 1));
-                        } else {
-                          setShowMentionSuggestions(false);
-                        }
-                      }}
-                      onKeyDown={e => {
-                        // 日本語IMEの変換確定Enterでは送信しない
-                        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-                        if (e.key === 'Enter' && !e.shiftKey) {
-                          // Enter: 送信 / Shift+Enter: 改行
-                          e.preventDefault();
-                          handleSendMessage(e);
-                          (e.target as HTMLTextAreaElement).style.height = 'auto';
-                        } else if (e.key === 'ArrowUp' && chatInput === '') {
-                          if (startEditLastOwnMessage()) e.preventDefault();
-                        } else if (e.key === 'Escape') {
-                          e.stopPropagation();
-                          if (showMentionSuggestions) setShowMentionSuggestions(false);
-                          else if (replyToMessage) setReplyToMessage(null);
-                          else if (chatInput) setChatInput('');
-                        }
-                      }}
-                      placeholder={`#${channels.find(c => c.id === activeChannelId)?.name || 'chat'} へメッセージ  (Shift+Enterで改行 / ↑で直前を編集)`}
-                      className="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 resize-none leading-relaxed max-h-[200px] py-0.5"
-                    />
+                    {/* メンションを色付けするため、同じ位置にハイライトだけの影を重ねる */}
+                    <div className="relative flex-1 min-w-0">
+                      <div
+                        ref={composerBackdropRef}
+                        aria-hidden="true"
+                        className="absolute inset-0 text-sm leading-relaxed py-0.5 whitespace-pre-wrap break-words text-transparent overflow-hidden pointer-events-none"
+                      >
+                        {renderComposerHighlight(chatInput, knownUsernames, channelByName)}
+                      </div>
+                      <textarea
+                        ref={chatInputRef}
+                        rows={1}
+                        value={chatInput}
+                        onChange={e => {
+                          const val = e.target.value;
+                          setChatInput(val);
+                          // 入力に合わせて高さを自動調整 (最大約8行)
+                          e.target.style.height = 'auto';
+                          e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
+                          updateCompletion(val, e.target.selectionStart);
+                          if (val.trim()) notifyTyping();
+                        }}
+                        onSelect={e => updateCompletion(e.currentTarget.value, e.currentTarget.selectionStart)}
+                        onScroll={e => {
+                          if (composerBackdropRef.current) composerBackdropRef.current.scrollTop = e.currentTarget.scrollTop;
+                        }}
+                        onBlur={() => setTimeout(() => setCompletion(null), 120)}
+                        onKeyDown={e => {
+                          // 日本語IMEの変換中は何もしない
+                          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                          const open = completion && completionItems.length > 0;
+                          if (open && (e.key === 'Tab' || e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+                            e.preventDefault();
+                            const dir = e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey) ? -1 : 1;
+                            const len = completionItems.length;
+                            setCompletion(c => (c ? { ...c, index: (((c.index % len) + dir) % len + len) % len } : c));
+                            return;
+                          }
+                          if (open && e.key === 'Enter') {
+                            e.preventDefault();
+                            applyCompletion(completionItems[completion!.index % completionItems.length]);
+                            return;
+                          }
+                          if (e.key === 'Tab') {
+                            e.preventDefault();
+                            return;
+                          }
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            // Enter: 送信 / Shift+Enter: 改行
+                            e.preventDefault();
+                            handleSendMessage(e);
+                            (e.target as HTMLTextAreaElement).style.height = 'auto';
+                          } else if (e.key === 'ArrowUp' && chatInput === '') {
+                            if (startEditLastOwnMessage()) e.preventDefault();
+                          } else if (e.key === 'Escape') {
+                            e.stopPropagation();
+                            if (completion) setCompletion(null);
+                            else if (replyToMessage) setReplyToMessage(null);
+                            else if (chatInput) setChatInput('');
+                          }
+                        }}
+                        placeholder={`#${activeChannelName} へメッセージ`}
+                        className="relative block w-full bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 resize-none leading-relaxed max-h-[200px] py-0.5"
+                      />
+                    </div>
                     <button
                       type="submit"
                       disabled={!chatInput.trim()}
-                      className="p-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black transition interactive-btn"
+                      className="p-1.5 rounded-lg btn-primary disabled:opacity-40"
+                      aria-label="送信"
                     >
                       <Send className="w-3.5 h-3.5" />
                     </button>
@@ -3372,9 +3683,9 @@ export default function App() {
               </div>
             </section>
 
-            {/* Right: Members Sidebar (Fixed width & scrollable) */}
+            {/* Right: Members Sidebar */}
             {!isMembersCollapsed && (
-              <aside className="w-48 sm:w-56 border-l border-stone-800 bg-[#0C0D10] p-3 hidden lg:flex flex-col shrink-0 min-h-0 overflow-y-auto">
+              <aside className="absolute lg:static inset-y-0 right-0 z-40 w-60 lg:w-56 border-l border-stone-800 bg-[#0C0D10] p-3 flex flex-col shrink-0 min-h-0 overflow-y-auto anim-slide-right lg:animate-none shadow-2xl lg:shadow-none">
                 {(['online', 'away', 'offline'] as const).map(group => {
                   const members = onlineUsers.filter(u =>
                     group === 'offline' ? (u.status !== 'online' && u.status !== 'away') : u.status === group
@@ -3387,24 +3698,29 @@ export default function App() {
                       </div>
                       <div className="space-y-0.5">
                         {members.map(u => (
-                          <div
+                          <button
                             key={u.id}
-                            className={`flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-900/60 text-sm ${
+                            type="button"
+                            onClick={() => {
+                              const insert = `@${u.username} `;
+                              setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
+                              if (window.innerWidth < 1024) setIsMembersCollapsed(true);
+                              requestAnimationFrame(() => chatInputRef.current?.focus());
+                            }}
+                            title={`@${u.username} をメンション`}
+                            className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left ${
                               group === 'offline' ? 'text-stone-600' : 'text-stone-200'
                             }`}
                           >
                             <div className="relative shrink-0">
-                              <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold uppercase border ${
-                                group === 'offline' ? 'bg-stone-900 text-stone-600 border-stone-800' : avatarColorFor(u.username)
-                              }`}>
-                                {u.username[0]}
-                              </div>
+                              <Avatar name={u.username} url={u.avatar_url} size="w-7 h-7 text-xs" dim={group === 'offline'} />
                               <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0C0D10] ${
                                 group === 'online' ? 'bg-emerald-400' : group === 'away' ? 'bg-amber-400' : 'bg-stone-600'
                               }`} />
                             </div>
                             <span className="truncate">{u.username}</span>
-                          </div>
+                            {u.id === currentUser.id && <span className="ml-auto text-[10px] text-stone-500">あなた</span>}
+                          </button>
                         ))}
                       </div>
                     </div>
@@ -3417,41 +3733,35 @@ export default function App() {
 
         {/* TAB 2: リアルタイムメモ */}
         {activeTab === 'memo' && (
-          <div className="flex-1 flex overflow-hidden">
-            <aside className="w-64 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex flex-col justify-between shrink-0 h-full overflow-hidden">
-              <div className="flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 min-h-0 flex overflow-hidden relative anim-tab">
+            {isMemoListOpen && <div className="absolute inset-0 bg-black/50 z-30 md:hidden anim-fade" onClick={() => setIsMemoListOpen(false)} />}
+            <aside className={`${isMemoListOpen ? 'flex anim-slide-left' : 'hidden'} md:flex absolute md:static inset-y-0 left-0 z-40 w-64 border-r border-stone-800/80 bg-[#0C0D10] p-3 flex-col shrink-0 overflow-hidden shadow-2xl md:shadow-none`}>
+              <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
                 {/* スロット1〜10: 共有メモ */}
                 <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold flex items-center justify-between shrink-0">
-                  <span>共有メモ (#1 ~ #10)</span>
+                  <span>共有メモ</span>
                   <FileText className="w-3.5 h-3.5 text-stone-500" />
                 </div>
-                <div className="space-y-1 overflow-y-auto max-h-[38vh] pr-1 mb-4">
+                <div className="space-y-1 overflow-y-auto max-h-[42%] pr-1 mb-4 shrink-0">
                   {memoSlots.filter(s => s.slot_index <= 10).map(slot => {
-                    const cleanTitle = slot.title ? slot.title.replace(/^メモ\s*#?\d+\s*:?\s*/, '') : '';
-                    const displayTitle = cleanTitle ? cleanTitle : `メモ`;
-
+                    const isSelected = selectedSlotIndex === slot.slot_index;
+                    const cleanTitle = (isSelected ? memoTitle : slot.title || '').replace(/^メモ\s*#?\d+\s*:?\s*/, '');
                     return (
                       <button
                         key={slot.slot_index}
-                        onClick={() => {
-                          setSelectedSlotIndex(slot.slot_index);
-                          setMemoTitle(slot.title);
-                          setMemoContent(slot.content);
-                          setMemoMode(slot.mode === 'monaco' ? 'markdown' : slot.mode);
-                          setMemoAssignedUser(null);
-                        }}
-                        className={`w-full flex items-center justify-between px-3 py-1.5 rounded-xl text-xs font-mono transition text-left ${
-                          selectedSlotIndex === slot.slot_index
-                            ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
-                            : 'bg-[#111214] border border-stone-800/80 text-stone-400 hover:text-stone-200 hover:border-stone-700'
+                        onClick={() => selectMemoSlot(slot)}
+                        className={`w-full flex items-center justify-between px-3 py-1.5 rounded-xl text-xs font-mono text-left border ${
+                          isSelected
+                            ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                            : 'bg-[#111214] border-stone-800/80 text-stone-400 hover:text-stone-100 hover:border-stone-600 hover:bg-stone-900'
                         }`}
                       >
                         <div className="flex items-center gap-2 truncate min-w-0">
                           <span className="text-amber-500/80 font-bold shrink-0">#{slot.slot_index}</span>
-                          <span className="truncate">{displayTitle}</span>
+                          <span className="truncate">{cleanTitle || 'メモ'}</span>
                         </div>
-                        <span className="text-[10px] text-stone-600 uppercase shrink-0 font-mono">
-                          {slot.mode || 'md'}
+                        <span className="text-[10px] text-stone-600 uppercase shrink-0">
+                          {slot.mode === 'plain' ? 'txt' : 'md'}
                         </span>
                       </button>
                     );
@@ -3460,47 +3770,32 @@ export default function App() {
 
                 {/* スロット11以降: メンバー専用Monacoエディタ */}
                 <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold flex items-center justify-between shrink-0 border-t border-stone-800/80 pt-3">
-                  <span>専用コードゾーン (Monaco)</span>
+                  <span>専用コードゾーン</span>
                   <Code className="w-3.5 h-3.5 text-stone-500" />
                 </div>
-                <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+                <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1">
                   {memoSlots.filter(s => s.slot_index >= 11).map(slot => {
                     const isMySlot = slot.assigned_user_id === currentUser?.id;
                     const assignedName = (slot as any).assigned_username || `ユーザー${slot.assigned_user_id || ''}`;
-
                     return (
                       <button
                         key={slot.slot_index}
-                        onClick={() => {
-                          setSelectedSlotIndex(slot.slot_index);
-                          setMemoTitle(slot.title);
-                          setMemoContent(slot.content);
-                          setMemoMode('monaco');
-                          setMemoAssignedUser(slot.assigned_user_id || null);
-                        }}
-                        className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-mono transition text-left ${
+                        onClick={() => selectMemoSlot(slot)}
+                        className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-mono text-left border ${
                           selectedSlotIndex === slot.slot_index
-                            ? 'bg-amber-500/15 text-amber-300 border border-amber-500/40 shadow-sm'
-                            : 'bg-[#111214] border border-stone-800/80 text-stone-400 hover:text-stone-200 hover:border-stone-700'
+                            ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 shadow-sm'
+                            : 'bg-[#111214] border-stone-800/80 text-stone-400 hover:text-stone-100 hover:border-stone-600 hover:bg-stone-900'
                         }`}
                       >
                         <div className="flex items-center gap-2 truncate min-w-0">
-                          <Code className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                          <span className="truncate font-bold text-white">
-                            {assignedName}
-                          </span>
+                          <Avatar name={assignedName} url={slot.assigned_user_id ? userById.get(slot.assigned_user_id)?.avatar_url : null} size="w-5 h-5 text-[10px]" />
+                          <span className="truncate font-bold text-white">{assignedName}</span>
                         </div>
-                        <div className="flex items-center gap-1 shrink-0 ml-1">
-                          {isMySlot ? (
-                            <span className="text-[9px] bg-emerald-950/60 border border-emerald-800/80 text-emerald-300 px-1.5 py-0.2 rounded font-mono">
-                              あなた
-                            </span>
-                          ) : (
-                            <span className="text-[9px] bg-stone-900 border border-stone-800 text-stone-500 px-1.5 py-0.2 rounded font-mono flex items-center gap-0.5">
-                              <Lock className="w-2.5 h-2.5" /> 閲覧専用
-                            </span>
-                          )}
-                        </div>
+                        {isMySlot ? (
+                          <span className="text-[9px] bg-emerald-950/60 border border-emerald-800/80 text-emerald-300 px-1.5 rounded shrink-0">あなた</span>
+                        ) : (
+                          <Lock className="w-3 h-3 text-stone-600 shrink-0" />
+                        )}
                       </button>
                     );
                   })}
@@ -3508,42 +3803,56 @@ export default function App() {
               </div>
             </aside>
 
-            <section className="flex-1 flex flex-col bg-[#090A0C] p-4">
-              <div className="flex items-center justify-between mb-3 border-b border-stone-800/80 pb-3">
+            <section className="flex-1 min-w-0 min-h-0 flex flex-col bg-[#090A0C] p-2 sm:p-4">
+              <div className="flex flex-wrap items-center gap-2 mb-2 sm:mb-3 border-b border-stone-800/80 pb-2 sm:pb-3">
+                <button
+                  onClick={() => setIsMemoListOpen(true)}
+                  className="md:hidden p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-300 hover:text-white"
+                  aria-label="メモ一覧"
+                >
+                  <Menu className="w-4 h-4" />
+                </button>
+                <span className="text-amber-500/80 font-bold font-mono text-sm shrink-0">#{selectedSlotIndex}</span>
                 <input
                   type="text"
                   disabled={isMonacoLocked}
                   value={memoTitle}
-                  onChange={e => setMemoTitle(e.target.value)}
-                  placeholder="タイトルを入力..."
-                  className="bg-transparent text-xl font-bold font-['Space_Grotesk'] text-white focus:outline-none flex-1 mr-4 disabled:opacity-50"
+                  onChange={e => handleMemoTitleChange(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                      e.preventDefault();
+                      handleSaveMemo();
+                    }
+                  }}
+                  placeholder="タイトル"
+                  className="bg-transparent text-lg sm:text-xl font-bold font-['Space_Grotesk'] text-white focus:outline-none flex-1 min-w-[8rem] disabled:opacity-50 rounded-lg px-1 hover:bg-stone-900/60 focus:bg-stone-900/60"
                 />
 
-                <div className="flex items-center gap-2 font-mono text-xs">
+                <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs">
                   {isMonacoLocked && (
                     <span className="text-red-400 flex items-center gap-1 bg-red-950/40 border border-red-800/60 px-2.5 py-1 rounded-lg">
-                      <Lock className="w-3 h-3" /> 他ユーザーの専用ゾーン（閲覧専用）
+                      <Lock className="w-3 h-3" /> 閲覧のみ
                     </span>
                   )}
 
                   {/* 自動保存インジケーター */}
-                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-stone-900 border border-stone-800 text-[11px] font-mono">
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-stone-900 border border-stone-800 text-[11px]" title={memoAutoSaveInterval === 0 ? '自動保存はオフです (設定で変更できます)' : undefined}>
                     <span className={`w-2 h-2 rounded-full ${autoSaveStatus === 'saving' ? 'bg-amber-400 animate-pulse' : autoSaveStatus === 'dirty' ? 'bg-orange-500' : 'bg-emerald-400'}`} />
                     <span className="text-stone-400">
-                      {autoSaveStatus === 'saving' ? '自動保存中...' : autoSaveStatus === 'dirty' ? '未保存' : '自動保存済み'}
+                      {autoSaveStatus === 'saving' ? '保存中…' : autoSaveStatus === 'dirty' ? '未保存' : '保存済み'}
                     </span>
                   </div>
 
                   {selectedSlotIndex <= 10 ? (
-                    <div className="flex items-center gap-1.5">
+                    <>
                       <select
                         value={memoMode}
                         disabled={isMonacoLocked}
-                        onChange={e => setMemoMode(e.target.value as any)}
-                        className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2.5 py-1.5 focus:outline-none disabled:opacity-50 text-xs font-mono"
+                        onChange={e => handleMemoModeChange(e.target.value as any)}
+                        className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2 py-1.5 focus:outline-none disabled:opacity-50 text-xs hover:border-stone-600"
                       >
-                        <option value="markdown">Markdownモード</option>
-                        <option value="plain">プレーンテキスト</option>
+                        <option value="markdown">Markdown</option>
+                        <option value="plain">テキスト</option>
                       </select>
 
                       {memoMode === 'markdown' && (
@@ -3551,76 +3860,80 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => setMemoViewMode('split')}
-                            className={`px-2 py-1 rounded text-[11px] font-mono flex items-center gap-1 transition ${
+                            className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 ${
                               memoViewMode === 'split' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
                             }`}
-                            title="編集とプレビューの2分割表示"
                           >
-                            <Book className="w-3 h-3" />
-                            <span>分割編集</span>
+                            <Edit3 className="w-3 h-3" />
+                            <span>編集</span>
                           </button>
                           <button
                             type="button"
                             onClick={() => setMemoViewMode('view_only')}
-                            className={`px-2 py-1 rounded text-[11px] font-mono flex items-center gap-1 transition ${
+                            className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 ${
                               memoViewMode === 'view_only' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
                             }`}
-                            title="大画面でマークダウンを綺麗に閲覧"
                           >
                             <Eye className="w-3 h-3" />
-                            <span>閲覧専用</span>
+                            <span>表示</span>
                           </button>
                         </div>
                       )}
-                    </div>
+                    </>
                   ) : (
-                    <span className="text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-lg text-xs font-mono font-bold flex items-center gap-1">
-                      <Code className="w-3 h-3" /> Monaco Editor
+                    <span className="text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1">
+                      <Code className="w-3 h-3" /> コード
                     </span>
                   )}
 
-                  {/* Memo AI Assistants */}
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => handleMemoAiAssist('summarize')}
-                      disabled={isMemoAiLoading || !memoContent.trim()}
-                      className="px-2.5 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 rounded-lg transition disabled:opacity-40 flex items-center gap-1 text-[11px]"
-                      title="メモの内容を要約"
-                    >
-                      <Sparkles className="w-3 h-3 text-amber-400" />
-                      <span>{isMemoAiLoading ? '要約中...' : 'AI要約'}</span>
-                    </button>
-                    <button
-                      onClick={() => handleMemoAiAssist('proofread')}
-                      disabled={isMemoAiLoading || !memoContent.trim()}
-                      className="px-2.5 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 rounded-lg transition disabled:opacity-40 flex items-center gap-1 text-[11px]"
-                      title="誤字脱字・表現の校正"
-                    >
-                      <CheckCircle2 className="w-3 h-3 text-amber-400" />
-                      <span>AI校正</span>
-                    </button>
-                    <button
-                      onClick={() => handleMemoAiAssist('explain_code')}
-                      disabled={isMemoAiLoading || !memoContent.trim()}
-                      className="px-2.5 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 rounded-lg transition disabled:opacity-40 flex items-center gap-1 text-[11px]"
-                      title="コードの解説"
-                    >
-                      <Bot className="w-3 h-3 text-amber-400" />
-                      <span>コード解説</span>
-                    </button>
+                  {/* Memo AI */}
+                  <div className="flex items-center gap-1" title={aiLock.inSchool ? `授業時間中は AI を使えません (${aiLock.until} まで)` : undefined}>
+                    {selectedSlotIndex <= 10 ? (
+                      <>
+                        <button
+                          onClick={() => handleMemoAiAssist('summarize')}
+                          disabled={isMemoAiLoading || !memoContent.trim() || aiLock.inSchool}
+                          className="btn-chip text-[11px] disabled:opacity-40"
+                        >
+                          <Sparkles className="w-3 h-3 text-amber-400" /> {isMemoAiLoading ? '処理中…' : '要約'}
+                        </button>
+                        <button
+                          onClick={() => handleMemoAiAssist('proofread')}
+                          disabled={isMemoAiLoading || !memoContent.trim() || aiLock.inSchool || isMonacoLocked}
+                          className="btn-chip text-[11px] disabled:opacity-40"
+                        >
+                          <CheckCircle2 className="w-3 h-3 text-amber-400" /> 校正
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={() => handleMemoAiAssist('explain_code')}
+                        disabled={isMemoAiLoading || !memoContent.trim() || aiLock.inSchool}
+                        className="btn-chip text-[11px] disabled:opacity-40"
+                      >
+                        <Bot className="w-3 h-3 text-amber-400" /> {isMemoAiLoading ? '処理中…' : 'コード解説'}
+                      </button>
+                    )}
+                    {aiLock.inSchool && <Lock className="w-3 h-3 text-stone-600" />}
                   </div>
+
+                  {memoUndo && memoUndo.slot === selectedSlotIndex && (
+                    <button onClick={undoMemoAi} className="btn-chip text-[11px] !border-amber-500/40 !text-amber-300 anim-pop">
+                      <Undo2 className="w-3 h-3" /> 校正前に戻す
+                    </button>
+                  )}
 
                   <button
                     onClick={() => handleSaveMemo()}
                     disabled={isSavingMemo || isMonacoLocked}
-                    className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition interactive-btn uppercase disabled:opacity-50"
+                    className="px-3 py-1.5 btn-primary font-bold rounded-lg disabled:opacity-50"
                   >
-                    {isSavingMemo ? '保存中...' : '手動保存'}
+                    {isSavingMemo ? '保存中…' : '保存'}
                   </button>
                 </div>
               </div>
 
-              <div className="flex-1 flex gap-4 overflow-hidden rounded-2xl border border-stone-800/80 bg-[#111214]">
+              <div className="flex-1 min-h-0 flex overflow-hidden rounded-2xl border border-stone-800/80 bg-[#111214]">
                 {memoMode === 'monaco' ? (
                   <div className="w-full h-full rounded-2xl overflow-hidden">
                     <Editor
@@ -3639,57 +3952,46 @@ export default function App() {
                     />
                   </div>
                 ) : memoMode === 'plain' ? (
-                  /* プレーンテキスト選択時: Markdown Live Previewは非表示で全幅編集 */
-                  <div className="flex-1 p-4 overflow-hidden">
+                  <div className="flex-1 p-2 sm:p-4 overflow-hidden">
                     <textarea
                       value={memoContent}
+                      readOnly={isMonacoLocked}
                       onChange={e => handleMemoContentChange(e.target.value)}
-                      placeholder="プレーンテキストを入力..."
-                      className="w-full h-full bg-[#16181D] border border-stone-800 rounded-xl p-4 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
+                      onKeyDown={handleMemoTextareaKeyDown}
+                      placeholder="テキストを入力"
+                      className="w-full h-full bg-[#16181D] border border-stone-800 rounded-xl p-3 sm:p-4 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
                     />
                   </div>
                 ) : memoViewMode === 'view_only' ? (
-                  /* Markdown閲覧専用モード: 大画面で実際のMarkdownを快適に読む */
-                  <div className="flex-1 p-6 overflow-y-auto">
-                    <div className="max-w-4xl mx-auto bg-[#16181D]/80 border border-stone-800 rounded-2xl p-6 sm:p-8 text-stone-200 font-sans leading-relaxed prose prose-invert max-w-none shadow-xl">
-                      <div className="flex items-center justify-between pb-3 mb-4 border-b border-stone-800 text-xs font-mono text-stone-400">
-                        <span className="flex items-center gap-1.5 text-amber-400 font-bold">
-                          <Eye className="w-3.5 h-3.5" /> MARKDOWN VIEW-ONLY MODE
-                        </span>
-                        <button
-                          onClick={() => setMemoViewMode('split')}
-                          className="px-2.5 py-1 rounded bg-stone-900 border border-stone-700 hover:border-amber-500 text-stone-300 hover:text-white transition"
-                        >
-                          編集モードに戻る
-                        </button>
-                      </div>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {memoContent || '（内容がありません）'}
-                      </ReactMarkdown>
+                  <div className="flex-1 p-3 sm:p-6 overflow-y-auto">
+                    <div className="max-w-4xl mx-auto markdown-body text-stone-200 text-[15px] anim-fade">
+                      {memoContent ? (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{memoContent}</ReactMarkdown>
+                      ) : (
+                        <p className="text-stone-600">まだ何も書かれていません</p>
+                      )}
                     </div>
                   </div>
                 ) : (
-                  /* Markdown 2分割編集モード */
-                  <div className="flex-1 flex gap-4 p-4 overflow-hidden">
+                  /* Markdown 編集 + プレビュー (スマホは縦並び) */
+                  <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-2 sm:gap-4 p-2 sm:p-4 overflow-hidden">
                     <textarea
                       value={memoContent}
+                      readOnly={isMonacoLocked}
                       onChange={e => handleMemoContentChange(e.target.value)}
-                      placeholder="Markdownテキストを入力..."
-                      className="flex-1 h-full bg-[#16181D] border border-stone-800 rounded-xl p-3.5 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
+                      onKeyDown={handleMemoTextareaKeyDown}
+                      placeholder="Markdown で書けます (# 見出し、- 箇条書き など)"
+                      className="flex-1 min-h-0 bg-[#16181D] border border-stone-800 rounded-xl p-3 sm:p-3.5 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
                     />
-                    <div className="flex-1 h-full bg-[#16181D]/60 border border-stone-800 rounded-xl p-4 text-stone-300 font-sans text-sm overflow-y-auto leading-relaxed prose prose-invert max-w-none">
-                      <div className="flex items-center justify-between text-[10px] font-mono text-stone-500 mb-2 border-b border-stone-800 pb-1">
-                        <span>MARKDOWN LIVE PREVIEW</span>
-                        <button
-                          onClick={() => setMemoViewMode('view_only')}
-                          className="hover:text-amber-400 transition"
-                        >
-                          [全画面閲覧]
-                        </button>
+                    <div className="flex-1 min-h-0 bg-[#16181D]/60 border border-stone-800 rounded-xl p-3 sm:p-4 text-stone-300 text-sm overflow-y-auto">
+                      <div className="text-[10px] font-mono text-stone-500 mb-2 pb-1 border-b border-stone-800">プレビュー</div>
+                      <div className="markdown-body">
+                        {memoContent ? (
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{memoContent}</ReactMarkdown>
+                        ) : (
+                          <p className="text-stone-600">まだ何も書かれていません</p>
+                        )}
                       </div>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {memoContent || '（内容がありません）'}
-                      </ReactMarkdown>
                     </div>
                   </div>
                 )}
@@ -3698,251 +4000,52 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: AI (Gemini Console) */}
-        {activeTab === 'ai' && (
-          <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#0C0D10]/50">
-            {/* Header / Config Bar */}
-            <div className="h-12 border-b border-stone-800/80 px-4 flex items-center justify-between font-mono text-xs bg-[#111214]">
-              <div className="flex items-center gap-2">
-                <Bot className="w-4 h-4 text-amber-400" />
-                <span className="font-bold text-white">Gemini AI Console</span>
-                <span className="text-[10px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/60 px-2 py-0.5 rounded-full">
-                  キープール稼働中
-                </span>
-              </div>
-              <div className="flex items-center gap-3">
-                <label className="flex items-center gap-1.5 cursor-pointer text-stone-400 hover:text-stone-200">
-                  <input
-                    type="checkbox"
-                    checked={includeContextInAi}
-                    onChange={e => setIncludeContextInAi(e.target.checked)}
-                    className="accent-amber-500 rounded"
-                  />
-                  <span className="text-[11px]">システム情報(JSON)を渡す</span>
-                </label>
-                <button
-                  onClick={() => setAiMessages([{
-                    id: Date.now(),
-                    role: 'model',
-                    content: '会話履歴をリセットしました。何かお手伝いできることはありますか？',
-                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                  }])}
-                  className="p-1 hover:text-amber-400 text-stone-500 rounded transition"
-                  title="履歴をクリア"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </div>
+        {/* TAB 3: AI (切り替えても会話・応答待ちが消えないよう常に保持) */}
+        <div className={activeTab === 'ai' ? 'flex-1 min-h-0 flex anim-tab' : 'hidden'}>
+          <AiTab
+            active={activeTab === 'ai'}
+            userId={currentUser.id}
+            token={token}
+            safeFetch={safeFetch}
+            buildContext={buildAiContext}
+            lock={aiLock}
+            memo={{ slot: selectedSlotIndex, title: memoTitle, content: memoContent }}
+            onAppendToMemo={text => {
+              const next = memoContent ? `${memoContent}\n\n---\n${text}` : text;
+              handleMemoContentChange(next);
+            }}
+          />
+        </div>
 
-            {/* AI Messages Stream */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-6xl w-full mx-auto">
-              {aiMessages.map(msg => (
-                <div
-                  key={msg.id}
-                  className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                >
-                  {msg.role === 'model' && (
-                    <div className="w-7 h-7 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0 mt-0.5">
-                      <Bot className="w-4 h-4" />
-                    </div>
-                  )}
-                  <div
-                    className={`max-w-[85%] rounded-2xl p-4 text-xs font-mono leading-relaxed shadow-lg break-words min-w-0 overflow-hidden ${
-                      msg.role === 'user'
-                        ? 'bg-amber-500 text-black font-semibold'
-                        : 'bg-[#14161C] border border-stone-800/80 text-stone-200'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-4 mb-1.5 opacity-60 text-[10px]">
-                      <span>{msg.role === 'user' ? 'あなた' : 'Gemini AI'}</span>
-                      <span>{msg.timestamp}</span>
-                    </div>
-                    {msg.role === 'user' ? (
-                      <div className="whitespace-pre-wrap">{msg.content}</div>
-                    ) : (
-                      <>
-                        <div className="prose prose-invert prose-xs max-w-none overflow-x-auto">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {msg.content}
-                          </ReactMarkdown>
-                        </div>
-                        {/* メモ連携アクションバー */}
-                        <div className="mt-3 pt-2.5 border-t border-stone-800/80 flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              handleMemoContentChange(msg.content);
-                              alert(`現在のメモ(#${selectedSlotIndex})にAIの回答を反映しました！`);
-                            }}
-                            className="px-2 py-1 rounded bg-stone-900 border border-stone-800 hover:border-emerald-500/50 text-stone-300 hover:text-emerald-400 text-[10px] transition flex items-center gap-1 font-mono"
-                            title="現在のメモをこの回答で上書き"
-                          >
-                            <FileText className="w-3 h-3 text-emerald-400" />
-                            <span>メモに反映(上書き)</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const newContent = memoContent ? `${memoContent}\n\n---\n${msg.content}` : msg.content;
-                              handleMemoContentChange(newContent);
-                              alert(`現在のメモ(#${selectedSlotIndex})の末尾に追記しました！`);
-                            }}
-                            className="px-2 py-1 rounded bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 text-[10px] transition flex items-center gap-1 font-mono"
-                            title="現在のメモの末尾にこの回答を追記"
-                          >
-                            <Plus className="w-3 h-3 text-amber-400" />
-                            <span>メモに追記</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              navigator.clipboard.writeText(msg.content);
-                              alert('クリップボードにコピーしました！');
-                            }}
-                            className="px-2 py-1 rounded bg-stone-900 border border-stone-800 hover:border-stone-600 text-stone-400 hover:text-white text-[10px] transition flex items-center gap-1 font-mono"
-                          >
-                            <Copy className="w-3 h-3" />
-                            <span>コピー</span>
-                          </button>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </div>
-              ))}
-              {isLoadingAi && (
-                <div className="flex gap-3 justify-start">
-                  <div className="w-7 h-7 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0 mt-0.5">
-                    <Bot className="w-4 h-4 animate-spin" />
-                  </div>
-                  <div className="bg-[#14161C] border border-stone-800/80 rounded-2xl p-4 text-xs font-mono text-stone-400 flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-amber-400 animate-pulse" />
-                    <span>Geminiが回答を生成中...</span>
-                  </div>
-                </div>
-              )}
-              <div ref={aiEndRef} />
-            </div>
-
-            {/* Input Form: Fixed at bottom with shrink-0 */}
-            <div className="p-4 border-t border-stone-800/80 bg-[#111214] shrink-0">
-              <div className="max-w-6xl mx-auto mb-2 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-stone-400">
-                <div className="flex items-center gap-2">
-                  <span className="text-stone-500">選択中メモ:</span>
-                  <span className="text-amber-400 font-bold">#{selectedSlotIndex} {memoTitle || 'メモ'}</span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (!memoContent.trim()) {
-                        alert('現在のメモに本文がありません。');
-                        return;
-                      }
-                      const quote = `【#${selectedSlotIndex} ${memoTitle || 'メモ'}の内容】\n${memoContent}\n\n`;
-                      setAiInput(prev => quote + prev);
-                    }}
-                    className="px-2 py-0.5 rounded bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 transition flex items-center gap-1"
-                    title="現在のメモの内容を質問欄に引用"
-                  >
-                    <FileText className="w-3 h-3 text-amber-400" />
-                    <span>メモ内容を引用して質問</span>
-                  </button>
-                </div>
-                <div className="text-[10px] text-stone-500 flex items-center gap-1">
-                  <span>※質問内で <code className="text-amber-400/80">#メモ名</code> や <code className="text-amber-400/80">#チャンネル名</code> を含めると自動参照されます</span>
-                </div>
-              </div>
-              <form onSubmit={handleSendAiMessage} className="max-w-6xl mx-auto flex gap-2">
-                <input
-                  type="text"
-                  placeholder="Geminiに質問を入力 (#メモ名 や #チャンネル名 でDB自動取得)..."
-                  value={aiInput}
-                  onChange={e => setAiInput(e.target.value)}
-                  disabled={isLoadingAi}
-                  className="flex-1 bg-[#16181D] border border-stone-800 rounded-xl px-4 py-2.5 text-xs text-stone-200 font-mono focus:outline-none focus:border-amber-500/50"
-                />
-                <button
-                  type="submit"
-                  disabled={isLoadingAi || !aiInput.trim()}
-                  className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-bold rounded-xl text-xs font-mono transition flex items-center gap-1.5"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                  <span>送信</span>
-                </button>
-              </form>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 4: 提出物 & 時間割 (Phase 3 Full Feature) */}
+        {/* TAB 4: 提出物 */}
         {activeTab === 'assignments' && (
-          <div className="flex-1 p-6 overflow-y-auto">
-            <div className="max-w-4xl mx-auto space-y-6">
-              {/* Header & 時程切り替え */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-stone-800/80 pb-4">
-                <div>
-                  <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">提出物 & 時間割</h2>
-                  <p className="text-xs text-stone-400 font-mono">
-                    締め切り管理・再提出締め切り・教科フィルター・全員合格アーカイブ機能
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-1.5 font-mono text-xs bg-[#111214] p-1 rounded-xl border border-stone-800">
-                  <button
-                    onClick={() => handleSetTodaySchedule('normal')}
-                    title="今日の時程 (全員共通) を切り替え"
-                    className={`px-3 py-1.5 rounded-lg transition ${
-                      todaySchedule === 'normal' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
-                    }`}
-                  >
-                    通常時程
-                  </button>
-                  <button
-                    onClick={() => handleSetTodaySchedule('short')}
-                    title="今日の時程 (全員共通) を切り替え"
-                    className={`px-3 py-1.5 rounded-lg transition ${
-                      todaySchedule === 'short' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
-                    }`}
-                  >
-                    短縮時程
-                  </button>
-                  <button
-                    onClick={() => handleSetTodaySchedule('s_short')}
-                    title="今日の時程 (全員共通) を切り替え"
-                    className={`px-3 py-1.5 rounded-lg transition ${
-                      todaySchedule === 's_short' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
-                    }`}
-                  >
-                    S短時程
-                  </button>
-                </div>
+          <div className="flex-1 p-3 sm:p-6 overflow-y-auto anim-tab">
+            <div className="max-w-4xl mx-auto space-y-4 sm:space-y-5">
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-xl sm:text-2xl font-bold font-['Space_Grotesk'] text-white">提出物</h2>
+                <button
+                  onClick={() => setIsAssignFormOpen(v => !v)}
+                  className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold ${isAssignFormOpen ? 'btn-ghost' : 'btn-primary'}`}
+                >
+                  {isAssignFormOpen ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                  {isAssignFormOpen ? '閉じる' : '提出物を追加'}
+                </button>
               </div>
 
-              {/* 提出物作成フォーム (簡易入力・選択肢充実) */}
-              <form onSubmit={handleCreateAssignment} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 sm:p-5 space-y-3 font-mono text-xs shadow-lg">
-                <div className="flex items-center justify-between text-stone-300 font-bold uppercase tracking-wider">
-                  <span className="flex items-center gap-1.5 text-white">
-                    <Plus className="w-4 h-4 text-amber-400" /> 新規提出物の登録
-                  </span>
-                  <span className="text-[10px] text-stone-500 font-normal">ワンタップ入力対応</span>
-                </div>
-
-                {/* クイック教科選択ボタン */}
-                <div className="space-y-1.5 bg-[#16181D]/60 p-2.5 rounded-xl border border-stone-800/60">
-                  <div className="text-[10px] text-stone-400 font-bold flex items-center justify-between">
-                    <span>教科クイック選択:</span>
-                    <span className="text-amber-400 font-bold">{newAssignSubject}</span>
-                  </div>
+              {isAssignFormOpen && (
+              <form onSubmit={handleCreateAssignment} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 sm:p-5 space-y-3 font-mono text-xs shadow-lg anim-pop">
+                <div className="space-y-1.5">
+                  <div className="text-[10px] text-stone-400 font-bold">教科</div>
                   <div className="flex flex-wrap gap-1.5">
-                    {['国語', '数学', '英語', '理科', '社会', '情報', '体育', '美術', '音楽', '技家', '総合', 'その他'].map(subj => (
+                    {[...SUBJECTS, 'その他'].map(subj => (
                       <button
                         type="button"
                         key={subj}
                         onClick={() => setNewAssignSubject(subj)}
-                        className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${
+                        className={`px-2.5 py-1 rounded-lg border text-[11px] ${
                           newAssignSubject === subj
                             ? 'bg-amber-500 text-black font-bold border-amber-400 shadow-sm'
-                            : 'bg-[#111214] text-stone-300 border-stone-800 hover:border-stone-600'
+                            : 'bg-[#16181D] text-stone-300 border-stone-800 hover:border-stone-500 hover:text-white'
                         }`}
                       >
                         {subj}
@@ -3951,44 +4054,40 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* クイック課題プリセットボタン */}
-                <div className="space-y-1.5 bg-[#16181D]/60 p-2.5 rounded-xl border border-stone-800/60">
-                  <span className="text-[10px] text-stone-400 font-bold block">課題名プリセット:</span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {[
-                      { label: '教科書ワーク', prefix: 'ワーク P.' },
-                      { label: '授業プリント', prefix: 'プリント提出' },
-                      { label: 'レポート課題', prefix: 'レポート' },
-                      { label: 'ノート提出', prefix: 'ノート点検' },
-                      { label: 'Web小テスト', prefix: 'Webテスト' },
-                      { label: '週末課題', prefix: '週末課題' },
-                    ].map(preset => (
-                      <button
-                        type="button"
-                        key={preset.label}
-                        onClick={() => setNewAssignTitle(prev => prev ? `${preset.prefix} (${prev})` : preset.prefix)}
-                        className="px-2 py-0.5 rounded-md bg-[#111214] border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-amber-500/50 text-[10px] transition"
-                      >
-                        +{preset.label}
-                      </button>
-                    ))}
-                  </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    { label: 'ワーク', prefix: 'ワーク P.' },
+                    { label: 'プリント', prefix: 'プリント' },
+                    { label: 'レポート', prefix: 'レポート' },
+                    { label: 'ノート', prefix: 'ノート提出' },
+                    { label: '週末課題', prefix: '週末課題' },
+                  ].map(preset => (
+                    <button
+                      type="button"
+                      key={preset.label}
+                      onClick={() => setNewAssignTitle(prev => prev ? `${preset.prefix} (${prev})` : preset.prefix)}
+                      className="btn-chip text-[10px]"
+                    >
+                      +{preset.label}
+                    </button>
+                  ))}
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div className="sm:col-span-1">
-                    <label className="text-[10px] text-stone-400 block mb-1">課題タイトル *</label>
+                    <label className="text-[10px] text-stone-400 block mb-1">タイトル *</label>
                     <input
                       type="text"
                       required
-                      placeholder="例: 数学I ワーク P.40-45"
+                      autoFocus
+                      placeholder="例: ワーク P.40-45"
                       value={newAssignTitle}
                       onChange={e => setNewAssignTitle(e.target.value)}
                       className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] text-stone-400 block mb-1">提出締切日 *</label>
+                    <label className="text-[10px] text-stone-400 block mb-1">締切日 *</label>
                     <input
                       type="date"
                       required
@@ -3998,7 +4097,7 @@ export default function App() {
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] text-stone-400 block mb-1">再提出締切日 (任意)</label>
+                    <label className="text-[10px] text-stone-400 block mb-1">再提出締切日</label>
                     <input
                       type="date"
                       value={newAssignResubmitDeadline}
@@ -4009,26 +4108,26 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="text-[10px] text-stone-400 block mb-1">指示文・持ち物・注意事項 (Gemini AI要約対応)</label>
+                  <label className="text-[10px] text-stone-400 block mb-1">内容・注意事項</label>
                   <textarea
-                    placeholder="問題番号、提出形式、注意点など。AIが自動要約してフローティング表示できます"
+                    placeholder="問題番号、提出方法など"
                     value={newAssignDesc}
                     onChange={e => setNewAssignDesc(e.target.value)}
-                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-3 text-white focus:outline-none focus:border-amber-500/60 resize-none h-18 text-xs font-mono"
+                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-3 text-white focus:outline-none focus:border-amber-500/60 resize-none h-20 text-xs font-mono"
                   />
                 </div>
 
                 <button
                   type="submit"
-                  className="w-full sm:w-auto px-6 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition interactive-btn uppercase tracking-wider"
+                  className="w-full sm:w-auto px-6 py-2 btn-primary font-bold rounded-xl"
                 >
-                  提出物を追加登録
+                  登録
                 </button>
               </form>
+              )}
 
               {/* フィルター */}
               <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
-                <span className="text-stone-500">Filter:</span>
                 {[
                   { id: 'all', label: 'すべて' },
                   { id: 'unstarted', label: '未着手' },
@@ -4039,10 +4138,10 @@ export default function App() {
                   <button
                     key={f.id}
                     onClick={() => setAssignmentFilter(f.id as any)}
-                    className={`px-2.5 py-1 rounded-lg border transition ${
+                    className={`px-2.5 py-1 rounded-lg border ${
                       assignmentFilter === f.id
                         ? 'bg-amber-500/10 text-amber-400 border-amber-500/40 font-bold'
-                        : 'bg-[#111214] text-stone-400 border-stone-800 hover:border-stone-700'
+                        : 'bg-[#111214] text-stone-400 border-stone-800 hover:border-stone-500 hover:text-white'
                     }`}
                   >
                     {f.label}
@@ -4054,7 +4153,7 @@ export default function App() {
               <div className="space-y-3">
                 {filteredAssignments.length === 0 ? (
                   <div className="p-8 text-center text-stone-600 font-mono text-xs border border-dashed border-stone-800 rounded-2xl">
-                    表示できる提出物はありません。
+                    提出物はありません
                   </div>
                 ) : (
                   filteredAssignments.map((item) => {
@@ -4063,7 +4162,7 @@ export default function App() {
                     const totalMembers = membersProg.length;
 
                     return (
-                      <div key={item.id} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4.5 interactive-card space-y-3 shadow-lg">
+                      <div key={item.id} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 interactive-card space-y-3 shadow-lg anim-fade">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                           <div className="flex items-center gap-2.5 flex-wrap">
                             <span className="px-2.5 py-0.5 rounded-lg text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 font-bold">
@@ -4128,7 +4227,17 @@ export default function App() {
                         </div>
 
                         <div className="flex flex-wrap items-center gap-4 text-xs font-mono text-stone-400">
-                          <div>締切: <span className="text-stone-200 font-bold">{new Date(item.deadline).toLocaleDateString()}</span></div>
+                          <div>締切: <span className="text-stone-200 font-bold">{new Date(item.deadline).toLocaleDateString()}</span>
+                            {(() => {
+                              const days = Math.ceil((new Date(item.deadline).setHours(23, 59, 59) - now.getTime()) / 86400000);
+                              if (item.my_status === 'submitted' || item.my_status === 'passed') return null;
+                              return (
+                                <span className={`ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${days < 0 ? 'bg-red-500/20 text-red-300' : days <= 1 ? 'bg-amber-500/20 text-amber-300' : 'bg-stone-800 text-stone-400'}`}>
+                                  {days < 0 ? '期限切れ' : days === 0 ? '今日まで' : days === 1 ? '明日まで' : `あと${days}日`}
+                                </span>
+                              );
+                            })()}
+                          </div>
                           {item.resubmit_deadline && (
                             <div>再提出締切: <span className="text-amber-300 font-bold">{new Date(item.resubmit_deadline).toLocaleDateString()}</span></div>
                           )}
@@ -4145,18 +4254,19 @@ export default function App() {
                           <div className="flex items-center justify-between">
                             <button
                               onClick={() => handleSummarizeAssignment(item)}
-                              disabled={isSummarizingAI === item.id || !item.description}
-                              className="text-xs font-mono flex items-center gap-1.5 text-amber-400 hover:text-amber-300 disabled:opacity-40 transition"
+                              disabled={isSummarizingAI === item.id || !item.description || aiLock.inSchool}
+                              title={aiLock.inSchool ? `授業時間中は AI を使えません (${aiLock.until} まで)` : undefined}
+                              className="btn-chip text-xs disabled:opacity-40"
                             >
-                              <Sparkles className="w-3.5 h-3.5" />
-                              <span>{isSummarizingAI === item.id ? 'Gemini 要約中...' : 'Geminiで要約・ポイント抽出 (フローティング表示)'}</span>
+                              {aiLock.inSchool ? <Lock className="w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5 text-amber-400" />}
+                              <span>{isSummarizingAI === item.id ? '要約中…' : 'AIで要約'}</span>
                             </button>
                             {summarizedTexts[item.id] && (
                               <button
                                 onClick={() => setFloatingAiSummary({ id: item.id, title: item.title, summary: summarizedTexts[item.id] })}
-                                className="text-[11px] font-mono text-stone-400 hover:text-amber-400 transition"
+                                className="text-[11px] font-mono text-stone-400 hover:text-amber-400"
                               >
-                                [要約ウィンドウを開く]
+                                要約を見る
                               </button>
                             )}
                           </div>
@@ -4172,10 +4282,10 @@ export default function App() {
 
         {/* TAB 5: リアルタイム共同作業ボード & クリップボード同期 (Phase 4 Full Feature) */}
         {activeTab === 'board' && (
-          <div className="flex-1 flex flex-col p-4 bg-[#090A0C] overflow-hidden">
+          <div className="flex-1 flex flex-col p-2 sm:p-4 bg-[#090A0C] overflow-hidden anim-tab">
             {/* Whiteboard Toolbar */}
-            <div className="flex flex-wrap items-center justify-between gap-3 bg-[#111214] border border-stone-800/80 rounded-2xl p-3 mb-3 font-mono text-xs">
-              <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 sm:gap-3 bg-[#111214] border border-stone-800/80 rounded-2xl p-2 sm:p-3 mb-2 sm:mb-3 font-mono text-xs">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   onClick={() => setBoardMode('draw')}
                   className={`px-3 py-1.5 rounded-xl flex items-center gap-1.5 transition ${
@@ -4202,14 +4312,14 @@ export default function App() {
                     boardMode === 'text' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
                   }`}
                 >
-                  <span>付箋/文章</span>
+                  <span>文字</span>
                 </button>
 
                 {(boardMode === 'draw' || boardMode === 'eraser') && (
                   <div className="flex items-center gap-2 pl-2 border-l border-stone-800">
                     {boardMode === 'draw' && (
                       <>
-                        <span className="text-stone-500">Color:</span>
+
                         {['#f59e0b', '#ef4444', '#10b981', '#3b82f6', '#ffffff'].map(c => (
                           <button
                             key={c}
@@ -4223,7 +4333,7 @@ export default function App() {
                       </>
                     )}
 
-                    <span className="text-stone-500 ml-2">Size:</span>
+                    <span className="w-px h-4 bg-stone-800 mx-1" />
                     {[2, 4, 8, 16].map(w => (
                       <button
                         key={w}
@@ -4242,10 +4352,10 @@ export default function App() {
                   <div className="flex items-center gap-2 pl-2 border-l border-stone-800">
                     <input
                       type="text"
-                      placeholder="配置する文章を入力してボードをクリック"
+                      placeholder="文字を入力 → ボードをタップ"
                       value={newBoardText}
                       onChange={e => setNewBoardText(e.target.value)}
-                      className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-1 text-white w-64 focus:outline-none focus:border-amber-500/60"
+                      className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-1 text-white w-48 sm:w-64 focus:outline-none focus:border-amber-500/60"
                     />
                   </div>
                 )}
@@ -4258,13 +4368,13 @@ export default function App() {
                   className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-amber-400 rounded-xl flex items-center gap-1.5 transition disabled:opacity-40"
                 >
                   <Play className="w-3.5 h-3.5 text-amber-400" />
-                  <span>{isTimelapsePlaying ? 'タイムラプス再生中...' : 'タイムラプス再生'}</span>
+                  <span className="hidden sm:inline">{isTimelapsePlaying ? '再生中…' : 'タイムラプス'}</span>
                 </button>
 
                 <button
                   onClick={handleClearBoard}
                   className="p-1.5 rounded-xl bg-stone-900 border border-stone-800 text-stone-500 hover:text-red-400 hover:border-red-900 transition"
-                  title="全員分クリア"
+                  title="全員分を消す"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
@@ -4286,204 +4396,35 @@ export default function App() {
                 className="w-full h-full object-contain select-none"
               />
 
-              {/* クリップボード同期ドック (右下にPinP風配置) */}
-              <div className="absolute bottom-4 left-4 w-80 bg-[#111214]/90 backdrop-blur-md border border-stone-800/80 rounded-2xl p-3 shadow-2xl font-mono text-xs space-y-2">
-                <div className="flex items-center justify-between text-stone-400">
+              {/* 共有クリップボード (折りたたみ可) */}
+              <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 w-[calc(100%-1rem)] sm:w-80 bg-[#111214]/90 backdrop-blur-md border border-stone-800/80 rounded-2xl shadow-2xl font-mono text-xs cursor-auto">
+                <button
+                  onClick={() => setIsClipboardOpen(v => !v)}
+                  className="w-full flex items-center justify-between px-3 py-2 text-stone-400 hover:text-white"
+                >
                   <span className="flex items-center gap-1.5 font-bold text-white">
-                    <Clipboard className="w-3.5 h-3.5 text-amber-400" /> クリップボード同期
+                    <Clipboard className="w-3.5 h-3.5 text-amber-400" /> 共有クリップボード
                   </span>
-                  <span className="text-[10px] text-stone-500">by {clipboardUpdatedBy || 'system'}</span>
-                </div>
-                <textarea
-                  value={clipboardText}
-                  onChange={e => handleUpdateClipboard(e.target.value)}
-                  placeholder="ここに貼り付け・記入すると全員と即座に同期されます..."
-                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-2 text-stone-200 focus:outline-none focus:border-amber-500/60 resize-none h-18 text-xs leading-relaxed"
-                />
-                <button
-                  onClick={handleCopyClipboardToOS}
-                  className="w-full py-1.5 bg-stone-900 border border-stone-800 hover:border-stone-700 text-stone-300 rounded-lg flex items-center justify-center gap-1.5 transition text-[11px]"
-                >
-                  {isCopiedToOS ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{isCopiedToOS ? 'クリップボードにコピー完了！' : 'OSのクリップボードへコピー'}</span>
+                  <span className="flex items-center gap-2 text-[10px] text-stone-500">
+                    {clipboardUpdatedBy && `by ${clipboardUpdatedBy}`}
+                    <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isClipboardOpen ? '' : 'rotate-180'}`} />
+                  </span>
                 </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 6: その他 (テスト点数メモ & Gemini学習アドバイス) */}
-        {activeTab === 'more' && (
-          <div className="flex-1 p-6 overflow-y-auto">
-            <div className="max-w-3xl mx-auto space-y-6">
-              <div>
-                <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">テスト点数メモ & AIアドバイス</h2>
-                <p className="text-xs text-stone-400 font-mono">テスト結果の記録、合計点・平均点の集計、Geminiによる個別学習アドバイス</p>
-              </div>
-
-              {/* 点数サマリー */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 interactive-card">
-                  <div className="flex items-center gap-2 text-xs font-mono text-stone-400 mb-2">
-                    <Award className="w-4 h-4 text-amber-400" />
-                    <span>TOTAL SCORE</span>
-                  </div>
-                  <div className="text-3xl font-black font-['Space_Grotesk'] text-white">
-                    {totalScore} <span className="text-sm font-normal text-stone-500">/ {totalMaxScore}点</span>
-                  </div>
-                </div>
-
-                <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 interactive-card">
-                  <div className="flex items-center gap-2 text-xs font-mono text-stone-400 mb-2">
-                    <TrendingUp className="w-4 h-4 text-emerald-400" />
-                    <span>AVERAGE SCORE</span>
-                  </div>
-                  <div className="text-3xl font-black font-['Space_Grotesk'] text-white">
-                    {testScores.length > 0 ? (totalScore / testScores.length).toFixed(1) : 0} <span className="text-sm font-normal text-stone-500">点</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* 点数登録フォーム */}
-              <form onSubmit={handleCreateTestScore} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 font-mono text-xs space-y-3">
-                <div className="text-stone-300 font-bold uppercase tracking-wider flex items-center gap-1.5">
-                  <Plus className="w-4 h-4 text-amber-400" /> 点数の記録
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <input
-                    type="text"
-                    required
-                    placeholder="テスト名 (中間考査)"
-                    value={newExamName}
-                    onChange={e => setNewExamName(e.target.value)}
-                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
-                  />
-                  <input
-                    type="text"
-                    required
-                    placeholder="教科名 (英語)"
-                    value={newExamSubject}
-                    onChange={e => setNewExamSubject(e.target.value)}
-                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
-                  />
-                  <input
-                    type="number"
-                    required
-                    placeholder="得点"
-                    value={newExamScore}
-                    onChange={e => setNewExamScore(Number(e.target.value))}
-                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
-                  />
-                  <input
-                    type="number"
-                    required
-                    placeholder="満点"
-                    value={newExamMaxScore}
-                    onChange={e => setNewExamMaxScore(Number(e.target.value))}
-                    className="bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition interactive-btn uppercase"
-                >
-                  点数を追加
-                </button>
-              </form>
-
-              {/* 一覧テーブル (ユーザー切り替え & 削除ボタン付き) */}
-              <div className="bg-[#111214] border border-stone-800/80 rounded-2xl overflow-hidden font-mono text-xs">
-                <div className="px-4 py-3 border-b border-stone-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <div className="text-stone-400 font-bold uppercase tracking-wider">
-                    記録一覧 {testScoreUserFilter === 'me' ? '(あなた)' : testScoreUserFilter === 'all' ? '(全員)' : `(ユーザーID: ${testScoreUserFilter})`}
-                  </div>
-
-                  {/* ユーザー切り替え */}
-                  <div className="flex items-center gap-1.5 bg-[#16181D] p-1 rounded-xl border border-stone-800">
+                {isClipboardOpen && (
+                  <div className="px-3 pb-3 space-y-2 anim-fade">
+                    <textarea
+                      value={clipboardText}
+                      onChange={e => handleUpdateClipboard(e.target.value)}
+                      placeholder="ここに書いた内容は全員と共有されます"
+                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-2 text-stone-200 focus:outline-none focus:border-amber-500/60 resize-none h-20 text-xs leading-relaxed"
+                    />
                     <button
-                      onClick={() => handleFetchTestScores('me')}
-                      className={`px-2.5 py-1 rounded-lg transition ${
-                        testScoreUserFilter === 'me' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
-                      }`}
+                      onClick={handleCopyClipboardToOS}
+                      className="w-full py-1.5 btn-ghost rounded-lg flex items-center justify-center gap-1.5 text-[11px]"
                     >
-                      自分の点数
+                      {isCopiedToOS ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{isCopiedToOS ? 'コピーしました' : '端末にコピー'}</span>
                     </button>
-                    <button
-                      onClick={() => handleFetchTestScores('all')}
-                      className={`px-2.5 py-1 rounded-lg transition ${
-                        testScoreUserFilter === 'all' ? 'bg-amber-500 text-black font-bold' : 'text-stone-400 hover:text-white'
-                      }`}
-                    >
-                      全員の点数
-                    </button>
-                    <select
-                      value={testScoreUserFilter}
-                      onChange={e => handleFetchTestScores(e.target.value)}
-                      className="bg-[#111214] border border-stone-800 text-stone-300 rounded-lg px-2 py-1 text-xs focus:outline-none"
-                    >
-                      <option value="me">自分</option>
-                      <option value="all">全員</option>
-                      {onlineUsers.map(u => (
-                        <option key={u.id} value={String(u.id)}>{u.username}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                <div className="divide-y divide-stone-800/60">
-                  {testScores.length === 0 ? (
-                    <div className="p-6 text-center text-stone-600">記録された点数はありません</div>
-                  ) : (
-                    testScores.map(t => (
-                      <div key={t.id} className="px-4 py-3 flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="text-stone-500">[{t.exam_name}]</span>
-                          <span className="font-bold text-white">{t.subject}</span>
-                          {(t as any).username && (
-                            <span className="text-[10px] text-amber-500/80 bg-amber-500/10 px-1.5 py-0.2 rounded font-mono">
-                              {(t as any).username}
-                            </span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-3">
-                          <div className="font-bold text-amber-400">
-                            {t.score} / {t.max_score}点
-                          </div>
-                          {(t.user_id === currentUser?.id || currentUser?.role === 'admin') && (
-                            <button
-                              onClick={() => handleDeleteTestScore(t.id)}
-                              className="p-1 text-stone-500 hover:text-red-400 transition"
-                              title="記録を削除"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {/* Gemini アドバイス生成エリア */}
-              <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Sparkles className="w-5 h-5 text-amber-400" />
-                    <span className="font-bold font-['Space_Grotesk'] text-white">Gemini 学習アドバイス</span>
-                  </div>
-                  <button
-                    onClick={handleGetAiAdvice}
-                    disabled={isLoadingAdvice || testScores.length === 0}
-                    className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black text-xs font-mono font-bold rounded-xl transition interactive-btn uppercase disabled:opacity-40"
-                  >
-                    {isLoadingAdvice ? 'AI分析中...' : 'アドバイスを生成'}
-                  </button>
-                </div>
-
-                {aiAdvice && (
-                  <div className="bg-[#16181D] border border-amber-500/30 rounded-xl p-4 text-xs font-mono text-amber-100 whitespace-pre-wrap leading-relaxed">
-                    {aiAdvice}
                   </div>
                 )}
               </div>
@@ -4491,13 +4432,27 @@ export default function App() {
           </div>
         )}
 
+        {/* TAB 6: その他 (テスト点数) */}
+        {activeTab === 'more' && (
+          <div className="flex-1 min-h-0 flex anim-tab">
+            <TestScoresTab token={token} safeFetch={safeFetch} currentUser={currentUser} users={onlineUsers} lock={aiLock} />
+          </div>
+        )}
+
+        {/* TAB 8: ヘルプ */}
+        {activeTab === 'help' && (
+          <div className="flex-1 min-h-0 flex anim-tab">
+            <HelpTab />
+          </div>
+        )}
+
         {/* TAB 7: 設定 (アカウント・通知・Webhook・監査ログ) */}
         {activeTab === 'settings' && (
-          <div className="flex-1 p-6 overflow-y-auto">
-            <div className="max-w-3xl mx-auto space-y-6">
-              <div className="flex items-center justify-between border-b border-stone-800/80 pb-4">
-                <h2 className="text-2xl font-bold font-['Space_Grotesk'] text-white">設定</h2>
-                <div className="flex gap-1.5 font-mono text-xs bg-[#111214] p-1 rounded-xl border border-stone-800">
+          <div className="flex-1 p-3 sm:p-6 overflow-y-auto anim-tab">
+            <div className="max-w-3xl mx-auto space-y-4 sm:space-y-6">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-stone-800/80 pb-4">
+                <h2 className="text-xl sm:text-2xl font-bold font-['Space_Grotesk'] text-white">設定</h2>
+                <div className="flex gap-1 font-mono text-xs bg-[#111214] p-1 rounded-xl border border-stone-800 overflow-x-auto">
                   {[
                     { id: 'account', label: 'アカウント' },
                     { id: 'appearance', label: '表示・操作' },
@@ -4513,10 +4468,10 @@ export default function App() {
                         if (sec.id === 'audit') loadAuditLogs();
                         if (sec.id === 'webhook' || sec.id === 'notifications') loadIntegrations();
                       }}
-                      className={`px-3 py-1.5 rounded-lg transition ${
+                      className={`px-3 py-1.5 rounded-lg whitespace-nowrap ${
                         settingsSection === sec.id
                           ? 'bg-amber-500 text-black font-bold'
-                          : 'text-stone-400 hover:text-white'
+                          : 'text-stone-400 hover:text-white hover:bg-stone-800/60'
                       }`}
                     >
                       {sec.label}
@@ -4573,9 +4528,7 @@ export default function App() {
                   {/* リアルタイム方式 */}
                   <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
                     <div className="text-white font-bold text-sm">リアルタイム通信方式</div>
-                    <p className="text-stone-400 leading-relaxed">
-                      学校のフィルター等で WebSocket が通らない場合は、自動で他の方式に切り替わります。うまくいかない時は手動で固定してください。
-                    </p>
+                    <p className="text-stone-400">つながらない時は自動で切り替わります。うまくいかない時だけ固定してください。</p>
                     <div className="grid grid-cols-1 sm:grid-cols-5 gap-2">
                       {([
                         { id: 'auto', label: '自動', desc: 'おすすめ' },
@@ -4662,127 +4615,101 @@ export default function App() {
                 </div>
               )}
 
-              {/* 0. 表示・操作設定 (UI縮小・スクロール・自動保存) */}
+              {/* 0. 表示・操作 */}
               {settingsSection === 'appearance' && (
-                <div className="space-y-4">
-                  {/* UI縮小率 */}
-                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4 shadow-lg">
-                    <div className="flex items-center justify-between border-b border-stone-800 pb-2">
-                      <span className="text-white font-bold text-sm">UI縮小・画面スケール (UI Scale)</span>
-                      <span className="text-amber-400 font-bold">{uiScale}%</span>
+                <div className="space-y-4 text-xs">
+                  {([
+                    {
+                      title: '画面の大きさ',
+                      value: uiScale,
+                      options: [75, 85, 100, 110].map(v => ({ v, label: `${v}%` })),
+                      onPick: (v: number) => {
+                        setUiScale(v);
+                        LS.set('asdf_ui_scale', String(v));
+                      },
+                    },
+                    {
+                      title: 'チャットの自動スクロール',
+                      value: chatAutoScrollMode,
+                      options: [
+                        { v: 'always', label: '常に最新へ' },
+                        { v: 'unread_anchor', label: '一番下にいる時だけ' },
+                        { v: 'off', label: 'しない' },
+                      ],
+                      onPick: (v: any) => {
+                        setChatAutoScrollMode(v);
+                        LS.set('asdf_chat_scroll_mode', v);
+                      },
+                    },
+                    {
+                      title: 'メモの自動保存 (入力が止まってから)',
+                      value: memoAutoSaveInterval,
+                      options: [
+                        { v: 1000, label: '1秒' },
+                        { v: 2000, label: '2秒' },
+                        { v: 5000, label: '5秒' },
+                        { v: 0, label: 'オフ' },
+                      ],
+                      onPick: (v: number) => {
+                        setMemoAutoSaveInterval(v);
+                        LS.set('asdf_memo_autosave_ms', String(v));
+                      },
+                    },
+                  ] as { title: string; value: any; options: { v: any; label: string }[]; onPick: (v: any) => void }[]).map(group => (
+                    <div key={group.title} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 sm:p-5 space-y-3">
+                      <div className="text-white font-bold text-sm">{group.title}</div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        {group.options.map(opt => (
+                          <button
+                            key={String(opt.v)}
+                            type="button"
+                            onClick={() => group.onPick(opt.v)}
+                            className={`p-2.5 rounded-xl border text-center ${
+                              group.value === opt.v
+                                ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold'
+                                : 'bg-[#16181D] border-stone-800 text-stone-300 hover:text-white hover:border-stone-500'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                    <p className="text-stone-400 leading-relaxed">
-                      Chromebookや小型ノートPC、低解像度モニターでも快適に画面全体を見渡せるよう、全体の表示サイズを縮小・最適化できます。
-                    </p>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                      {[
-                        { scale: 75, label: '75% (超コンパクト)' },
-                        { scale: 85, label: '85% (推奨・見やすい)' },
-                        { scale: 100, label: '100% (標準サイズ)' },
-                        { scale: 110, label: '110% (文字大きめ)' },
-                      ].map(item => (
-                        <button
-                          key={item.scale}
-                          type="button"
-                          onClick={() => {
-                            setUiScale(item.scale);
-                            localStorage.setItem('asdf_ui_scale', String(item.scale));
-                          }}
-                          className={`p-3 rounded-xl border text-center transition ${
-                            uiScale === item.scale
-                              ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold shadow-sm'
-                              : 'bg-[#16181D] border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
-                          }`}
-                        >
-                          <div className="text-sm font-bold">{item.scale}%</div>
-                          <div className="text-[10px] text-stone-500 mt-1">{item.label.split(' ')[1]}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* チャット自動スクロール */}
-                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4 shadow-lg">
-                    <div className="flex items-center justify-between border-b border-stone-800 pb-2">
-                      <span className="text-white font-bold text-sm">チャット自動スクロール挙動</span>
-                      <span className="text-amber-400 font-bold uppercase">{chatAutoScrollMode}</span>
-                    </div>
-                    <p className="text-stone-400 leading-relaxed">
-                      新着メッセージ受信時の画面スクロール動作を選択できます。「未読で停止」にすると、過去ログを読んでいる最中に勝手に最下部へ飛ばされません。
-                    </p>
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                      {[
-                        { mode: 'always', label: '常に最新へスクロール', desc: '新着を逃さず追従' },
-                        { mode: 'unread_stop', label: '未読位置で停止 (推奨)', desc: '未読があればスクロール固定' },
-                        { mode: 'manual', label: '完全手動スクロール', desc: '勝手に動かない' },
-                      ].map(item => (
-                        <button
-                          key={item.mode}
-                          type="button"
-                          onClick={() => {
-                            setChatAutoScrollMode(item.mode as any);
-                            localStorage.setItem('asdf_chat_scroll_mode', item.mode);
-                          }}
-                          className={`p-3 rounded-xl border text-left transition ${
-                            chatAutoScrollMode === item.mode
-                              ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold shadow-sm'
-                              : 'bg-[#16181D] border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
-                          }`}
-                        >
-                          <div className="font-bold text-white">{item.label}</div>
-                          <div className="text-[10px] text-stone-500 mt-1">{item.desc}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* メモ自動保存間隔 */}
-                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-4 shadow-lg">
-                    <div className="flex items-center justify-between border-b border-stone-800 pb-2">
-                      <span className="text-white font-bold text-sm">メモ自動保存間隔</span>
-                      <span className="text-amber-400 font-bold">
-                        {memoAutoSaveInterval === 0 ? '手動保存のみ' : `${memoAutoSaveInterval / 1000}秒`}
-                      </span>
-                    </div>
-                    <p className="text-stone-400 leading-relaxed">
-                      入力停止後、指定した時間が経過すると自動でサーバーに同期・保存されます。
-                    </p>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                      {[
-                        { ms: 1000, label: '1秒 (リアルタイム)' },
-                        { ms: 2000, label: '2秒 (標準)' },
-                        { ms: 5000, label: '5秒 (長め)' },
-                        { ms: 0, label: 'オフ (手動のみ)' },
-                      ].map(item => (
-                        <button
-                          key={item.ms}
-                          type="button"
-                          onClick={() => {
-                            setMemoAutoSaveInterval(item.ms);
-                            localStorage.setItem('asdf_memo_autosave', String(item.ms));
-                          }}
-                          className={`p-2.5 rounded-xl border text-center transition ${
-                            memoAutoSaveInterval === item.ms
-                              ? 'bg-amber-500/15 border-amber-500 text-amber-300 font-bold shadow-sm'
-                              : 'bg-[#16181D] border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
-                          }`}
-                        >
-                          <div className="font-bold">{item.ms === 0 ? 'オフ' : `${item.ms / 1000}秒`}</div>
-                          <div className="text-[10px] text-stone-500 mt-0.5">{item.label.split(' ')[1]}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                  ))}
                 </div>
               )}
 
               {/* 1. アカウント設定 */}
               {settingsSection === 'account' && (
                 <div className="space-y-4">
-                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
-                    <div className="text-stone-400 uppercase font-bold tracking-wider">Account Information</div>
-                    <div className="text-stone-200">ユーザー名: <span className="text-amber-400 font-bold">{currentUser.username}</span></div>
-                    <div className="text-stone-200">権限: <span className="text-stone-400">{currentUser.role}</span></div>
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 sm:p-6 text-xs flex flex-wrap items-center gap-4">
+                    <div className="relative group">
+                      <Avatar name={currentUser.username} url={currentUser.avatar_url} size="w-20 h-20 text-3xl" />
+                      <button
+                        onClick={() => avatarInputRef.current?.click()}
+                        disabled={isUploadingAvatar}
+                        className="absolute inset-0 rounded-full bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white"
+                        aria-label="アイコンを変更"
+                      >
+                        {isUploadingAvatar ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Camera className="w-5 h-5" />}
+                      </button>
+                      <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} />
+                    </div>
+                    <div className="space-y-1 min-w-0">
+                      <div className="text-white font-bold text-lg truncate">{currentUser.username}</div>
+                      <div className="text-stone-500">{currentUser.role === 'admin' ? '管理者' : 'メンバー'}</div>
+                      <div className="flex gap-2 pt-1">
+                        <button onClick={() => avatarInputRef.current?.click()} disabled={isUploadingAvatar} className="px-3 py-1.5 rounded-lg btn-primary font-bold">
+                          {isUploadingAvatar ? 'アップロード中…' : 'アイコンを変更'}
+                        </button>
+                        {currentUser.avatar_url && (
+                          <button onClick={handleRemoveAvatar} className="px-3 py-1.5 rounded-lg btn-ghost">削除</button>
+                        )}
+                      </div>
+                    </div>
+                    <button onClick={handleLogout} className="sm:hidden ml-auto px-3 py-1.5 rounded-lg btn-ghost flex items-center gap-1.5">
+                      <LogOut className="w-3.5 h-3.5" /> ログアウト
+                    </button>
                   </div>
 
                   {/* パスワード変更 */}
@@ -4826,14 +4753,12 @@ export default function App() {
                     <div className="text-red-400 uppercase font-bold tracking-wider flex items-center gap-1.5">
                       <ShieldAlert className="w-3.5 h-3.5 text-red-400" /> アカウント削除
                     </div>
-                    <p className="text-stone-400">
-                      アカウントを削除すると、チャットやメモの割り当てを含むすべての権限が削除されます。
-                    </p>
+                    <p className="text-stone-400">元に戻せません。</p>
                     <button
                       onClick={handleDeleteAccount}
-                      className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl transition uppercase"
+                      className="px-4 py-2 btn-danger font-bold rounded-xl"
                     >
-                      アカウントを完全に削除する
+                      アカウントを削除
                     </button>
                   </div>
                 </div>
@@ -4846,15 +4771,21 @@ export default function App() {
                     <div className="text-white font-bold text-sm flex items-center gap-1.5">
                       <Bell className="w-4 h-4 text-amber-400" /> このブラウザへの通知
                     </div>
-                    {'Notification' in window && Notification.permission === 'denied' && (
+                    {notifyPermission === 'denied' && (
                       <div className="p-2.5 rounded-xl bg-red-950/30 border border-red-900 text-red-300">
                         ブラウザで通知がブロックされています。アドレスバーのサイト設定から許可してください。
+                      </div>
+                    )}
+                    {notifyPermission === 'default' && (
+                      <div className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200">
+                        <span>通知がまだ許可されていません</span>
+                        <button onClick={requestNotifyPermission} className="px-3 py-1 rounded-lg btn-primary font-bold shrink-0">許可する</button>
                       </div>
                     )}
                     {([
                       { key: 'important', label: '重要な通知', desc: '自分へのメンション・返信、@everyone、新しい提出物' },
                       { key: 'messages', label: 'すべてのメッセージ', desc: '見ていないチャンネルやタブ非表示中の新着メッセージ' },
-                      { key: 'sound', label: '通知音', desc: '重要な通知のときに音を鳴らす' },
+                      { key: 'sound', label: '通知音', desc: '重要な通知で音を鳴らす' },
                     ] as const).map(item => (
                       <div key={item.key} className="flex items-center justify-between gap-3 p-3 bg-[#16181D] border border-stone-800 rounded-xl">
                         <div>
@@ -5093,10 +5024,62 @@ export default function App() {
         )}
       </main>
 
+      {/* スマホ: 下部タブバー */}
+      <nav className="md:hidden shrink-0 border-t border-stone-800/80 bg-[#0C0D10]/95 backdrop-blur-md pb-safe z-40">
+        <div className="flex overflow-x-auto">
+          {TABS.map(tab => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`relative flex-1 min-w-[3.25rem] flex flex-col items-center gap-0.5 py-1.5 text-[10px] ${isActive ? 'text-amber-400' : 'text-stone-500'}`}
+              >
+                {isActive && <span className="absolute top-0 left-1/4 right-1/4 h-0.5 rounded-b bg-amber-400 anim-fade" />}
+                <Icon className="w-5 h-5" />
+                <span>{tab.label}</span>
+                {tab.id === 'chat' && totalMentions > 0 && (
+                  <span className="absolute top-0.5 left-1/2 ml-1.5 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center anim-badge">
+                    {totalMentions > 99 ? '99+' : totalMentions}
+                  </span>
+                )}
+                {tab.id === 'chat' && totalMentions === 0 && totalUnread > 0 && !isActive && (
+                  <span className="absolute top-1 left-1/2 ml-2 w-2 h-2 rounded-full bg-white" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
+      <UiHost />
+
+      {showWeather && (
+        <Modal onClose={() => setShowWeather(false)} className="max-w-2xl">
+          <WeatherDetail weather={weather} onClose={() => setShowWeather(false)} />
+        </Modal>
+      )}
+
+      {showCalendar && (
+        <Modal onClose={() => setShowCalendar(false)} className="max-w-5xl">
+          <CalendarPanel
+            token={token}
+            safeFetch={safeFetch}
+            currentUser={currentUser}
+            events={calendarEvents}
+            loadRange={loadCalendarRange}
+            upsert={ev => setCalendarEvents(prev => [...prev.filter(e => e.id !== ev.id), ev])}
+            removeLocal={id => setCalendarEvents(prev => prev.filter(e => e.id !== id))}
+            onClose={() => setShowCalendar(false)}
+          />
+        </Modal>
+      )}
+
       {/* 画像ビューア: クリックで拡大・ホイール/ボタンでズーム・ダウンロード */}
       {lightbox && (
         <div
-          className="fixed inset-0 z-[60] bg-black/85 backdrop-blur-sm flex flex-col"
+          className="fixed inset-0 z-[60] bg-black/85 backdrop-blur-sm flex flex-col anim-fade"
           onClick={() => setLightbox(null)}
         >
           <div className="flex items-center justify-end gap-2 p-3 shrink-0" onClick={e => e.stopPropagation()}>
@@ -5162,7 +5145,7 @@ export default function App() {
       {/* カメラ小窓 (実機WebRTCカメラプレビュー) */}
       {/* 4. カメラ小窓 & フロント/バック切り替え */}
       {showCamera && (
-        <div className="fixed bottom-4 right-4 w-72 bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden z-50">
+        <div className="fixed bottom-20 md:bottom-4 right-4 w-64 sm:w-72 bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden z-50 anim-pop">
           <div className="p-2.5 border-b border-stone-800 flex items-center justify-between text-xs font-mono text-stone-400">
             <span className="flex items-center gap-1.5 font-bold text-white">
               <Camera className="w-3.5 h-3.5 text-amber-400" /> カメラ ({cameraFacingMode === 'user' ? 'フロント' : 'バック'})
@@ -5199,8 +5182,8 @@ export default function App() {
 
       {/* チャンネル作成モーダル */}
       {isNewChannelModalOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="w-full max-w-sm bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl font-mono text-xs space-y-4">
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
+          <div className="w-full max-w-sm bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl font-mono text-xs space-y-4 anim-pop">
             <div className="flex items-center justify-between">
               <span className="font-bold text-white text-sm">新規チャンネル作成</span>
               <button onClick={() => setIsNewChannelModalOpen(false)} className="text-stone-500 hover:text-white">&times;</button>
@@ -5230,17 +5213,17 @@ export default function App() {
 
       {/* Ctrl+K コマンドパレット (Spotlight風モーダル) */}
       {isPaletteOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-start justify-center pt-24 p-4">
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-start justify-center pt-16 sm:pt-24 p-4 anim-fade" onClick={() => setIsPaletteOpen(false)}>
           <div 
             onClick={e => e.stopPropagation()} 
-            className="w-full max-w-xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs"
+            className="w-full max-w-xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden anim-pop font-mono text-xs"
           >
             <div className="p-3 border-b border-stone-800 flex items-center gap-2">
               <Command className="w-4 h-4 text-amber-400" />
               <input
                 autoFocus
                 type="text"
-                placeholder="コマンド、計算式 (例: 12 * 85)、タブ名を入力..."
+                placeholder="タブ名や計算式 (例: 12 * 85)"
                 value={paletteQuery}
                 onChange={e => handlePaletteInput(e.target.value)}
                 className="w-full bg-transparent text-white focus:outline-none placeholder-stone-600 text-sm"
@@ -5261,15 +5244,16 @@ export default function App() {
 
             {/* ナビゲーションショートカット候補 */}
             <div className="p-2 space-y-1">
-              <div className="text-[10px] uppercase text-stone-500 px-2 py-1 font-bold">Quick Navigation</div>
+              <div className="text-[10px] uppercase text-stone-500 px-2 py-1 font-bold">移動</div>
               {[
                 { id: 'chat', label: 'チャットへ移動', desc: '/chat' },
                 { id: 'memo', label: 'リアルタイムメモへ移動', desc: '/memo' },
                 { id: 'assignments', label: '提出物・時間割へ移動', desc: '/assignments' },
                 { id: 'board', label: 'ホワイトボードへ移動', desc: '/board' },
-                { id: 'ai', label: 'Gemini AIへ移動', desc: '/ai' },
-                { id: 'more', label: 'テスト点数メモへ移動', desc: '/more' },
+                { id: 'ai', label: 'AIへ移動', desc: '/ai' },
+                { id: 'more', label: 'テスト点数へ移動', desc: '/more' },
                 { id: 'settings', label: '設定へ移動', desc: '/settings' },
+                { id: 'help', label: 'ヘルプへ移動', desc: '/help' },
               ].filter(c => c.label.includes(paletteQuery) || c.desc.includes(paletteQuery) || !paletteQuery).map(cmd => (
                 <button
                   key={cmd.id}
@@ -5289,43 +5273,70 @@ export default function App() {
         </div>
       )}
 
-      {/* 時間割専用エディタモーダル (週間グリッド & ワンタップ編集) */}
-      {isTimetableModalOpen && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4" onClick={() => setIsTimetableModalOpen(false)}>
+      {/* 時間割モーダル: 週間グリッド (朝の会〜帰りの会) と各コマの編集 */}
+      {isTimetableModalOpen && (() => {
+        const editDef = ttConfig.schedules[scheduleType] || DEFAULT_CONFIG.schedules.normal;
+        const timeInput = 'bg-[#111214] border border-stone-800 rounded px-1.5 py-1 text-white w-[5.5rem]';
+        const draftRow = (label: string, value: { start: string; end: string }, onChange: (v: { start: string; end: string }) => void) => (
+          <div key={label} className="flex items-center gap-1.5">
+            <span className="w-14 text-amber-400 font-bold shrink-0">{label}</span>
+            <input type="time" value={value.start} onChange={e => onChange({ ...value, start: e.target.value })} className={timeInput} />
+            <span className="text-stone-500">〜</span>
+            <input type="time" value={value.end} onChange={e => onChange({ ...value, end: e.target.value })} className={timeInput} />
+          </div>
+        );
+        const fixedRow = (label: string, render: (day: number) => React.ReactNode, time?: string) => (
+          <tr className="border-b border-stone-800/80 bg-stone-950/30">
+            <td className="py-1.5 px-2 border-r border-stone-800">
+              <div className="font-bold text-stone-300">{label}</div>
+              {time && <div className="text-[10px] text-stone-500 tabular-nums">{time}</div>}
+            </td>
+            {[1, 2, 3, 4, 5].map(day => (
+              <td key={day} className="p-1 border-r border-stone-800 last:border-r-0 text-[10px] text-stone-500">{render(day)}</td>
+            ))}
+          </tr>
+        );
+        return (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-stretch sm:items-center justify-center sm:p-4 anim-fade" onClick={() => setIsTimetableModalOpen(false)}>
           <div
             onClick={e => e.stopPropagation()}
-            className="w-full max-w-5xl bg-[#111214] border border-amber-500/30 rounded-2xl shadow-2xl overflow-hidden text-xs max-h-[94vh] flex flex-col"
+            className="w-full max-w-5xl bg-[#111214] sm:border border-amber-500/30 sm:rounded-2xl shadow-2xl overflow-hidden text-xs max-h-[100dvh] sm:max-h-[94dvh] flex flex-col anim-pop"
           >
             <div className="p-3 sm:p-4 border-b border-stone-800 flex flex-wrap items-center gap-2 bg-stone-900/60">
               <BookOpen className="w-4 h-4 text-amber-400" />
-              <span className="font-bold text-white text-sm mr-2">時間割</span>
-              <span className="text-stone-500">今日の時程 (全員共通):</span>
-              <div className="flex gap-1">
+              <span className="font-bold text-white text-sm">時間割</span>
+              <span className="text-amber-300 font-bold hidden sm:inline">
+                {schoolStatus.label}{schoolStatus.sub ? ` (${schoolStatus.sub})` : ''}
+              </span>
+              <button onClick={() => setIsTimetableModalOpen(false)} className="ml-auto p-1 rounded-lg text-stone-500 hover:text-white hover:bg-stone-800" title="閉じる (Esc)">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* 今日の時程: 全員共通・今日だけ有効 */}
+            <div className="px-3 sm:px-4 py-2.5 border-b border-stone-800 flex flex-wrap items-center gap-2 bg-amber-500/5">
+              <span className="text-stone-300 font-bold">今日の時程</span>
+              <span className="text-stone-500 text-[10px]">(全員共通・明日には通常に戻ります)</span>
+              <div className="flex gap-1 ml-auto">
                 {(Object.keys(SCHEDULE_LABELS) as ScheduleType[]).map(t => (
                   <button
                     key={t}
                     onClick={() => handleSetTodaySchedule(t)}
-                    className={`px-2.5 py-1 rounded-lg border transition ${
-                      todaySchedule === t ? 'bg-amber-500 text-black font-bold border-amber-500' : 'border-stone-800 text-stone-400 hover:text-white'
+                    className={`px-2.5 py-1 rounded-lg border ${
+                      todaySchedule === t ? 'bg-amber-500 text-black font-bold border-amber-500' : 'border-stone-700 text-stone-300 hover:text-white hover:border-stone-500'
                     }`}
                   >
                     {SCHEDULE_LABELS[t]}
                   </button>
                 ))}
               </div>
-              <span className="ml-auto hidden sm:inline text-amber-300 font-bold">
-                {schoolStatus.label}{schoolStatus.sub ? ` (${schoolStatus.sub})` : ''}
-              </span>
-              <button onClick={() => setIsTimetableModalOpen(false)} className="text-stone-500 hover:text-white transition ml-2" title="閉じる (Esc)">
-                <X className="w-4 h-4" />
-              </button>
             </div>
 
             <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
               {/* 左: 週間グリッド */}
               <div className="flex-1 min-w-0 min-h-0 overflow-auto p-3 sm:p-4 space-y-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-stone-400 font-bold">編集する時程:</span>
+                  <span className="text-stone-400">表示・編集する時程:</span>
                   {(Object.keys(SCHEDULE_LABELS) as ScheduleType[]).map(t => (
                     <button
                       key={t}
@@ -5333,8 +5344,8 @@ export default function App() {
                         setScheduleType(t);
                         setIsEditingPeriods(false);
                       }}
-                      className={`px-2.5 py-1 rounded-lg border transition ${
-                        scheduleType === t ? 'bg-stone-200 text-black font-bold border-stone-200' : 'border-stone-800 text-stone-400 hover:text-white'
+                      className={`px-2.5 py-1 rounded-lg border ${
+                        scheduleType === t ? 'bg-stone-200 text-black font-bold border-stone-200' : 'border-stone-800 text-stone-400 hover:text-white hover:border-stone-600'
                       }`}
                     >
                       {SCHEDULE_LABELS[t]}
@@ -5342,39 +5353,27 @@ export default function App() {
                   ))}
                   <button
                     onClick={() => {
-                      setPeriodDraft((periodTimes[scheduleType] || []).map(p => ({ ...p })));
+                      setPeriodDraft(JSON.parse(JSON.stringify(editDef)));
                       setIsEditingPeriods(v => !v);
                     }}
                     className="ml-auto px-2.5 py-1 rounded-lg border border-stone-800 text-stone-300 hover:border-amber-500/50 hover:text-amber-300 flex items-center gap-1"
                   >
-                    <CalendarClock className="w-3.5 h-3.5" /> {isEditingPeriods ? '時刻の編集を閉じる' : '時刻を編集'}
+                    <CalendarClock className="w-3.5 h-3.5" /> {isEditingPeriods ? '閉じる' : '時刻を編集'}
                   </button>
                 </div>
 
-                {isEditingPeriods && (
-                  <div className="p-3 rounded-xl bg-[#16181D] border border-stone-800 space-y-2">
-                    <div className="text-stone-300 font-bold">{SCHEDULE_LABELS[scheduleType]} の各時限の時刻</div>
+                {isEditingPeriods && periodDraft && (
+                  <div className="p-3 rounded-xl bg-[#16181D] border border-stone-800 space-y-2 anim-fade">
+                    <div className="text-stone-300 font-bold">{SCHEDULE_LABELS[scheduleType]} の時刻</div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
-                      {periodDraft.map((p, i) => (
-                        <div key={i} className="flex items-center gap-1.5">
-                          <span className="w-8 text-amber-400 font-bold">{i + 1}限</span>
-                          <input
-                            type="time"
-                            value={p.start}
-                            onChange={e => setPeriodDraft(d => d.map((x, j) => (j === i ? { ...x, start: e.target.value } : x)))}
-                            className="bg-[#111214] border border-stone-800 rounded px-1.5 py-1 text-white"
-                          />
-                          <span className="text-stone-500">〜</span>
-                          <input
-                            type="time"
-                            value={p.end}
-                            onChange={e => setPeriodDraft(d => d.map((x, j) => (j === i ? { ...x, end: e.target.value } : x)))}
-                            className="bg-[#111214] border border-stone-800 rounded px-1.5 py-1 text-white"
-                          />
-                        </div>
-                      ))}
+                      {draftRow('朝の会', periodDraft.morning, v => setPeriodDraft(d => (d ? { ...d, morning: v } : d)))}
+                      {periodDraft.periods.map((p, i) =>
+                        draftRow(`${i + 1}限`, p, v => setPeriodDraft(d => (d ? { ...d, periods: d.periods.map((x, j) => (j === i ? v : x)) } : d)))
+                      )}
+                      {draftRow('帰りの会', periodDraft.closing, v => setPeriodDraft(d => (d ? { ...d, closing: v } : d)))}
                     </div>
-                    <button onClick={handleSavePeriodTimes} className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg">
+                    <div className="text-[10px] text-stone-500">5限の日は、帰りの会が5限のすぐ後になります。</div>
+                    <button onClick={handleSavePeriodTimes} className="px-4 py-1.5 btn-primary font-bold rounded-lg">
                       時刻を保存
                     </button>
                   </div>
@@ -5388,18 +5387,28 @@ export default function App() {
                         {[1, 2, 3, 4, 5].map(day => (
                           <th
                             key={day}
-                            className={`py-2 px-2 border-r border-stone-800 last:border-r-0 font-bold ${
+                            className={`py-1.5 px-2 border-r border-stone-800 last:border-r-0 font-bold ${
                               nowForStatus.getDay() === day ? 'text-amber-300 bg-amber-500/10' : 'text-white'
                             }`}
                           >
-                            {DAY_LABELS[day]}
+                            <div>{DAY_LABELS[day]}</div>
+                            <button
+                              onClick={() => handleToggleDayPeriods(day)}
+                              title="5限 / 6限 を切り替え"
+                              className={`mt-0.5 px-1.5 rounded text-[10px] font-bold border ${
+                                periodCountFor(ttConfig, day) === 5 ? 'bg-sky-500/15 border-sky-500/40 text-sky-300' : 'border-stone-700 text-stone-400 hover:text-white'
+                              }`}
+                            >
+                              {periodCountFor(ttConfig, day)}限まで
+                            </button>
                           </th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
-                      {[1, 2, 3, 4, 5, 6, 7].map(period => {
-                        const pt = periodTimes[scheduleType]?.[period - 1];
+                      {fixedRow('朝の会', () => '', `${editDef.morning.start}〜${editDef.morning.end}`)}
+                      {Array.from({ length: MAX_PERIODS }, (_, i) => i + 1).map(period => {
+                        const pt = editDef.periods[period - 1];
                         return (
                           <tr key={period} className="border-b border-stone-800/80">
                             <td className="py-1.5 px-2 border-r border-stone-800 bg-stone-950/40">
@@ -5407,14 +5416,22 @@ export default function App() {
                               {pt && <div className="text-[10px] text-stone-500 tabular-nums">{pt.start}〜{pt.end}</div>}
                             </td>
                             {[1, 2, 3, 4, 5].map(day => {
+                              const off = period > periodCountFor(ttConfig, day);
                               const existing = timetables.find(tt => tt.day_of_week === day && tt.period === period);
                               const isSelected = selectedTtCell?.day === day && selectedTtCell?.period === period;
+                              if (off) {
+                                return (
+                                  <td key={day} className="p-1 border-r border-stone-800 last:border-r-0 bg-stone-950/60">
+                                    <div className="min-h-[40px] flex items-center justify-center text-stone-700 text-[10px]">授業なし</div>
+                                  </td>
+                                );
+                              }
                               return (
                                 <td
                                   key={day}
                                   onClick={() => selectTtCell(day, period)}
                                   className={`p-1 border-r border-stone-800 last:border-r-0 cursor-pointer transition align-top ${
-                                    isSelected ? 'bg-amber-500/20 ring-1 ring-inset ring-amber-500' : 'hover:bg-stone-900/60'
+                                    isSelected ? 'bg-amber-500/20 ring-1 ring-inset ring-amber-500' : 'hover:bg-stone-800/60'
                                   }`}
                                 >
                                   {existing ? (
@@ -5436,18 +5453,21 @@ export default function App() {
                           </tr>
                         );
                       })}
+                      {fixedRow('帰りの会', day => {
+                        const c = closingFor(editDef, periodCountFor(ttConfig, day));
+                        return <span className="tabular-nums">{c.start}〜{c.end}</span>;
+                      })}
                     </tbody>
                   </table>
                 </div>
-                {ttSaveStatus && <div className="text-emerald-400">{ttSaveStatus}</div>}
+                {ttSaveStatus && <div className="text-emerald-400 anim-fade">{ttSaveStatus}</div>}
               </div>
 
-              {/* 右: 選択中のコマ (プリセットはワンクリックで即保存) */}
-              <div className="lg:w-80 shrink-0 border-t lg:border-t-0 lg:border-l border-stone-800 p-3 sm:p-4 space-y-3 overflow-y-auto max-h-[45vh] lg:max-h-none">
+              {/* 右: 選択中のコマ (教科ボタンは押した瞬間に保存) */}
+              <div className="lg:w-80 shrink-0 border-t lg:border-t-0 lg:border-l border-stone-800 p-3 sm:p-4 space-y-3 overflow-y-auto max-h-[45dvh] lg:max-h-none">
                 {!selectedTtCell ? (
                   <div className="text-stone-500 leading-relaxed">
-                    表のマスをクリックすると、教科・持ち物・メモを入力できます。<br />
-                    教科のプリセットは押した瞬間に保存され、次のコマへ進みます。
+                    マスを選ぶと教科・持ち物・メモを入力できます。教科ボタンは押すとすぐ保存され、次のコマへ進みます。
                   </div>
                 ) : (
                   <>
@@ -5460,15 +5480,15 @@ export default function App() {
                     </div>
 
                     <div className="flex flex-wrap gap-1.5">
-                      {['国語', '数学', '英語', '物理', '化学', '生物', '日本史', '世界史', '地理', '情報', '体育', '美術', '音楽', 'HR', '自習'].map(subj => (
+                      {SUBJECTS.map(subj => (
                         <button
                           type="button"
                           key={subj}
                           onClick={() => handlePresetSubject(subj)}
-                          className={`px-2 py-1 rounded border transition ${
+                          className={`px-2 py-1 rounded border ${
                             ttDetailDraft.subject === subj
                               ? 'bg-amber-500 text-black font-bold border-amber-400'
-                              : 'bg-[#16181D] border-stone-800 text-stone-300 hover:text-white hover:border-stone-600'
+                              : 'bg-[#16181D] border-stone-800 text-stone-300 hover:text-white hover:border-stone-500'
                           }`}
                         >
                           {subj}
@@ -5482,7 +5502,7 @@ export default function App() {
                         <input
                           value={ttDetailDraft.subject}
                           onChange={e => setTtDetailDraft(d => ({ ...d, subject: e.target.value }))}
-                          placeholder="例: 数学A"
+                          placeholder="例: 数学"
                           className="mt-1 w-full bg-[#16181D] border border-stone-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-amber-500/60"
                         />
                       </label>
@@ -5492,17 +5512,17 @@ export default function App() {
                           value={ttDetailDraft.items}
                           onChange={e => setTtDetailDraft(d => ({ ...d, items: e.target.value }))}
                           rows={2}
-                          placeholder="例: 教科書、ワーク、関数電卓"
+                          placeholder="例: 教科書、ワーク、コンパス"
                           className="mt-1 w-full bg-[#16181D] border border-stone-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-amber-500/60 resize-none"
                         />
                       </label>
                       <label className="block">
-                        <span className="text-stone-400">メモ・詳細</span>
+                        <span className="text-stone-400">メモ</span>
                         <textarea
                           value={ttDetailDraft.note}
                           onChange={e => setTtDetailDraft(d => ({ ...d, note: e.target.value }))}
                           rows={3}
-                          placeholder="例: 教室移動 (理科室)、小テストあり"
+                          placeholder="例: 理科室へ移動、小テスト"
                           className="mt-1 w-full bg-[#16181D] border border-stone-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-amber-500/60 resize-none"
                         />
                       </label>
@@ -5511,7 +5531,7 @@ export default function App() {
                       <button
                         onClick={handleSaveTtDetail}
                         disabled={!ttDetailDraft.subject.trim()}
-                        className="flex-1 py-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-bold rounded-lg"
+                        className="flex-1 py-2 btn-primary disabled:opacity-40 font-bold rounded-lg"
                       >
                         保存
                       </button>
@@ -5531,11 +5551,11 @@ export default function App() {
                   </>
                 )}
 
-                {/* 今日の持ち物 (確認用) */}
+                {/* 今日の持ち物 */}
                 <div className="pt-3 border-t border-stone-800 space-y-1.5">
                   <div className="text-stone-300 font-bold flex items-center gap-1"><Backpack className="w-3.5 h-3.5 text-amber-400" /> 今日の持ち物・メモ</div>
                   {todayRows.filter(t => (t.items && t.items.trim()) || (t.note && t.note.trim())).length === 0 ? (
-                    <div className="text-stone-500">{nowForStatus.getDay() === 0 || nowForStatus.getDay() === 6 ? '今日は休みです' : '登録されていません'}</div>
+                    <div className="text-stone-500">{nowForStatus.getDay() === 0 || nowForStatus.getDay() === 6 ? '今日は休みです' : 'なし'}</div>
                   ) : (
                     todayRows
                       .filter(t => (t.items && t.items.trim()) || (t.note && t.note.trim()))
@@ -5553,14 +5573,15 @@ export default function App() {
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* 提出物編集モーダル */}
       {editingAssignment && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
           <div 
             onClick={e => e.stopPropagation()} 
-            className="w-full max-w-lg bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[85vh]"
+            className="w-full max-w-lg bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden anim-pop font-mono text-xs flex flex-col max-h-[85dvh]"
           >
             <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-amber-500/10">
               <div className="flex items-center gap-2 text-amber-300 font-bold text-sm">
@@ -5595,7 +5616,7 @@ export default function App() {
                     onChange={e => setEditingAssignment({ ...editingAssignment, subject: e.target.value })}
                     className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
                   >
-                    {['国語', '数学', '英語', '理科', '社会', '情報', '保健体育', '美術', '音楽', 'その他'].map(s => (
+                    {Array.from(new Set([...SUBJECTS, 'その他', editingAssignment.subject])).map(s => (
                       <option key={s} value={s}>{s}</option>
                     ))}
                   </select>
@@ -5653,10 +5674,10 @@ export default function App() {
 
       {/* 提出物のメンバー別進捗確認モーダル */}
       {showMemberProgressModalId && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
           <div 
             onClick={e => e.stopPropagation()} 
-            className="w-full max-w-lg bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[85vh]"
+            className="w-full max-w-lg bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden anim-pop font-mono text-xs flex flex-col max-h-[85dvh]"
           >
             <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-stone-900/60">
               <div className="flex items-center gap-2">
@@ -5763,15 +5784,15 @@ export default function App() {
 
       {/* 提出物AI要約フローティングモーダル (JSON解析 & リッチ表示) */}
       {floatingAiSummary && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
           <div 
             onClick={e => e.stopPropagation()} 
-            className="w-full max-w-xl bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[85vh]"
+            className="w-full max-w-xl bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden anim-pop font-mono text-xs flex flex-col max-h-[85dvh]"
           >
             <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-amber-500/10">
               <div className="flex items-center gap-2 text-amber-300 font-bold">
                 <Sparkles className="w-4 h-4 text-amber-400" />
-                <span>Gemini AI 要約: {floatingAiSummary.title}</span>
+                <span>AI 要約: {floatingAiSummary.title}</span>
               </div>
               <button 
                 onClick={() => setFloatingAiSummary(null)}
@@ -5826,7 +5847,7 @@ export default function App() {
                 }
 
                 return (
-                  <div className="prose prose-invert prose-xs max-w-none text-stone-200 font-sans leading-relaxed whitespace-pre-wrap">
+                  <div className="markdown-body text-stone-200 text-sm">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
                       {floatingAiSummary.summary}
                     </ReactMarkdown>
@@ -5840,7 +5861,7 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   navigator.clipboard.writeText(floatingAiSummary.summary);
-                  alert('クリップボードに要約内容をコピーしました！');
+                  toast('コピーしました', { kind: 'success' });
                 }}
                 className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-white rounded-lg transition flex items-center gap-1.5"
               >
@@ -5859,63 +5880,56 @@ export default function App() {
         </div>
       )}
 
-      {/* メモAI処理結果モーダル (反映ボタン付き) */}
+      {/* メモAI結果: 反映できるのは校正だけ (確認あり・元に戻せる) */}
       {memoAiResultModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-4 anim-fade" onClick={() => setMemoAiResultModal(null)}>
           <div 
             onClick={e => e.stopPropagation()} 
-            className="w-full max-w-xl bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden interactive-card font-mono text-xs flex flex-col max-h-[80vh]"
+            className="w-full max-w-2xl bg-[#111214] border border-amber-500/40 rounded-2xl shadow-2xl overflow-hidden anim-pop text-xs flex flex-col max-h-[85dvh]"
           >
             <div className="p-4 border-b border-stone-800 flex items-center justify-between bg-amber-500/10">
               <div className="flex items-center gap-2 text-amber-300 font-bold">
                 <Sparkles className="w-4 h-4 text-amber-400" />
-                <span>Gemini AI による処理結果</span>
+                <span>{memoAiResultModal.type === 'summarize' ? 'AI 要約' : memoAiResultModal.type === 'proofread' ? 'AI 校正' : 'コード解説'}</span>
               </div>
-              <button 
-                onClick={() => setMemoAiResultModal(null)}
-                className="text-stone-500 hover:text-white transition"
-              >
+              <button onClick={() => setMemoAiResultModal(null)} className="text-stone-500 hover:text-white" aria-label="閉じる">
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <div className="p-4 overflow-y-auto flex-1 text-stone-200 whitespace-pre-wrap leading-relaxed select-text">
-              {memoAiResultModal}
+            <div className="p-4 overflow-y-auto flex-1 text-stone-200 text-sm select-text">
+              {memoAiResultModal.type === 'proofread' ? (
+                <div className="whitespace-pre-wrap leading-relaxed">{memoAiResultModal.result}</div>
+              ) : (
+                <div className="markdown-body">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{memoAiResultModal.result}</ReactMarkdown>
+                </div>
+              )}
             </div>
-            <div className="p-3 border-t border-stone-800 flex items-center justify-between bg-[#16181D]">
+            <div className="p-3 border-t border-stone-800 flex flex-wrap items-center justify-end gap-2 bg-[#16181D]">
               <button
                 type="button"
                 onClick={() => {
-                  handleMemoContentChange(memoAiResultModal);
-                  setMemoAiResultModal(null);
-                  alert('現在のメモにAI処理結果を反映しました！');
+                  navigator.clipboard.writeText(memoAiResultModal.result);
+                  toast('コピーしました', { kind: 'success' });
                 }}
-                className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition flex items-center gap-1.5 shadow-sm"
-                title="現在のメモをこの結果で上書き反映"
+                className="px-3 py-1.5 btn-ghost rounded-lg flex items-center gap-1.5"
               >
-                <Check className="w-3.5 h-3.5" />
-                <span>メモに反映する</span>
+                <Copy className="w-3.5 h-3.5" />
+                <span>コピー</span>
               </button>
-
-              <div className="flex items-center gap-2">
+              {memoAiResultModal.type === 'proofread' && !isMonacoLocked && (
                 <button
                   type="button"
-                  onClick={() => {
-                    navigator.clipboard.writeText(memoAiResultModal);
-                    alert('クリップボードにコピーしました！');
-                  }}
-                  className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-white rounded-lg transition flex items-center gap-1.5"
+                  onClick={() => applyProofread(memoAiResultModal.result)}
+                  className="px-3.5 py-1.5 btn-primary font-bold rounded-lg flex items-center gap-1.5"
                 >
-                  <Copy className="w-3.5 h-3.5 text-amber-400" />
-                  <span>コピー</span>
+                  <Check className="w-3.5 h-3.5" />
+                  <span>メモに反映</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setMemoAiResultModal(null)}
-                  className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-lg transition"
-                >
-                  閉じる
-                </button>
-              </div>
+              )}
+              <button type="button" onClick={() => setMemoAiResultModal(null)} className="px-3.5 py-1.5 btn-ghost rounded-lg">
+                閉じる
+              </button>
             </div>
           </div>
         </div>

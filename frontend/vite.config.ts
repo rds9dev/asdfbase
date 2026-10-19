@@ -32,30 +32,8 @@ export default defineConfig({
         ]
       },
       workbox: {
-        runtimeCaching: [
-          {
-            urlPattern: /\/api\/notes/,
-            handler: 'NetworkFirst',
-            options: {
-              cacheName: 'notes-cache',
-              expiration: {
-                maxEntries: 20,
-                maxAgeSeconds: 24 * 60 * 60
-              }
-            }
-          },
-          {
-            urlPattern: /\/api\/assignments/,
-            handler: 'NetworkFirst',
-            options: {
-              cacheName: 'assignments-cache',
-              expiration: {
-                maxEntries: 50,
-                maxAgeSeconds: 24 * 60 * 60
-              }
-            }
-          }
-        ]
+        // API はキャッシュしない (古いメモ等が表示されるのを防ぐ)
+        navigateFallbackDenylist: [/^\/api\//, /^\/uploads\//],
       }
     })
   ],

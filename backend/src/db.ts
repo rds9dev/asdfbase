@@ -152,6 +152,38 @@ export async function initDb() {
       ALTER TABLE channels ADD COLUMN IF NOT EXISTS position INT DEFAULT 0;
     `).catch(err => console.warn('Migration note/channel warning:', err.message));
 
+    // マイグレーション: テスト種別 / アイコン / カレンダー予定
+    await client.query(`
+      ALTER TABLE test_scores ADD COLUMN IF NOT EXISTS exam_type VARCHAR(20) DEFAULT 'midterm';
+      ALTER TABLE test_scores ADD COLUMN IF NOT EXISTS exam_label VARCHAR(100) DEFAULT '';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT NULL;
+      CREATE TABLE IF NOT EXISTS calendar_events (
+        id SERIAL PRIMARY KEY,
+        user_id INT REFERENCES users(id) ON DELETE CASCADE,
+        username VARCHAR(50),
+        event_date DATE NOT NULL,
+        event_time VARCHAR(5) DEFAULT '',
+        title VARCHAR(100) NOT NULL,
+        note TEXT DEFAULT '',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS calendar_events_date_idx ON calendar_events (event_date);
+    `).catch(err => console.warn('Migration test/avatar/calendar warning:', err.message));
+
+    // 既存のテスト記録はテスト名から種別を推定 (初回のみ)
+    const migrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_test_exam_type'`);
+    if (migrated.rows.length === 0) {
+      await client.query(`
+        UPDATE test_scores SET exam_type = CASE
+          WHEN exam_name LIKE '%学年末%' THEN 'yearend'
+          WHEN exam_name LIKE '%期末%' THEN 'final'
+          WHEN exam_name LIKE '%診断%' OR exam_name LIKE '%実力%' THEN 'diagnostic'
+          ELSE 'midterm' END,
+          exam_label = exam_name
+      `);
+      await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_test_exam_type', 'done') ON CONFLICT DO NOTHING`);
+    }
+
     // 初期チャンネルの作成
     const channelRes = await client.query('SELECT COUNT(*) FROM channels');
     if (parseInt(channelRes.rows[0].count, 10) === 0) {
