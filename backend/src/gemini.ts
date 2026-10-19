@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, type Content, type FunctionDeclaration, type GenerateContentResponse } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -19,6 +19,13 @@ if (process.env.GEMINI_API_KEY && !parsedKeys.includes(process.env.GEMINI_API_KE
 
 let currentKeyIndex = 0;
 
+const MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-flash-lite-latest',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash'
+];
+
 export function getAvailableKeyCount(): number {
   return parsedKeys.length;
 }
@@ -29,12 +36,7 @@ export async function askGemini(prompt: string, systemInstruction?: string): Pro
     return '【Gemini連携】APIキーが設定されていません。.env に GEMINI_API_KEY_1 などを登録してください。';
   }
 
-  const models = [
-    'gemini-3.5-flash-lite',
-    'gemini-flash-lite-latest',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash'
-  ];
+  const models = MODELS;
   let lastError: any = null;
 
   // 登録されている全キーを順番に試行
@@ -90,4 +92,82 @@ export async function chatWithGemini(
     'あなたは中学生向けワークスペース「asdfbase」のAIアシスタントです。コンテキスト情報 (JSON) を必要に応じて活用し、前置きや締めの挨拶を省いて要点だけを日本語で簡潔に答えてください。';
 
   return askGemini(fullPrompt, defaultInstruction);
+}
+
+// ---------------- ツールを使う AI (関数呼び出し) ----------------
+export interface AgentStep {
+  name: string;
+  label: string;
+  ok: boolean;
+  write: boolean;
+}
+
+export interface AgentInput {
+  history: Content[];
+  systemInstruction: string;
+  tools: FunctionDeclaration[];
+  runTool: (name: string, args: any) => Promise<{ step: AgentStep; response: Record<string, unknown> }>;
+  maxSteps?: number;
+}
+
+// 一度成功したキーとモデルは、同じ会話の続きでも使い続ける (途中でモデルが変わると関数呼び出しの文脈が崩れるため)
+async function generateWithFallback(
+  contents: Content[],
+  config: object,
+  pinned: { key?: string; model?: string }
+): Promise<GenerateContentResponse> {
+  const keys = parsedKeys.map((_, i) => parsedKeys[(currentKeyIndex + i) % parsedKeys.length]);
+  currentKeyIndex = (currentKeyIndex + 1) % Math.max(parsedKeys.length, 1);
+  const combos = pinned.model
+    ? [pinned.key!, ...keys.filter(k => k !== pinned.key)].map(key => ({ key, model: pinned.model! }))
+    : keys.flatMap(key => MODELS.map(model => ({ key, model })));
+
+  let lastError: any = null;
+  for (const c of combos) {
+    try {
+      const client = new GoogleGenAI({ apiKey: c.key });
+      const response = await client.models.generateContent({ model: c.model, contents, config });
+      pinned.key = c.key;
+      pinned.model = c.model;
+      return response;
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`[Gemini agent] ${c.model} failed: ${err.message || err}`);
+    }
+  }
+  throw new Error(lastError?.message || 'すべてのAPIキーまたはモデルでの呼び出しに失敗しました');
+}
+
+export async function runGeminiAgent(input: AgentInput): Promise<{ text: string; steps: AgentStep[] }> {
+  if (parsedKeys.length === 0) {
+    return { text: '【Gemini連携】APIキーが設定されていません。', steps: [] };
+  }
+  const contents: Content[] = [...input.history];
+  const steps: AgentStep[] = [];
+  const pinned: { key?: string; model?: string } = {};
+  const config = {
+    systemInstruction: input.systemInstruction,
+    tools: input.tools.length > 0 ? [{ functionDeclarations: input.tools }] : undefined,
+  };
+  const maxSteps = input.maxSteps ?? 6;
+
+  for (let round = 0; round <= maxSteps; round++) {
+    // 上限に達したらツールなしで答えさせる
+    const roundConfig = round === maxSteps ? { systemInstruction: input.systemInstruction } : config;
+    const response = await generateWithFallback(contents, roundConfig, pinned);
+    const calls = response.functionCalls || [];
+    if (calls.length === 0) {
+      return { text: response.text?.trim() || '(応答が空でした)', steps };
+    }
+    const modelContent = response.candidates?.[0]?.content;
+    if (modelContent) contents.push(modelContent);
+    const parts: NonNullable<Content['parts']> = [];
+    for (const call of calls) {
+      const { step, response: toolResponse } = await input.runTool(call.name || '', call.args || {});
+      steps.push(step);
+      parts.push({ functionResponse: { id: call.id, name: call.name, response: toolResponse } });
+    }
+    contents.push({ role: 'user', parts });
+  }
+  return { text: '(応答をまとめられませんでした)', steps };
 }

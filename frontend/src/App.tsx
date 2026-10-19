@@ -4979,6 +4979,9 @@ export default function App() {
                       <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
                         <div className="text-white font-bold text-sm flex items-center gap-1.5">
                           <Trash2 className="w-4 h-4 text-amber-400" /> 古いチャットの自動削除
+                          <span className="ml-auto px-2.5 py-1 rounded-full border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs">
+                            現在: {integrations.chatRetentionDays ? `${integrations.chatRetentionDays}日より前を削除` : '削除しない'}
+                          </span>
                         </div>
                         <p className="text-stone-400 leading-relaxed">
                           Discord に転送されているチャンネルだけ、保存期間を過ぎたメッセージと画像をサーバーから削除します (Discord 側には残ります)。ピン留めしたメッセージは消えません。
@@ -5003,12 +5006,14 @@ export default function App() {
                                 await saveIntegrations({ chatRetentionDays: d });
                                 setTimeout(loadIntegrations, 3000);
                               }}
-                              className={`btn-chip px-3 py-1.5 rounded-lg border font-bold ${
+                              aria-pressed={integrations.chatRetentionDays === d}
+                              className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border font-bold transition ${
                                 integrations.chatRetentionDays === d
-                                  ? 'bg-amber-500/15 border-amber-500/60 text-amber-300'
-                                  : 'bg-stone-800 border-stone-700 text-stone-400'
-                              } disabled:opacity-50`}
+                                  ? 'bg-amber-500 border-amber-400 text-black shadow-[0_0_0_3px_rgba(245,158,11,0.2)]'
+                                  : 'bg-stone-800 border-stone-700 text-stone-400 enabled:hover:border-amber-500/50 enabled:hover:text-amber-300'
+                              } disabled:cursor-not-allowed`}
                             >
+                              {integrations.chatRetentionDays === d && <Check className="w-3.5 h-3.5" />}
                               {d === 0 ? '削除しない' : `${d}日`}
                             </button>
                           ))}

@@ -11,7 +11,9 @@ import path from 'path';
 import fs from 'fs';
 import dns from 'dns';
 import { pool, initDb } from './db.js';
-import { askGemini, chatWithGemini, getAvailableKeyCount } from './gemini.js';
+import { askGemini, getAvailableKeyCount, runGeminiAgent } from './gemini.js';
+import { aiToolDeclarations, createAiToolRunner } from './aiTools.js';
+import type { Content } from '@google/genai';
 import { startDiscordBot, relayToDiscordBot, getDiscordStatus, refreshDiscordCommands, getBoundAsdfChannelIds } from './discord.js';
 import {
   DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo,
@@ -750,7 +752,7 @@ app.put('/api/messages/:messageId', authMiddleware, async (req: AuthRequest, res
 
 // @gemini: チャンネルの直近の会話を履歴として渡して返信する
 const IMAGE_MD_RE = /!\[[^\]]*\]\([^)\s]+\)/g;
-async function replyAsGemini(channelId: number, trigger: { id: number; content: string; username?: string; sender_username?: string }) {
+async function replyAsGemini(channelId: number, trigger: { id: number; content: string; user_id?: number | null; username?: string; sender_username?: string }) {
   if (!/@gemini\b/i.test(String(trigger.content || ''))) return;
   try {
     const hist = await pool.query(
@@ -759,19 +761,53 @@ async function replyAsGemini(channelId: number, trigger: { id: number; content: 
        WHERE m.channel_id = $1 AND m.id <= $2 ORDER BY m.id DESC LIMIT 30`,
       [channelId, trigger.id]
     );
-    const history = hist.rows.reverse().map(r => {
-      const text = String(r.content || '').replace(IMAGE_MD_RE, '[画像]').slice(0, 2000);
-      return r.username === 'Gemini'
-        ? { role: 'model' as const, content: text }
-        : { role: 'user' as const, content: `${r.username}: ${text}` };
-    });
+    const rows = hist.rows.reverse();
+    // 直近の画像 (最大3枚) は中身も見せる
+    const recentImageIds = new Set(
+      rows.slice(-8).filter(r => /^!\[[^\]]*\]\(\/uploads\/[^)\s]+\)$/.test(String(r.content).trim())).slice(-3).map(r => r.id)
+    );
+    const history: Content[] = [];
+    for (const r of rows) {
+      const isGemini = r.username === 'Gemini';
+      const parts: NonNullable<Content['parts']> = [];
+      const imgMatch = recentImageIds.has(r.id) ? String(r.content).match(/\/uploads\/([^)\s]+)/) : null;
+      if (imgMatch) {
+        try {
+          const data = await fs.promises.readFile(path.join(UPLOAD_DIR, path.basename(imgMatch[1])));
+          parts.push({ text: `${r.username}: [画像]` }, { inlineData: { mimeType: 'image/webp', data: data.toString('base64') } });
+        } catch (_) {
+          parts.push({ text: `${r.username}: [画像]` });
+        }
+      } else {
+        const text = String(r.content || '').replace(IMAGE_MD_RE, '[画像]').slice(0, 2000);
+        parts.push({ text: isGemini ? text : `${r.username}: ${text}` });
+      }
+      history.push({ role: isGemini ? 'model' : 'user', parts });
+    }
     const channel = (await pool.query(`SELECT name FROM channels WHERE id = $1`, [channelId])).rows[0];
     const asker = trigger.sender_username || trigger.username || '';
-    const reply = await chatWithGemini(history, {
-      channel: channel?.name,
-      asked_by: asker,
-      now: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
-    }, `あなたはチャット「asdfbase」の参加者 Gemini です。会話の流れを踏まえ、最後に @gemini で呼びかけた ${asker} に答えてください。前置きは省き、チャットらしく簡潔に日本語で答えてください。`);
+
+    // 呼びかけた本人の権限でサイト内の情報を読めるようにする (チャットからは閲覧のみ)
+    const askerRow = trigger.user_id
+      ? (await pool.query(`SELECT id, username, role FROM users WHERE id = $1`, [trigger.user_id])).rows[0]
+      : null;
+    const authHeader = askerRow
+      ? `Bearer ${jwt.sign({ id: askerRow.id, username: askerRow.username, role: askerRow.role }, JWT_SECRET, { expiresIn: '5m' })}`
+      : '';
+    const { text: reply } = await runGeminiAgent({
+      history,
+      tools: askerRow ? aiToolDeclarations(false) : [],
+      runTool: createAiToolRunner({
+        pool, baseUrl: `http://127.0.0.1:${PORT}`, authHeader,
+        userId: askerRow?.id || 0, username: asker, allowWrite: false,
+      }),
+      systemInstruction: [
+        `あなたはチャット「asdfbase」の #${channel?.name || ''} に参加している Gemini です。現在は ${jstNowLabel()} (日本時間) です。`,
+        `会話の流れを踏まえ、最後に @gemini で呼びかけた ${asker} に答えてください。`,
+        '時間割・提出物・予定・メモ・過去のチャット・天気などが関係する質問では、推測せずツールで確認してから答えてください。',
+        '前置きは省き、チャットらしく簡潔に日本語で答えてください。',
+      ].join('\n'),
+    });
     const botResult = await pool.query(
       `INSERT INTO messages (channel_id, user_id, username, content, reply_to_id)
        VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`,
@@ -1261,13 +1297,56 @@ app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
       ...(Object.keys(dynamicReferences).length > 0 ? { dynamic_fetched_references: dynamicReferences } : {})
     };
 
-    const reply = await chatWithGemini(messages, mergedContext, systemInstruction);
-    res.json({ reply, keyCount: getAvailableKeyCount(), resolvedReferences: Object.keys(dynamicReferences) });
+    // 最後の質問に付いた画像 (Ctrl+V などで添付)
+    const images: { mimeType: string; data: string }[] = (Array.isArray(req.body.images) ? req.body.images : [])
+      .filter((im: any) => typeof im?.data === 'string' && /^image\/(png|jpeg|webp|gif)$/.test(im?.mimeType) && im.data.length < 7_000_000)
+      .slice(0, 4);
+    const history: Content[] = messages.slice(-30).map((m: any, i: number, arr: any[]) => {
+      const parts: NonNullable<Content['parts']> = [{ text: String(m.content || '').slice(0, 20000) || '(画像)' }];
+      if (i === arr.length - 1 && m.role === 'user') {
+        for (const im of images) parts.push({ inlineData: { mimeType: im.mimeType, data: im.data } });
+      }
+      return { role: m.role === 'model' ? 'model' : 'user', parts };
+    });
+
+    const allowWrite = req.body.allowActions !== false;
+    const runTool = createAiToolRunner({
+      pool, baseUrl: `http://127.0.0.1:${PORT}`, authHeader: String(req.headers.authorization),
+      userId: req.user!.id, username: req.user!.username, allowWrite,
+    });
+    const { text, steps } = await runGeminiAgent({
+      history,
+      tools: aiToolDeclarations(allowWrite),
+      runTool,
+      systemInstruction: systemInstruction || aiSystemInstruction(req.user!.username, mergedContext, allowWrite),
+    });
+    if (steps.some(st => st.write && st.ok)) {
+      logAudit(req.user!, 'ai_action', 'ai', null, { message: `AI が操作を実行: ${steps.filter(st => st.write && st.ok).map(st => st.label).join(' / ')}` });
+    }
+    res.json({ reply: text, steps, keyCount: getAvailableKeyCount(), resolvedReferences: Object.keys(dynamicReferences) });
   } catch (err: any) {
     console.error('AI chat error:', err);
-    res.status(500).json({ error: 'AI応答エラー' });
+    res.status(500).json({ error: `AI応答エラー: ${err.message || '不明なエラー'}` });
   }
 });
+
+function jstNowLabel() {
+  return new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'long', day: 'numeric', weekday: 'long', hour: '2-digit', minute: '2-digit' });
+}
+
+function aiSystemInstruction(username: string, context: object, allowWrite: boolean) {
+  return [
+    'あなたは中学生向けワークスペース「asdfbase」のAIアシスタントです。',
+    `現在は ${jstNowLabel()} (日本時間)、話している相手は ${username} です。「明日」「来週の金曜」などはこの日時を基準に YYYY-MM-DD に直してください。`,
+    '時間割・提出物・予定・メモ・チャット・テストの点数・天気などサイト内の情報が関係する質問では、推測せず必ずツールで最新の情報を確認してから答えてください。必要なら複数のツールを組み合わせてください。',
+    '「#3」「メモ3」はメモ番号、「#general」はチャンネル名を指します。',
+    allowWrite
+      ? '提出物の登録・進捗変更、予定の追加、メモへの追記は、ユーザーがはっきり頼んだときだけ実行してください。内容が曖昧なら実行せずに確認してください。削除や上書きはできません。実行したら何をしたかを一言で伝えてください。'
+      : 'この会話では情報の確認だけができ、登録や変更はできません。',
+    '前置きや締めの挨拶は省き、要点だけを日本語で簡潔に答えてください。表や箇条書き (Markdown) を使ってかまいません。',
+    `補助情報 (画面の状態, JSON): ${JSON.stringify(context).slice(0, 8000)}`,
+  ].join('\n');
+}
 
 // Memo AI Assistant (Summarize, Proofread, Explain Code)
 app.post('/api/ai/memo-assist', authMiddleware, async (req: AuthRequest, res) => {
