@@ -43,6 +43,25 @@ const rtProxy = createProxyMiddleware({
 });
 app.use(rtProxy);
 
+// 0.5 AI 系: Gemini はキー/モデルを順に試すため 30 秒を超えることがある
+const aiProxy = createProxyMiddleware({
+  target: BACKEND_TARGET,
+  changeOrigin: true,
+  secure: true,
+  pathFilter: ['/api/ai/**', '/api/assignments/summarize', '/api/test-scores/advice'],
+  proxyTimeout: 120000,
+  timeout: 120000,
+  on: {
+    error: (err, req, res) => {
+      console.error('[AI Proxy Error]', err.message);
+      if (res && typeof res.status === 'function' && !res.headersSent) {
+        res.status(504).json({ error: 'AI の応答が時間内に返りませんでした。もう一度試してください' });
+      }
+    },
+  },
+});
+app.use(aiProxy);
+
 // 1. API Reverse Proxy (Preserve /api prefix)
 const apiProxy = createProxyMiddleware({
   target: BACKEND_TARGET,
