@@ -62,6 +62,12 @@ async function saveBindings(list: DiscordBinding[]) {
   await deps!.setSetting(BINDINGS_KEY, JSON.stringify(list));
 }
 
+// Bot で Discord に同期している asdfbase チャンネル
+export async function getBoundAsdfChannelIds(): Promise<number[]> {
+  if (!client || !deps) return [];
+  return [...new Set((await getBindings()).map(b => b.asdfChannelId))];
+}
+
 export function isDiscordBotConfigured() {
   return Boolean(client);
 }

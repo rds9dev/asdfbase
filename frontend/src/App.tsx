@@ -744,6 +744,10 @@ export default function App() {
     if (newMsg.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = newMsg.id;
     if (processedMessageIdsRef.current.has(newMsg.id)) return;
     processedMessageIdsRef.current.add(newMsg.id);
+    // 長時間開きっぱなしでも増え続けないように古いIDは捨てる
+    if (processedMessageIdsRef.current.size > 3000) {
+      processedMessageIdsRef.current = new Set(Array.from(processedMessageIdsRef.current).slice(-1500));
+    }
 
     const me = currentUserRef.current;
     const isMine = Boolean(me && newMsg.user_id === me.id);
@@ -777,7 +781,15 @@ export default function App() {
     }
 
     if (isActiveChannel) {
-      setMessages(prev => mergeIncomingMessage(prev, newMsg));
+      setMessages(prev => {
+        const next = mergeIncomingMessage(prev, newMsg);
+        // 最下部を見ている間は、画面に持つメッセージを直近400件に抑える (上へスクロールすれば再取得)
+        if (next.length > 500 && isNearBottomRef.current) {
+          setHasMoreMessages(true);
+          return next.slice(-400);
+        }
+        return next;
+      });
       const mode = chatAutoScrollModeRef.current;
       // always: 常に最新へ / unread_anchor: 下端にいる時だけ / off: 自動スクロールしない
       if (isMine || mode === 'always' || (mode === 'unread_anchor' && isNearBottomRef.current)) {
@@ -4961,6 +4973,57 @@ export default function App() {
                         <button onClick={loadIntegrations} className="px-3 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 flex items-center gap-1.5">
                           <RefreshCw className="w-3 h-3" /> 状態を更新
                         </button>
+                      </div>
+
+                      {/* 古いチャットの自動削除 */}
+                      <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
+                        <div className="text-white font-bold text-sm flex items-center gap-1.5">
+                          <Trash2 className="w-4 h-4 text-amber-400" /> 古いチャットの自動削除
+                        </div>
+                        <p className="text-stone-400 leading-relaxed">
+                          Discord に転送されているチャンネルだけ、保存期間を過ぎたメッセージと画像をサーバーから削除します (Discord 側には残ります)。ピン留めしたメッセージは消えません。
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {[0, 7, 14, 30, 60, 90].map(d => (
+                            <button
+                              key={d}
+                              disabled={currentUser?.role !== 'admin'}
+                              onClick={async () => {
+                                if (d === integrations.chatRetentionDays) return;
+                                const shorter = d > 0 && (integrations.chatRetentionDays === 0 || d < integrations.chatRetentionDays);
+                                if (shorter) {
+                                  const ok = await confirmDialog({
+                                    title: `${d}日より前のメッセージを削除しますか？`,
+                                    message: '対象チャンネルの古いメッセージと画像がサーバーから削除されます。元に戻せません。',
+                                    confirmLabel: '削除する',
+                                    danger: true,
+                                  });
+                                  if (!ok) return;
+                                }
+                                await saveIntegrations({ chatRetentionDays: d });
+                                setTimeout(loadIntegrations, 3000);
+                              }}
+                              className={`btn-chip px-3 py-1.5 rounded-lg border font-bold ${
+                                integrations.chatRetentionDays === d
+                                  ? 'bg-amber-500/15 border-amber-500/60 text-amber-300'
+                                  : 'bg-stone-800 border-stone-700 text-stone-400'
+                              } disabled:opacity-50`}
+                            >
+                              {d === 0 ? '削除しない' : `${d}日`}
+                            </button>
+                          ))}
+                        </div>
+                        {currentUser?.role !== 'admin' && <div className="text-stone-500">変更できるのは管理者だけです。</div>}
+                        <div className="text-stone-500 leading-relaxed">
+                          対象: {integrations.retention?.channels?.length
+                            ? integrations.retention.channels.map((n: string) => `#${n}`).join(' ')
+                            : 'なし (Discord への転送がないので削除されません)'}
+                          {integrations.retention?.last && (
+                            <div>
+                              前回の掃除: {new Date(integrations.retention.last.at).toLocaleString('ja-JP')} · メッセージ {integrations.retention.last.messages}件 / 画像 {integrations.retention.last.files}枚
+                            </div>
+                          )}
+                        </div>
                       </div>
 
                       {/* Webhooks */}

@@ -12,7 +12,7 @@ import fs from 'fs';
 import dns from 'dns';
 import { pool, initDb } from './db.js';
 import { askGemini, chatWithGemini, getAvailableKeyCount } from './gemini.js';
-import { startDiscordBot, relayToDiscordBot, getDiscordStatus, refreshDiscordCommands } from './discord.js';
+import { startDiscordBot, relayToDiscordBot, getDiscordStatus, refreshDiscordCommands, getBoundAsdfChannelIds } from './discord.js';
 import {
   DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo,
   type ScheduleDef, type ScheduleType, type TimetableConfig,
@@ -608,10 +608,10 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
       return res.json(await attachReplies(result.rows));
     } else if (beforeId) {
       query += ` AND m.id < $2 ORDER BY m.id DESC LIMIT $3`;
-      params.push(beforeId, limit);
+      params.push(beforeId, Math.min(limit, 200));
     } else {
       query += ` ORDER BY m.id DESC LIMIT $2`;
-      params.push(limit);
+      params.push(Math.min(limit, 200));
     }
 
     const result = await pool.query(query, params);
@@ -1858,6 +1858,8 @@ app.get('/api/settings/integrations', authMiddleware, async (req: AuthRequest, r
       importantEnabled: (await getSetting('notify_important_enabled', 'on')) === 'on',
       messagesEnabled: (await getSetting('notify_messages_enabled', 'on')) === 'on',
       bot: await getDiscordStatus(),
+      chatRetentionDays: Number(await getSetting('chat_retention_days', String(DEFAULT_RETENTION_DAYS))),
+      retention: await retentionSummary(),
     });
   } catch (err) {
     res.status(500).json({ error: '連携設定取得エラー' });
@@ -1866,7 +1868,7 @@ app.get('/api/settings/integrations', authMiddleware, async (req: AuthRequest, r
 
 app.post('/api/settings/integrations', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { importantWebhookUrl, messageWebhookUrl, importantEnabled, messagesEnabled } = req.body || {};
+    const { importantWebhookUrl, messageWebhookUrl, importantEnabled, messagesEnabled, chatRetentionDays } = req.body || {};
     const isWebhook = (u: any) => typeof u === 'string' && (u === '' || /^https:\/\/(discord|discordapp)\.com\/api\/webhooks\//.test(u));
     if (importantWebhookUrl !== undefined) {
       if (!isWebhook(importantWebhookUrl)) return res.status(400).json({ error: '重要通知 Webhook URL の形式が正しくありません' });
@@ -1878,6 +1880,13 @@ app.post('/api/settings/integrations', authMiddleware, async (req: AuthRequest, 
     }
     if (importantEnabled !== undefined) await setSetting('notify_important_enabled', importantEnabled ? 'on' : 'off');
     if (messagesEnabled !== undefined) await setSetting('notify_messages_enabled', messagesEnabled ? 'on' : 'off');
+    if (chatRetentionDays !== undefined) {
+      if (req.user!.role !== 'admin') return res.status(403).json({ error: '自動削除の設定は管理者だけが変更できます' });
+      const days = Number(chatRetentionDays);
+      if (!RETENTION_CHOICES.includes(days)) return res.status(400).json({ error: '保存期間の値が正しくありません' });
+      await setSetting('chat_retention_days', String(days));
+      runRetention().catch(err => console.error('Retention error:', err.message));
+    }
     logAudit(req.user!, 'settings_update', 'settings', null, {
       message: '通知・Discord連携設定を変更',
       changed: Object.keys(req.body || {}),
@@ -2504,6 +2513,107 @@ wss.on('connection', (ws: WebSocket) => {
     if (info && info.userId) removeConnection(info.userId);
   });
 });
+
+// ---------------- 容量の掃除 ----------------
+// Discord に転送されているチャンネルのメッセージだけ、保存期間を過ぎたら削除する (ピン留めは残す)
+const DEFAULT_RETENTION_DAYS = 30;
+const RETENTION_CHOICES = [0, 7, 14, 30, 60, 90];
+const NOTE_HISTORY_KEEP = 30;
+const AUDIT_LOG_DAYS = 180;
+const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+// メッセージが Discord に残る (Bot同期 or メッセージ Webhook) チャンネル
+async function discordMirroredChannelIds(): Promise<number[]> {
+  if ((await getSetting('notify_messages_enabled', 'on')) !== 'on') return [];
+  if (await getSetting('discord_message_webhook_url', '')) {
+    return (await pool.query(`SELECT id FROM channels`)).rows.map(r => r.id);
+  }
+  return getBoundAsdfChannelIds();
+}
+
+async function retentionSummary() {
+  let last = null;
+  try { last = JSON.parse(await getSetting('chat_retention_last', 'null')); } catch (_) {}
+  const ids = await discordMirroredChannelIds();
+  const names = ids.length
+    ? (await pool.query(`SELECT name FROM channels WHERE id = ANY($1::int[]) ORDER BY position ASC, id ASC`, [ids])).rows.map(r => r.name)
+    : [];
+  return { channels: names, last };
+}
+
+// 削除したメッセージが使っていた画像のうち、どこからも参照されなくなったものを消す
+async function removeUnreferencedUploads(contents: string[]) {
+  const names = new Set<string>();
+  for (const c of contents) {
+    for (const m of c.matchAll(/\/uploads\/([A-Za-z0-9._-]+)/g)) {
+      if (!m[1].startsWith('avatar-')) names.add(m[1]);
+    }
+  }
+  let removed = 0;
+  for (const name of names) {
+    const ref = `%/uploads/${name}%`;
+    const used = await pool.query(
+      `SELECT 1 FROM messages WHERE content LIKE $1
+       UNION ALL SELECT 1 FROM notes WHERE content LIKE $1
+       UNION ALL SELECT 1 FROM users WHERE avatar_url LIKE $1 LIMIT 1`,
+      [ref]
+    );
+    if (used.rows.length > 0) continue;
+    try {
+      await fs.promises.unlink(path.join(UPLOAD_DIR, name));
+      removed++;
+    } catch (_) {}
+  }
+  return removed;
+}
+
+let retentionRunning = false;
+async function runRetention() {
+  if (retentionRunning) return;
+  retentionRunning = true;
+  try {
+    const days = Number(await getSetting('chat_retention_days', String(DEFAULT_RETENTION_DAYS)));
+    let deletedMessages = 0;
+    let deletedFiles = 0;
+    if (days > 0) {
+      const channelIds = await discordMirroredChannelIds();
+      if (channelIds.length > 0) {
+        // 一度に消しすぎて DB を止めないよう 500 件ずつ
+        for (;;) {
+          const del = await pool.query(
+            `DELETE FROM messages WHERE id IN (
+               SELECT id FROM messages
+               WHERE channel_id = ANY($1::int[]) AND is_pinned = FALSE AND created_at < NOW() - make_interval(days => $2)
+               ORDER BY id LIMIT 500
+             ) RETURNING content`,
+            [channelIds, days]
+          );
+          if (del.rows.length === 0) break;
+          deletedMessages += del.rows.length;
+          deletedFiles += await removeUnreferencedUploads(del.rows.map(r => r.content));
+        }
+      }
+    }
+    // メモの変更履歴は読まれていないので、各メモ直近だけ残す
+    await pool.query(
+      `DELETE FROM note_history WHERE id IN (
+         SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY slot_index ORDER BY id DESC) AS rn FROM note_history) t
+         WHERE rn > $1
+       )`,
+      [NOTE_HISTORY_KEEP]
+    );
+    await pool.query(`DELETE FROM audit_logs WHERE created_at < NOW() - make_interval(days => $1)`, [AUDIT_LOG_DAYS]);
+    await setSetting('chat_retention_last', JSON.stringify({ at: new Date().toISOString(), messages: deletedMessages, files: deletedFiles }));
+    if (deletedMessages > 0) console.log(`[retention] deleted ${deletedMessages} messages, ${deletedFiles} files`);
+  } finally {
+    retentionRunning = false;
+  }
+}
+
+setTimeout(() => {
+  runRetention().catch(err => console.error('Retention error:', err.message));
+  setInterval(() => runRetention().catch(err => console.error('Retention error:', err.message)), RETENTION_INTERVAL_MS);
+}, 2 * 60 * 1000);
 
 server.listen(PORT, async () => {
   console.log(`[asdfbase-backend] Server listening on http://127.0.0.1:${PORT}`);
