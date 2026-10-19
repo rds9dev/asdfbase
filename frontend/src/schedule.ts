@@ -138,15 +138,3 @@ export function computeSchoolStatus(now: Date, config: TimetableConfig, today: T
   }
   return { kind: 'after', label: '放課後', sub: `${periodCountFor(config, dow)}限授業の日` };
 }
-
-// 授業時間中 (朝の会の開始〜帰りの会の終了)。この間は AI を使えない
-export function schoolTime(now: Date, config: TimetableConfig): { inSchool: boolean; until?: string } {
-  const dow = now.getDay();
-  if (dow === 0 || dow === 6) return { inSchool: false };
-  const slots = daySlots(config, dow, []);
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const start = toMinutes(slots[0].time.start);
-  const last = slots[slots.length - 1].time;
-  if (nowMin >= start && nowMin < toMinutes(last.end)) return { inSchool: true, until: last.end };
-  return { inSchool: false };
-}

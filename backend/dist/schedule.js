@@ -6,7 +6,6 @@ exports.toMinutes = toMinutes;
 exports.fromMinutes = fromMinutes;
 exports.closingFor = closingFor;
 exports.nowInTokyo = nowInTokyo;
-exports.schoolTimeStatus = schoolTimeStatus;
 exports.SCHEDULE_TYPES = ['normal', 'short', 's_short'];
 exports.MAX_PERIODS = 6;
 exports.DEFAULT_SCHEDULES = {
@@ -74,18 +73,4 @@ function nowInTokyo(date = new Date()) {
         dow,
         minutes: Number(get('hour')) * 60 + Number(get('minute')),
     };
-}
-// 授業時間中 (朝の会の開始〜帰りの会の終了) かどうか
-function schoolTimeStatus(config, date = new Date()) {
-    const now = nowInTokyo(date);
-    if (now.dow < 1 || now.dow > 5)
-        return { inSchool: false };
-    const def = config.schedules[config.activeScheduleType] || exports.DEFAULT_SCHEDULES.normal;
-    const count = config.dayPeriodCounts[String(now.dow)] || exports.MAX_PERIODS;
-    const closing = closingFor(def, count);
-    const start = toMinutes(def.morning.start);
-    const end = toMinutes(closing.end);
-    if (now.minutes >= start && now.minutes < end)
-        return { inSchool: true, until: closing.end };
-    return { inSchool: false };
 }

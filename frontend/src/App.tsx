@@ -92,7 +92,7 @@ import { RealtimeClient, type RealtimeStatus, type ConcreteTransport } from './r
 import { UiHost, HoverCard, Modal, confirmDialog, toast } from './ui';
 import {
   DEFAULT_CONFIG, SCHEDULE_LABELS, DAY_LABELS, MAX_PERIODS, SUBJECTS,
-  computeSchoolStatus, daySlots, schoolTime, periodCountFor, closingFor,
+  computeSchoolStatus, daySlots, periodCountFor, closingFor,
   type ScheduleType, type ScheduleDef, type TimetableConfig, type TimetableItem,
 } from './schedule';
 import { renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates } from './chatText';
@@ -452,8 +452,6 @@ export default function App() {
   const [scheduleType, setScheduleType] = useState<ScheduleType>('normal');
   const [ttConfig, setTtConfig] = useState<TimetableConfig>(DEFAULT_CONFIG);
   const todaySchedule = ttConfig.activeScheduleType;
-  // 授業時間中 (朝の会〜帰りの会) は AI を使えない
-  const aiLock = schoolTime(now, ttConfig);
   const [todayTimetables, setTodayTimetables] = useState<TimetableItem[]>([]);
   const [selectedTtCell, setSelectedTtCell] = useState<{ day: number; period: number } | null>(null);
   const [ttDetailDraft, setTtDetailDraft] = useState<{ subject: string; items: string; note: string }>({ subject: '', items: '', note: '' });
@@ -1410,9 +1408,6 @@ export default function App() {
     setCompletion(null);
     setReplyToMessage(null);
     lastTypingSentRef.current = 0;
-    if (/@gemini\b/i.test(content) && aiLock.inSchool) {
-      toast(`授業時間中は @gemini は返信しません (${aiLock.until} まで)`, { kind: 'error' });
-    }
 
     const me = currentUserRef.current;
     const optimistic: Message = {
@@ -1666,10 +1661,6 @@ export default function App() {
   // Memo AI Assistant Handler
   const handleMemoAiAssist = async (type: 'summarize' | 'proofread' | 'explain_code') => {
     if (!token || !memoContent.trim() || isMemoAiLoading) return;
-    if (aiLock.inSchool) {
-      toast(`授業時間中は AI を使えません (${aiLock.until} まで)`, { kind: 'error' });
-      return;
-    }
     setIsMemoAiLoading(true);
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/ai/memo-assist`, {
@@ -2316,10 +2307,6 @@ export default function App() {
   // Phase 3: Gemini Summarize Assignment (opens clean floating modal)
   const handleSummarizeAssignment = async (assignment: Assignment) => {
     if (!token || !assignment.description) return;
-    if (aiLock.inSchool) {
-      toast(`授業時間中は AI を使えません (${aiLock.until} まで)`, { kind: 'error' });
-      return;
-    }
     setIsSummarizingAI(assignment.id);
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/assignments/summarize`, {
@@ -2826,7 +2813,7 @@ export default function App() {
     if (completion.kind === '@') {
       const pool = [
         { key: 'everyone', label: 'everyone', insert: '@everyone', sub: '全員に通知' },
-        ...(aiLock.inSchool ? [] : [{ key: 'gemini', label: 'gemini', insert: '@gemini', sub: 'AI に質問' }]),
+        { key: 'gemini', label: 'gemini', insert: '@gemini', sub: 'AI に質問' },
         ...onlineUsers.filter(u => u.id !== currentUser.id).map(u => ({ key: `u${u.id}`, label: u.username, insert: `@${u.username}`, avatar: u.avatar_url, sub: u.status === 'online' ? 'オンライン' : undefined })),
       ];
       return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
@@ -3887,19 +3874,19 @@ export default function App() {
                   )}
 
                   {/* Memo AI */}
-                  <div className="flex items-center gap-1" title={aiLock.inSchool ? `授業時間中は AI を使えません (${aiLock.until} まで)` : undefined}>
+                  <div className="flex items-center gap-1">
                     {selectedSlotIndex <= 10 ? (
                       <>
                         <button
                           onClick={() => handleMemoAiAssist('summarize')}
-                          disabled={isMemoAiLoading || !memoContent.trim() || aiLock.inSchool}
+                          disabled={isMemoAiLoading || !memoContent.trim()}
                           className="btn-chip text-[11px] disabled:opacity-40"
                         >
                           <Sparkles className="w-3 h-3 text-amber-400" /> {isMemoAiLoading ? '処理中…' : '要約'}
                         </button>
                         <button
                           onClick={() => handleMemoAiAssist('proofread')}
-                          disabled={isMemoAiLoading || !memoContent.trim() || aiLock.inSchool || isMonacoLocked}
+                          disabled={isMemoAiLoading || !memoContent.trim() || isMonacoLocked}
                           className="btn-chip text-[11px] disabled:opacity-40"
                         >
                           <CheckCircle2 className="w-3 h-3 text-amber-400" /> 校正
@@ -3908,13 +3895,12 @@ export default function App() {
                     ) : (
                       <button
                         onClick={() => handleMemoAiAssist('explain_code')}
-                        disabled={isMemoAiLoading || !memoContent.trim() || aiLock.inSchool}
+                        disabled={isMemoAiLoading || !memoContent.trim()}
                         className="btn-chip text-[11px] disabled:opacity-40"
                       >
                         <Bot className="w-3 h-3 text-amber-400" /> {isMemoAiLoading ? '処理中…' : 'コード解説'}
                       </button>
                     )}
-                    {aiLock.inSchool && <Lock className="w-3 h-3 text-stone-600" />}
                   </div>
 
                   {memoUndo && memoUndo.slot === selectedSlotIndex && (
@@ -4008,7 +3994,6 @@ export default function App() {
             token={token}
             safeFetch={safeFetch}
             buildContext={buildAiContext}
-            lock={aiLock}
             memo={{ slot: selectedSlotIndex, title: memoTitle, content: memoContent }}
             onAppendToMemo={text => {
               const next = memoContent ? `${memoContent}\n\n---\n${text}` : text;
@@ -4254,11 +4239,10 @@ export default function App() {
                           <div className="flex items-center justify-between">
                             <button
                               onClick={() => handleSummarizeAssignment(item)}
-                              disabled={isSummarizingAI === item.id || !item.description || aiLock.inSchool}
-                              title={aiLock.inSchool ? `授業時間中は AI を使えません (${aiLock.until} まで)` : undefined}
+                              disabled={isSummarizingAI === item.id || !item.description}
                               className="btn-chip text-xs disabled:opacity-40"
                             >
-                              {aiLock.inSchool ? <Lock className="w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5 text-amber-400" />}
+                              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
                               <span>{isSummarizingAI === item.id ? '要約中…' : 'AIで要約'}</span>
                             </button>
                             {summarizedTexts[item.id] && (
@@ -4435,7 +4419,7 @@ export default function App() {
         {/* TAB 6: その他 (テスト点数) */}
         {activeTab === 'more' && (
           <div className="flex-1 min-h-0 flex anim-tab">
-            <TestScoresTab token={token} safeFetch={safeFetch} currentUser={currentUser} users={onlineUsers} lock={aiLock} />
+            <TestScoresTab token={token} safeFetch={safeFetch} currentUser={currentUser} users={onlineUsers} />
           </div>
         )}
 

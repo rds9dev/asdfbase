@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Award, Lock, Plus, Sparkles, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
+import { Award, Plus, Sparkles, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
 import { MAIN_SUBJECTS, PRACTICAL_SUBJECTS } from './schedule';
 
@@ -31,10 +31,9 @@ interface Props {
   safeFetch: (input: string, init?: RequestInit) => Promise<Response>;
   currentUser: { id: number; username: string; role: string };
   users: { id: number; username: string }[];
-  lock: { inSchool: boolean; until?: string };
 }
 
-export default function TestScoresTab({ token, safeFetch, currentUser, users, lock }: Props) {
+export default function TestScoresTab({ token, safeFetch, currentUser, users }: Props) {
   const [examType, setExamType] = useState<ExamType>('midterm');
   const [viewUserId, setViewUserId] = useState<number>(currentUser.id);
   const [scores, setScores] = useState<TestScore[]>([]);
@@ -315,9 +314,7 @@ export default function TestScoresTab({ token, safeFetch, currentUser, users, lo
               <span className="flex items-center gap-1.5 font-bold text-white">
                 <Sparkles className="w-4 h-4 text-amber-400" /> {typeLabel}の AI アドバイス
               </span>
-              {lock.inSchool ? (
-                <span className="flex items-center gap-1 text-red-300"><Lock className="w-3.5 h-3.5" /> 授業時間中は使えません</span>
-              ) : (
+              {(
                 <button onClick={getAdvice} disabled={adviceLoading || ofType.length === 0} className="px-4 py-1.5 rounded-xl btn-primary font-bold disabled:opacity-40">
                   {adviceLoading ? '分析中…' : 'アドバイスをもらう'}
                 </button>

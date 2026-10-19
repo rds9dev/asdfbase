@@ -14,7 +14,7 @@ import { pool, initDb } from './db.js';
 import { askGemini, chatWithGemini, getAvailableKeyCount } from './gemini.js';
 import { startDiscordBot, relayToDiscordBot, getDiscordStatus, refreshDiscordCommands } from './discord.js';
 import {
-  DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo, schoolTimeStatus,
+  DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo,
   type ScheduleDef, type ScheduleType, type TimetableConfig,
 } from './schedule.js';
 
@@ -748,12 +748,11 @@ app.put('/api/messages/:messageId', authMiddleware, async (req: AuthRequest, res
   }
 });
 
-// @gemini: チャンネルの直近の会話を履歴として渡して返信する (授業時間中は返信しない)
+// @gemini: チャンネルの直近の会話を履歴として渡して返信する
 const IMAGE_MD_RE = /!\[[^\]]*\]\([^)\s]+\)/g;
 async function replyAsGemini(channelId: number, trigger: { id: number; content: string; username?: string; sender_username?: string }) {
   if (!/@gemini\b/i.test(String(trigger.content || ''))) return;
   try {
-    if ((await getSchoolTime()).inSchool) return;
     const hist = await pool.query(
       `SELECT m.id, m.content, m.user_id, COALESCE(u.username, m.username) AS username, m.created_at
        FROM messages m LEFT JOIN users u ON u.id = m.user_id
@@ -1056,7 +1055,7 @@ app.put('/api/assignments/:id/progress', authMiddleware, async (req: AuthRequest
 });
 
 // Gemini Summarize Assignment
-app.post('/api/assignments/summarize', authMiddleware, aiGuard, async (req, res) => {
+app.post('/api/assignments/summarize', authMiddleware, async (req, res) => {
   try {
     const { description } = req.body;
     if (!description) return res.status(400).json({ error: '内容が空です' });
@@ -1151,7 +1150,7 @@ app.delete('/api/test-scores/:id', authMiddleware, async (req: AuthRequest, res)
 });
 
 // 種別ごとに、回を追った推移から学習アドバイス
-app.post('/api/test-scores/advice', authMiddleware, aiGuard, async (req: AuthRequest, res) => {
+app.post('/api/test-scores/advice', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const userId = req.user!.id;
     const examType = EXAM_TYPES[req.body?.examType] ? req.body.examType : 'midterm';
@@ -1181,7 +1180,7 @@ app.post('/api/test-scores/advice', authMiddleware, aiGuard, async (req: AuthReq
 });
 
 // AI Chat Endpoint (for AI Tab) with Smart # and @ contextual resolver
-app.post('/api/ai/chat', authMiddleware, aiGuard, async (req: AuthRequest, res) => {
+app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { messages, contextData, systemInstruction } = req.body;
     if (!messages || !Array.isArray(messages)) {
@@ -1271,7 +1270,7 @@ app.post('/api/ai/chat', authMiddleware, aiGuard, async (req: AuthRequest, res) 
 });
 
 // Memo AI Assistant (Summarize, Proofread, Explain Code)
-app.post('/api/ai/memo-assist', authMiddleware, aiGuard, async (req: AuthRequest, res) => {
+app.post('/api/ai/memo-assist', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { content, type, customPrompt } = req.body;
     if (!content && !customPrompt) {
@@ -1332,21 +1331,6 @@ async function getTimetableConfig(): Promise<TimetableConfig & { activeDate: str
   const today = nowInTokyo().date;
   const activeScheduleType = (SCHEDULE_TYPES as readonly string[]).includes(active) && activeDate === today ? active as ScheduleType : 'normal';
   return { activeScheduleType, activeDate: today, schedules, dayPeriodCounts };
-}
-
-async function getSchoolTime() {
-  return schoolTimeStatus(await getTimetableConfig());
-}
-
-// 授業時間中は AI を使わせない
-async function aiGuard(req: Request, res: Response, next: NextFunction) {
-  try {
-    const st = await getSchoolTime();
-    if (st.inSchool) {
-      return res.status(403).json({ error: `授業時間中は AI を使えません (${st.until} まで)`, code: 'SCHOOL_TIME', until: st.until });
-    }
-  } catch (_) {}
-  next();
 }
 
 // 時程(朝の会・各時限・帰りの会)と「今日の時程」: 全員で共有

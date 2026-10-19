@@ -652,14 +652,12 @@ app.put('/api/messages/:messageId', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'メッセージ編集エラー' });
     }
 });
-// @gemini: チャンネルの直近の会話を履歴として渡して返信する (授業時間中は返信しない)
+// @gemini: チャンネルの直近の会話を履歴として渡して返信する
 const IMAGE_MD_RE = /!\[[^\]]*\]\([^)\s]+\)/g;
 async function replyAsGemini(channelId, trigger) {
     if (!/@gemini\b/i.test(String(trigger.content || '')))
         return;
     try {
-        if ((await getSchoolTime()).inSchool)
-            return;
         const hist = await db_js_1.pool.query(`SELECT m.id, m.content, m.user_id, COALESCE(u.username, m.username) AS username, m.created_at
        FROM messages m LEFT JOIN users u ON u.id = m.user_id
        WHERE m.channel_id = $1 AND m.id <= $2 ORDER BY m.id DESC LIMIT 30`, [channelId, trigger.id]);
@@ -909,7 +907,7 @@ app.put('/api/assignments/:id/progress', authMiddleware, async (req, res) => {
     }
 });
 // Gemini Summarize Assignment
-app.post('/api/assignments/summarize', authMiddleware, aiGuard, async (req, res) => {
+app.post('/api/assignments/summarize', authMiddleware, async (req, res) => {
     try {
         const { description } = req.body;
         if (!description)
@@ -995,7 +993,7 @@ app.delete('/api/test-scores/:id', authMiddleware, async (req, res) => {
     }
 });
 // 種別ごとに、回を追った推移から学習アドバイス
-app.post('/api/test-scores/advice', authMiddleware, aiGuard, async (req, res) => {
+app.post('/api/test-scores/advice', authMiddleware, async (req, res) => {
     try {
         const userId = req.user.id;
         const examType = EXAM_TYPES[req.body?.examType] ? req.body.examType : 'midterm';
@@ -1020,7 +1018,7 @@ app.post('/api/test-scores/advice', authMiddleware, aiGuard, async (req, res) =>
     }
 });
 // AI Chat Endpoint (for AI Tab) with Smart # and @ contextual resolver
-app.post('/api/ai/chat', authMiddleware, aiGuard, async (req, res) => {
+app.post('/api/ai/chat', authMiddleware, async (req, res) => {
     try {
         const { messages, contextData, systemInstruction } = req.body;
         if (!messages || !Array.isArray(messages)) {
@@ -1094,7 +1092,7 @@ app.post('/api/ai/chat', authMiddleware, aiGuard, async (req, res) => {
     }
 });
 // Memo AI Assistant (Summarize, Proofread, Explain Code)
-app.post('/api/ai/memo-assist', authMiddleware, aiGuard, async (req, res) => {
+app.post('/api/ai/memo-assist', authMiddleware, async (req, res) => {
     try {
         const { content, type, customPrompt } = req.body;
         if (!content && !customPrompt) {
@@ -1156,20 +1154,6 @@ async function getTimetableConfig() {
     const today = (0, schedule_js_1.nowInTokyo)().date;
     const activeScheduleType = schedule_js_1.SCHEDULE_TYPES.includes(active) && activeDate === today ? active : 'normal';
     return { activeScheduleType, activeDate: today, schedules, dayPeriodCounts };
-}
-async function getSchoolTime() {
-    return (0, schedule_js_1.schoolTimeStatus)(await getTimetableConfig());
-}
-// 授業時間中は AI を使わせない
-async function aiGuard(req, res, next) {
-    try {
-        const st = await getSchoolTime();
-        if (st.inSchool) {
-            return res.status(403).json({ error: `授業時間中は AI を使えません (${st.until} まで)`, code: 'SCHOOL_TIME', until: st.until });
-        }
-    }
-    catch (_) { }
-    next();
 }
 // 時程(朝の会・各時限・帰りの会)と「今日の時程」: 全員で共有
 app.get('/api/timetables/config', authMiddleware, async (req, res) => {

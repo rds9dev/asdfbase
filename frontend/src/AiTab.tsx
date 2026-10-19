@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Bot, Copy, FileText, Lock, Plus, Send, Sparkles, Trash2 } from 'lucide-react';
+import { Bot, Copy, FileText, Plus, Send, Sparkles, Trash2 } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
 
 interface AiMessage {
@@ -19,7 +19,6 @@ interface AiTabProps {
   token: string;
   safeFetch: (input: string, init?: RequestInit) => Promise<Response>;
   buildContext: () => object;
-  lock: { inSchool: boolean; until?: string };
   memo: { slot: number; title: string; content: string };
   onAppendToMemo: (text: string) => void;
 }
@@ -36,7 +35,7 @@ function loadHistory(key: string): AiMessage[] {
   }
 }
 
-export default function AiTab({ active, userId, token, safeFetch, buildContext, lock, memo, onAppendToMemo }: AiTabProps) {
+export default function AiTab({ active, userId, token, safeFetch, buildContext, memo, onAppendToMemo }: AiTabProps) {
   const storageKey = `asdf_ai_history_${userId}`;
   const [messages, setMessages] = useState<AiMessage[]>(() => loadHistory(storageKey));
   const [input, setInput] = useState('');
@@ -81,7 +80,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
 
   const send = async () => {
     const text = input.trim();
-    if (!text || loading || lock.inSchool) return;
+    if (!text || loading) return;
     const userMsg: AiMessage = { id: Date.now(), role: 'user', content: text, timestamp: timeNow() };
     const next = [...messages, userMsg];
     setMessages(next);
@@ -138,11 +137,6 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
         <div className="flex items-center gap-2 font-bold text-white">
           <Bot className="w-4 h-4 text-amber-400" />
           <span>AI</span>
-          {lock.inSchool && (
-            <span className="flex items-center gap-1 text-[10px] font-normal text-red-300 bg-red-950/40 border border-red-900/60 px-2 py-0.5 rounded-full">
-              <Lock className="w-3 h-3" /> 授業時間中
-            </span>
-          )}
         </div>
         <button
           onClick={clearHistory}
@@ -233,11 +227,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
 
       <div className="shrink-0 border-t border-stone-800/80 bg-[#111214] p-2.5 sm:p-3">
         <div className="max-w-4xl mx-auto space-y-2">
-          {lock.inSchool ? (
-            <div className="flex items-center justify-center gap-2 py-3 text-xs text-red-300">
-              <Lock className="w-4 h-4" /> 授業時間中は AI を使えません ({lock.until} まで)
-            </div>
-          ) : (
+          {(
             <>
               <div className="flex items-center gap-2 text-[11px] text-stone-500">
                 <button onClick={quoteMemo} className="btn-chip">

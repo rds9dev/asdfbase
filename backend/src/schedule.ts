@@ -1,4 +1,4 @@
-// 時程 (朝の会・1〜6限・帰りの会) と「今日の時程」、授業時間中の判定
+// 時程 (朝の会・1〜6限・帰りの会) と「今日の時程」
 export type PeriodTime = { start: string; end: string };
 export interface ScheduleDef {
   morning: PeriodTime;
@@ -87,17 +87,4 @@ export interface TimetableConfig {
   activeScheduleType: ScheduleType;
   schedules: Record<ScheduleType, ScheduleDef>;
   dayPeriodCounts: Record<string, number>;
-}
-
-// 授業時間中 (朝の会の開始〜帰りの会の終了) かどうか
-export function schoolTimeStatus(config: TimetableConfig, date = new Date()) {
-  const now = nowInTokyo(date);
-  if (now.dow < 1 || now.dow > 5) return { inSchool: false as const };
-  const def = config.schedules[config.activeScheduleType] || DEFAULT_SCHEDULES.normal;
-  const count = config.dayPeriodCounts[String(now.dow)] || MAX_PERIODS;
-  const closing = closingFor(def, count);
-  const start = toMinutes(def.morning.start);
-  const end = toMinutes(closing.end);
-  if (now.minutes >= start && now.minutes < end) return { inSchool: true as const, until: closing.end };
-  return { inSchool: false as const };
 }
