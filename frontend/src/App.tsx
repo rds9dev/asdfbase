@@ -430,6 +430,8 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  // 送信待ちの画像 (Ctrl+V / ドロップ / 画像ボタン)。入力欄の上に小さくプレビューする
+  const [pendingImages, setPendingImages] = useState<{ id: string; file: File; url: string }[]>([]);
   const [copiedLinkMessageId, setCopiedLinkMessageId] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1339,36 +1341,56 @@ export default function App() {
     setCurrentUser(null);
   };
 
-  // Image Upload
-  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !token) return;
+  // Image Upload: 送信時までは手元でプレビューだけ
+  const MAX_PENDING_IMAGES = 10;
+  const addPendingImages = (files: File[]) => {
+    const images = files.filter(f => f.type.startsWith('image/'));
+    if (images.length === 0) return;
+    setPendingImages(prev => {
+      const room = MAX_PENDING_IMAGES - prev.length;
+      if (images.length > room) toast(`画像は一度に${MAX_PENDING_IMAGES}枚までです`, { kind: 'error' });
+      const added = images.slice(0, Math.max(room, 0)).map(file => ({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        file,
+        url: URL.createObjectURL(file),
+      }));
+      return [...prev, ...added];
+    });
+    chatInputRef.current?.focus();
+  };
 
-    setIsUploading(true);
+  const removePendingImage = (id: string) => {
+    setPendingImages(prev => {
+      const target = prev.find(p => p.id === id);
+      if (target) URL.revokeObjectURL(target.url);
+      return prev.filter(p => p.id !== id);
+    });
+  };
+
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    addPendingImages(Array.from(e.target.files || []));
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleComposerPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(e.clipboardData.files).filter(f => f.type.startsWith('image/'));
+    if (files.length === 0) return;
+    // 画像だけのコピーならテキスト貼り付けは起きないようにする
+    if (!e.clipboardData.getData('text/plain')) e.preventDefault();
+    addPendingImages(files);
+  };
+
+  const uploadChatImage = async (file: File): Promise<string> => {
     const formData = new FormData();
     formData.append('image', file);
-
-    try {
-      const res = await safeFetch(`${API_BASE_URL}/api/upload`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData,
-      });
-      const data = await res.json();
-      if (res.ok && data.url) {
-        const clientNonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-        await postChatMessage(`![image](${data.url})`, activeChannelId, clientNonce, null);
-        scheduleScrollToBottom();
-      } else {
-        toast(data.error || '画像を送信できませんでした', { kind: 'error' });
-      }
-    } catch (err) {
-      console.error('Image upload error:', err);
-      toast('画像を送信できませんでした', { kind: 'error' });
-    } finally {
-      setIsUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
+    const res = await safeFetch(`${API_BASE_URL}/api/upload`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.url) throw new Error(data.error || '画像を送信できませんでした');
+    return data.url;
   };
 
   // Chat Send with Instant Local Reflection & Auto Scroll
@@ -1398,37 +1420,71 @@ export default function App() {
   // Chat Send: 楽観的に即時表示 → サーバー確定で置換
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!chatInput.trim() || !token) return;
+    const images = pendingImages;
+    if ((!chatInput.trim() && images.length === 0) || !token) return;
 
     const content = chatInput.replace(/\s+$/, '');
     const targetChannelId = activeChannelId;
-    const clientNonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const replyTarget = replyToMessage && replyToMessage.channel_id === targetChannelId ? replyToMessage : null;
     setChatInput('');
+    setPendingImages([]);
     setCompletion(null);
     setReplyToMessage(null);
     lastTypingSentRef.current = 0;
 
     const me = currentUserRef.current;
-    const optimistic: Message = {
+    const newNonce = () => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const makeOptimistic = (body: string, clientNonce: string, withReply: boolean): Message => ({
       id: tempMessageIdRef.current--,
       channel_id: targetChannelId,
       user_id: me?.id ?? 0,
       username: me?.username ?? '',
       sender_username: me?.username,
-      content,
+      content: body,
       created_at: new Date().toISOString(),
       client_nonce: clientNonce,
       pending: true,
-      reply_to_id: replyTarget?.id ?? null,
-      reply_to: replyTarget
+      reply_to_id: withReply ? replyTarget?.id ?? null : null,
+      reply_to: withReply && replyTarget
         ? { id: replyTarget.id, username: replyTarget.sender_username || replyTarget.username, user_id: replyTarget.user_id, content: summarizeContent(replyTarget.content) }
         : null,
-    };
-    setMessages(prev => [...prev, optimistic]);
+    });
+
+    // 本文 → 画像の順に1件ずつ送る (返信先は最初の1件にだけ付ける)
+    const textNonce = content.trim() ? newNonce() : null;
+    const imageNonces = images.map(() => newNonce());
+    const optimistic: Message[] = [];
+    if (textNonce) optimistic.push(makeOptimistic(content, textNonce, true));
+    images.forEach((img, i) => optimistic.push(makeOptimistic(`![image](${img.url})`, imageNonces[i], !textNonce && i === 0)));
+    setMessages(prev => [...prev, ...optimistic]);
     scheduleScrollToBottom();
 
-    await postChatMessage(content, targetChannelId, clientNonce, replyTarget?.id);
+    if (textNonce) await postChatMessage(content, targetChannelId, textNonce, replyTarget?.id);
+    if (images.length === 0) return;
+
+    setIsUploading(true);
+    const uploads = images.map(img => uploadChatImage(img.file).then(url => ({ url }), (err: Error) => ({ error: err })));
+    const failed: typeof images = [];
+    for (let i = 0; i < images.length; i++) {
+      const result = await uploads[i];
+      const nonce = imageNonces[i];
+      if ('url' in result) {
+        // 再送に備えて、表示中の仮メッセージも本物のURLに差し替えておく
+        const body = `![image](${result.url})`;
+        setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === nonce ? { ...m, content: body } : m)));
+        await postChatMessage(`![image](${result.url})`, targetChannelId, nonce, !textNonce && i === 0 ? replyTarget?.id : null);
+        URL.revokeObjectURL(images[i].url);
+      } else {
+        setMessages(prev => prev.filter(m => !(m.id < 0 && m.client_nonce === nonce)));
+        failed.push(images[i]);
+      }
+    }
+    setIsUploading(false);
+    if (failed.length > 0) {
+      // 送れなかった画像はプレビューに戻して、もう一度送れるようにする
+      setPendingImages(prev => [...failed, ...prev]);
+      toast(`画像${failed.length}枚を送信できませんでした。もう一度送信してください`, { kind: 'error' });
+    }
   };
 
   // ↑キー: 入力欄が空なら自分の最後のメッセージを編集
@@ -3556,7 +3612,41 @@ export default function App() {
                   </div>
                 )}
 
-                <form onSubmit={handleSendMessage}>
+                <form
+                  onSubmit={handleSendMessage}
+                  onDragOver={e => {
+                    if (Array.from(e.dataTransfer.types).includes('Files')) e.preventDefault();
+                  }}
+                  onDrop={e => {
+                    const files = Array.from(e.dataTransfer.files);
+                    if (files.length === 0) return;
+                    e.preventDefault();
+                    addPendingImages(files);
+                  }}
+                >
+                  {pendingImages.length > 0 && (
+                    <div className="flex gap-2 px-1 pb-2 overflow-x-auto anim-fade">
+                      {pendingImages.map(img => (
+                        <div key={img.id} className="relative shrink-0 group anim-pop">
+                          <img
+                            src={img.url}
+                            alt={img.file.name}
+                            onClick={() => setLightbox({ src: img.url, zoom: 1 })}
+                            className="w-16 h-16 sm:w-20 sm:h-20 object-cover rounded-lg border border-stone-700 bg-stone-900 cursor-zoom-in"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removePendingImage(img.id)}
+                            title="この画像を外す"
+                            aria-label="この画像を外す"
+                            className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-stone-800 border border-stone-600 text-stone-300 hover:bg-red-600 hover:text-white hover:border-red-500 shadow"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {replyToMessage && (
                     <div className="flex items-center gap-2 px-3 py-1.5 mb-1 rounded-lg bg-stone-900/80 border border-stone-800 text-xs text-stone-400 anim-fade">
                       <Reply className="w-3.5 h-3.5 text-amber-400 shrink-0" />
@@ -3578,6 +3668,7 @@ export default function App() {
                     <input
                       type="file"
                       accept="image/*"
+                      multiple
                       ref={fileInputRef}
                       onChange={handleImageUpload}
                       className="hidden"
@@ -3585,8 +3676,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
-                      disabled={isUploading}
-                      title="画像を送る"
+                      title="画像を添付 (Ctrl+V で貼り付けも可)"
                       className="p-1 rounded-lg text-stone-400 hover:text-amber-400 hover:bg-stone-800"
                     >
                       {isUploading ? <RefreshCw className="w-4 h-4 animate-spin text-amber-400" /> : <Image className="w-4 h-4" />}
@@ -3615,6 +3705,7 @@ export default function App() {
                           if (val.trim()) notifyTyping();
                         }}
                         onSelect={e => updateCompletion(e.currentTarget.value, e.currentTarget.selectionStart)}
+                        onPaste={handleComposerPaste}
                         onScroll={e => {
                           if (composerBackdropRef.current) composerBackdropRef.current.scrollTop = e.currentTarget.scrollTop;
                         }}
@@ -3650,6 +3741,7 @@ export default function App() {
                             e.stopPropagation();
                             if (completion) setCompletion(null);
                             else if (replyToMessage) setReplyToMessage(null);
+                            else if (pendingImages.length > 0) removePendingImage(pendingImages[pendingImages.length - 1].id);
                             else if (chatInput) setChatInput('');
                           }
                         }}
@@ -3659,7 +3751,7 @@ export default function App() {
                     </div>
                     <button
                       type="submit"
-                      disabled={!chatInput.trim()}
+                      disabled={!chatInput.trim() && pendingImages.length === 0}
                       className="p-1.5 rounded-lg btn-primary disabled:opacity-40"
                       aria-label="送信"
                     >
