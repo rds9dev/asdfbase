@@ -3071,6 +3071,17 @@ server.listen(PORT, async () => {
           broadcast({ type: 'MESSAGE_UPDATED', payload: updated });
         }
       },
+      onTyping: (asdfChannelId, discordUserId, username) => {
+        broadcast({
+          type: 'USER_TYPING',
+          payload: {
+            userId: `discord-${discordUserId}`,
+            username,
+            channelId: asdfChannelId,
+            t: Date.now(),
+          },
+        });
+      },
       saveImage: async (buf) => {
         const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.webp`;
         await sharp(buf, { animated: false }).resize({ width: 1600, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(UPLOAD_DIR, filename));

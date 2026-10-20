@@ -46,6 +46,8 @@ export interface DiscordDeps {
   ingest: (asdfChannelId: number, username: string, content: string, meta: DiscordIngestMeta) => Promise<void>;
   // Discord 側でメッセージが編集された
   ingestEdit: (discordMessageId: string, content: string) => Promise<void>;
+  // Discord 側の入力中イベント
+  onTyping?: (asdfChannelId: number, discordUserId: string, username: string) => void;
   // Discord の画像を保存して /uploads/... のパスを返す
   saveImage: (buf: Buffer) => Promise<string>;
   // Discord のアイコンを (名前が同じなら使い回して) 保存し /uploads/... のパスを返す
@@ -348,7 +350,7 @@ export async function editRelayedOnDiscord(links: RelayedMessage[], username: st
 }
 
 function createClient(withMessageContent: boolean) {
-  const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
+  const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageTyping];
   if (withMessageContent) intents.push(GatewayIntentBits.MessageContent);
   return new Client({
     intents,
@@ -411,6 +413,21 @@ export async function startDiscordBot(d: DiscordDeps) {
     });
     c.on(Events.MessageUpdate, (_old, m) => {
       handleDiscordEdit(m).catch(err => console.error('[discord] edit handling failed:', err));
+    });
+    c.on(Events.TypingStart, async typing => {
+      try {
+        if (!isGuildAllowed(typing.guild?.id)) return;
+        if (typing.user?.bot) return;
+        if (!deps?.onTyping) return;
+        const targets = (await getBindings()).filter(b => b.discordChannelId === typing.channel.id);
+        if (targets.length === 0) return;
+        const username = `[Discord] ${typing.member?.displayName || typing.user?.globalName || typing.user?.username || 'ユーザー'}`;
+        for (const t of targets) {
+          deps.onTyping(t.asdfChannelId, typing.user.id, username);
+        }
+      } catch (err: any) {
+        console.error('[discord] typing handling failed:', err.message);
+      }
     });
     c.on(Events.InteractionCreate, i => {
       if (i.isChatInputCommand()) {

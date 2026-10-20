@@ -314,7 +314,7 @@ async function editRelayedOnDiscord(links, username, content) {
     return edited;
 }
 function createClient(withMessageContent) {
-    const intents = [discord_js_1.GatewayIntentBits.Guilds, discord_js_1.GatewayIntentBits.GuildMessages];
+    const intents = [discord_js_1.GatewayIntentBits.Guilds, discord_js_1.GatewayIntentBits.GuildMessages, discord_js_1.GatewayIntentBits.GuildMessageTyping];
     if (withMessageContent)
         intents.push(discord_js_1.GatewayIntentBits.MessageContent);
     return new discord_js_1.Client({
@@ -375,6 +375,26 @@ async function startDiscordBot(d) {
         });
         c.on(discord_js_1.Events.MessageUpdate, (_old, m) => {
             handleDiscordEdit(m).catch(err => console.error('[discord] edit handling failed:', err));
+        });
+        c.on(discord_js_1.Events.TypingStart, async (typing) => {
+            try {
+                if (!isGuildAllowed(typing.guild?.id))
+                    return;
+                if (typing.user?.bot)
+                    return;
+                if (!deps?.onTyping)
+                    return;
+                const targets = (await getBindings()).filter(b => b.discordChannelId === typing.channel.id);
+                if (targets.length === 0)
+                    return;
+                const username = `[Discord] ${typing.member?.displayName || typing.user?.globalName || typing.user?.username || 'ユーザー'}`;
+                for (const t of targets) {
+                    deps.onTyping(t.asdfChannelId, typing.user.id, username);
+                }
+            }
+            catch (err) {
+                console.error('[discord] typing handling failed:', err.message);
+            }
         });
         c.on(discord_js_1.Events.InteractionCreate, i => {
             if (i.isChatInputCommand()) {
