@@ -22,11 +22,14 @@ const BINDINGS_KEY = 'discord_bindings';
 const VIDEO_NOTICE = '(動画が送信されています)';
 let client = null;
 let deps = null;
-let guildId = '';
+let allowedGuildIds = [];
 let connected = false;
 let lastError = '';
 let intentWarning = '';
 let bindingsCache = null;
+function isGuildAllowed(gid) {
+    return Boolean(gid && allowedGuildIds.includes(gid));
+}
 async function getBindings() {
     if (bindingsCache)
         return bindingsCache;
@@ -56,12 +59,15 @@ function isDiscordBotConfigured() {
 async function getDiscordStatus() {
     const bindings = deps ? await getBindings() : [];
     const channels = deps ? await deps.listAsdfChannels() : [];
+    const guildNames = allowedGuildIds
+        .map(gid => client?.guilds.cache.get(gid)?.name)
+        .filter(Boolean);
     return {
         enabled: Boolean(client),
         connected,
         botTag: client?.user?.tag || null,
-        guildId,
-        guildName: client?.guilds.cache.get(guildId)?.name || null,
+        guildId: allowedGuildIds.join(','),
+        guildName: guildNames.length > 0 ? guildNames.join(', ') : null,
         intentWarning,
         lastError,
         bindings: bindings.map(b => {
@@ -78,44 +84,47 @@ async function getDiscordStatus() {
 async function refreshDiscordCommands() {
     if (!client || !connected || !deps)
         return;
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild)
-        return;
     const channels = (await deps.listAsdfChannels()).filter(c => c.type !== 'voice').slice(0, 25);
-    try {
-        await guild.commands.set([
-            {
-                name: 'setup',
-                description: 'このチャンネルを asdfbase のチャンネルと同期します',
-                defaultMemberPermissions: discord_js_1.PermissionFlagsBits.ManageChannels,
-                options: [
-                    {
-                        name: 'channel',
-                        description: '同期する asdfbase のチャンネル',
-                        type: discord_js_1.ApplicationCommandOptionType.String,
-                        required: true,
-                        choices: channels.map(c => ({ name: `#${c.name}`, value: String(c.id) })),
-                    },
-                ],
-            },
-            {
-                name: 'unsetup',
-                description: 'このチャンネルの asdfbase 同期を解除します',
-                defaultMemberPermissions: discord_js_1.PermissionFlagsBits.ManageChannels,
-            },
-            {
-                name: 'status',
-                description: 'asdfbase との同期状態を表示します',
-            },
-        ]);
-    }
-    catch (err) {
-        lastError = `コマンド登録失敗: ${err.message}`;
-        console.error('[discord] command registration failed:', err.message);
+    const commandDefs = [
+        {
+            name: 'setup',
+            description: 'このチャンネルを asdfbase のチャンネルと同期します',
+            defaultMemberPermissions: discord_js_1.PermissionFlagsBits.ManageChannels,
+            options: [
+                {
+                    name: 'channel',
+                    description: '同期する asdfbase のチャンネル',
+                    type: discord_js_1.ApplicationCommandOptionType.String,
+                    required: true,
+                    choices: channels.map(c => ({ name: `#${c.name}`, value: String(c.id) })),
+                },
+            ],
+        },
+        {
+            name: 'unsetup',
+            description: 'このチャンネルの asdfbase 同期を解除します',
+            defaultMemberPermissions: discord_js_1.PermissionFlagsBits.ManageChannels,
+        },
+        {
+            name: 'status',
+            description: 'asdfbase との同期状態を表示します',
+        },
+    ];
+    for (const gid of allowedGuildIds) {
+        const guild = client.guilds.cache.get(gid);
+        if (!guild)
+            continue;
+        try {
+            await guild.commands.set(commandDefs);
+        }
+        catch (err) {
+            lastError = `コマンド登録失敗 (${gid}): ${err.message}`;
+            console.error(`[discord] command registration failed for guild ${gid}:`, err.message);
+        }
     }
 }
 async function handleCommand(interaction) {
-    if (interaction.guildId !== guildId) {
+    if (!isGuildAllowed(interaction.guildId)) {
         await interaction.reply({ content: 'このサーバーでは利用できません。', ephemeral: true });
         return;
     }
@@ -179,7 +188,7 @@ async function avatarFor(msg) {
     }
 }
 async function handleDiscordMessage(msg) {
-    if (msg.guildId !== guildId)
+    if (!isGuildAllowed(msg.guildId))
         return;
     if (msg.author.bot || msg.webhookId)
         return; // 自分の転送を再取り込みしない
@@ -232,7 +241,7 @@ async function handleDiscordMessage(msg) {
 }
 // Discord 側の編集: 本文が変わっていれば asdfbase の該当メッセージも書き換える
 async function handleDiscordEdit(msg) {
-    if (msg.guildId !== guildId)
+    if (!isGuildAllowed(msg.guildId))
         return;
     const full = msg.partial ? await msg.fetch().catch(() => null) : msg;
     if (!full || full.author.bot || full.webhookId)
@@ -270,7 +279,7 @@ async function relayToDiscordBot(asdfChannelId, username, content) {
     for (const t of targets) {
         try {
             const ch = (await client.channels.fetch(t.discordChannelId));
-            if (ch && 'send' in ch && ch.guildId === guildId) {
+            if (ch && 'send' in ch && isGuildAllowed(ch.guildId)) {
                 const m = await ch.send(payload);
                 sent.push({ discordChannelId: t.discordChannelId, discordMessageId: m.id });
             }
@@ -291,7 +300,7 @@ async function editRelayedOnDiscord(links, username, content) {
     for (const l of links) {
         try {
             const ch = (await client.channels.fetch(l.discordChannelId));
-            if (!ch || !('messages' in ch) || ch.guildId !== guildId)
+            if (!ch || !('messages' in ch) || !isGuildAllowed(ch.guildId))
                 continue;
             const m = await ch.messages.fetch(l.discordMessageId);
             await m.edit({ content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000), allowedMentions: { parse: [] } });
@@ -329,9 +338,10 @@ function createClient(withMessageContent) {
 async function startDiscordBot(d) {
     deps = d;
     const token = process.env.DISCORD_BOT_TOKEN || '';
-    guildId = process.env.DISCORD_GUILD_ID || '';
-    if (!token || !guildId) {
-        console.log('[discord] DISCORD_BOT_TOKEN / DISCORD_GUILD_ID not set — bot disabled');
+    const rawGuilds = process.env.DISCORD_GUILD_IDS || process.env.DISCORD_GUILD_ID || '';
+    allowedGuildIds = rawGuilds.split(',').map(s => s.trim()).filter(Boolean);
+    if (!token || allowedGuildIds.length === 0) {
+        console.log('[discord] DISCORD_BOT_TOKEN / DISCORD_GUILD_ID(S) not set — bot disabled');
         return;
     }
     const boot = async (withMessageContent) => {
@@ -341,8 +351,9 @@ async function startDiscordBot(d) {
             connected = true;
             lastError = '';
             console.log(`[discord] logged in as ${ready.user.tag}`);
-            if (!ready.guilds.cache.has(guildId)) {
-                lastError = `許可されたサーバーに Bot が参加していません。招待URL: https://discord.com/oauth2/authorize?client_id=${ready.user.id}&scope=bot+applications.commands&permissions=117760&guild_id=${guildId}&disable_guild_select=true`;
+            const missing = allowedGuildIds.filter(gid => !ready.guilds.cache.has(gid));
+            if (missing.length > 0) {
+                lastError = `許可されたサーバーの一部に Bot が参加していません: ${missing.join(', ')}`;
             }
             await refreshDiscordCommands();
         });
@@ -371,7 +382,7 @@ async function startDiscordBot(d) {
             }
         });
         c.on(discord_js_1.Events.GuildCreate, g => {
-            if (g.id !== guildId) {
+            if (!isGuildAllowed(g.id)) {
                 console.warn(`[discord] joined unauthorized guild ${g.name} (${g.id}) — ignoring`);
                 return;
             }
