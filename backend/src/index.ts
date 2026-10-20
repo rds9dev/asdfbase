@@ -16,6 +16,7 @@ import { aiToolDeclarations, createAiToolRunner } from './aiTools.js';
 import type { Content } from '@google/genai';
 import {
   startDiscordBot, relayToDiscordBot, editRelayedOnDiscord, getDiscordStatus, refreshDiscordCommands, getBoundAsdfChannelIds,
+  relayReactionToDiscord, relayPinToDiscord,
 } from './discord.js';
 import {
   DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo, nextLessonDate, nextWeekday,
@@ -93,13 +94,24 @@ export async function notifyImportant(title: string, description: string, color 
 }
 
 // 通常メッセージの Discord 転送: Bot 連携があれば Bot、なければメッセージ用 Webhook
-export async function relayMessage(msg: { id?: number; channel_id: number; username?: string; sender_username?: string; content: string }) {
+export async function relayMessage(msg: { id?: number; channel_id: number; username?: string; sender_username?: string; content: string; reply_to_id?: number | null }) {
   try {
     const username = msg.sender_username || msg.username || 'unknown';
     if (username.startsWith('[Discord]')) return; // Discord から来たものは戻さない
     if ((await getSetting('notify_messages_enabled', 'on')) !== 'on') return;
 
-    const sent = await relayToDiscordBot(msg.channel_id, username, msg.content);
+    let targetDiscordMsgId: string | null = null;
+    if (msg.reply_to_id) {
+      const linkRes = await pool.query(
+        `SELECT discord_message_id FROM discord_message_links WHERE asdf_message_id = $1 LIMIT 1`,
+        [msg.reply_to_id]
+      );
+      if (linkRes.rows.length > 0) {
+        targetDiscordMsgId = linkRes.rows[0].discord_message_id;
+      }
+    }
+
+    const sent = await relayToDiscordBot(msg.channel_id, username, msg.content, targetDiscordMsgId);
     if (sent.length > 0) {
       // あとで編集を Discord 側にも反映できるよう、送ったメッセージを覚えておく
       if (msg.id) {
@@ -1033,6 +1045,22 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthR
       payload: { messageId, reactions: updated.rows[0].reactions },
     });
 
+    // Discord 側にもリアクションを反映 (非同期)
+    (async () => {
+      try {
+        const links = (await pool.query(
+          `SELECT discord_channel_id, discord_message_id FROM discord_message_links WHERE asdf_message_id = $1`,
+          [messageId]
+        )).rows;
+        const isRemove = !reactions[emoji] || !reactions[emoji].includes(userId);
+        for (const l of links) {
+          await relayReactionToDiscord(l.discord_channel_id, l.discord_message_id, emoji, isRemove);
+        }
+      } catch (err: any) {
+        console.warn('Discord reaction relay error:', err.message);
+      }
+    })();
+
     res.json(updated.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'リアクション更新エラー' });
@@ -1059,6 +1087,22 @@ app.post('/api/messages/:messageId/pin', authMiddleware, async (req: AuthRequest
     if (pinned.is_pinned) {
       notifyImportant(`📌 ${req.user!.username} がメッセージをピン留め`, `**${pinned.username}**: ${pinned.content}`);
     }
+
+    // Discord 側にもピン留めを反映 (非同期)
+    (async () => {
+      try {
+        const links = (await pool.query(
+          `SELECT discord_channel_id, discord_message_id FROM discord_message_links WHERE asdf_message_id = $1`,
+          [messageId]
+        )).rows;
+        for (const l of links) {
+          await relayPinToDiscord(l.discord_channel_id, l.discord_message_id, pinned.is_pinned);
+        }
+      } catch (err: any) {
+        console.warn('Discord pin relay error:', err.message);
+      }
+    })();
+
     res.json(updated.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'ピン留め更新エラー' });
@@ -2220,6 +2264,12 @@ app.post('/api/settings/webhook', authMiddleware, async (req: AuthRequest, res) 
   }
 });
 
+let lastDiscordVoiceStatus: any[] = [];
+
+app.get('/api/discord/voice-status', authMiddleware, (_req, res) => {
+  res.json({ vcs: lastDiscordVoiceStatus });
+});
+
 app.post('/api/webhook/test', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { webhookUrl } = req.body;
@@ -3044,9 +3094,19 @@ server.listen(PORT, async () => {
       setSetting,
       listAsdfChannels: async () => (await pool.query(`SELECT id, name, type FROM channels ORDER BY position ASC, id ASC`)).rows,
       ingest: async (asdfChannelId, username, content, meta) => {
+        let replyToId: number | null = null;
+        if (meta.replyToDiscordMsgId) {
+          const link = await pool.query(
+            `SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1 LIMIT 1`,
+            [meta.replyToDiscordMsgId]
+          );
+          if (link.rows.length > 0) {
+            replyToId = link.rows[0].asdf_message_id;
+          }
+        }
         const result = await pool.query(
-          `INSERT INTO messages (channel_id, user_id, username, content, author_avatar) VALUES ($1, NULL, $2, $3, $4) RETURNING *`,
-          [asdfChannelId, username, content, meta.avatarUrl]
+          `INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id) VALUES ($1, NULL, $2, $3, $4, $5) RETURNING *`,
+          [asdfChannelId, username, content, meta.avatarUrl, replyToId]
         );
         const saved = result.rows[0];
         if (meta.discordMessageId) {
@@ -3056,7 +3116,8 @@ server.listen(PORT, async () => {
             [saved.id, meta.discordChannelId, meta.discordMessageId]
           );
         }
-        broadcast({ type: 'NEW_MESSAGE', payload: { ...saved, sender_username: username } });
+        const [attached] = await attachReplies([{ ...saved, sender_username: username }]);
+        broadcast({ type: 'NEW_MESSAGE', payload: attached });
       },
       ingestEdit: async (discordMessageId, content) => {
         const rows = (await pool.query(
@@ -3070,6 +3131,81 @@ server.listen(PORT, async () => {
           const [updated] = await attachReplies([{ ...r, sender_username: r.username }]);
           broadcast({ type: 'MESSAGE_UPDATED', payload: updated });
         }
+      },
+      ingestDelete: async (discordMessageId) => {
+        const links = (await pool.query(
+          `SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1`,
+          [discordMessageId]
+        )).rows;
+        for (const l of links) {
+          const cur = await pool.query(`SELECT id, content FROM messages WHERE id = $1`, [l.asdf_message_id]);
+          if (cur.rows.length === 0) continue;
+          const originalContent = cur.rows[0].content;
+          if (originalContent.includes('*(Discordで削除されました)*')) continue;
+          const newContent = `~~${originalContent}~~ *(Discordで削除されました)*`;
+          const updated = (await pool.query(
+            `UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`,
+            [newContent, l.asdf_message_id]
+          )).rows;
+          for (const r of updated) {
+            const [attached] = await attachReplies([{ ...r, sender_username: r.username }]);
+            broadcast({ type: 'MESSAGE_UPDATED', payload: attached });
+          }
+        }
+      },
+      ingestReaction: async (discordMessageId, emoji, discordUserId, action) => {
+        const links = (await pool.query(
+          `SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1`,
+          [discordMessageId]
+        )).rows;
+        // 負の整数IDを生成して既存ユーザーと衝突防止
+        const pseudoUserId = -Math.abs(Array.from(discordUserId).reduce((acc, c) => ((acc << 5) - acc + c.charCodeAt(0)) | 0, 0));
+        for (const l of links) {
+          const msgRes = await pool.query(`SELECT reactions FROM messages WHERE id = $1`, [l.asdf_message_id]);
+          if (msgRes.rows.length === 0) continue;
+          const reactions = msgRes.rows[0].reactions || {};
+          const users = reactions[emoji] || [];
+          if (action === 'add') {
+            if (!users.includes(pseudoUserId)) {
+              reactions[emoji] = [...users, pseudoUserId];
+            }
+          } else {
+            reactions[emoji] = users.filter((u: number) => u !== pseudoUserId);
+            if (reactions[emoji].length === 0) delete reactions[emoji];
+          }
+          const updated = await pool.query(
+            `UPDATE messages SET reactions = $1 WHERE id = $2 RETURNING *`,
+            [JSON.stringify(reactions), l.asdf_message_id]
+          );
+          broadcast({
+            type: 'MESSAGE_REACTION_UPDATED',
+            payload: { messageId: l.asdf_message_id, reactions: updated.rows[0].reactions },
+          });
+        }
+      },
+      syncPinsForChannel: async (discordChannelId, pinnedDiscordMsgIds) => {
+        const links = (await pool.query(
+          `SELECT asdf_message_id, discord_message_id FROM discord_message_links WHERE discord_channel_id = $1`,
+          [discordChannelId]
+        )).rows;
+        for (const l of links) {
+          const shouldBePinned = pinnedDiscordMsgIds.includes(l.discord_message_id);
+          const updated = (await pool.query(
+            `UPDATE messages SET is_pinned = $1 WHERE id = $2 AND is_pinned IS DISTINCT FROM $1 RETURNING *`,
+            [shouldBePinned, l.asdf_message_id]
+          )).rows;
+          for (const r of updated) {
+            const [pinned] = await attachReplies([r]);
+            broadcast({ type: 'MESSAGE_PIN_UPDATED', payload: pinned });
+          }
+        }
+      },
+      onVoiceStatusUpdate: (vcs) => {
+        lastDiscordVoiceStatus = vcs;
+        broadcast({ type: 'DISCORD_VOICE_STATUS', payload: vcs });
+      },
+      notifyImportant: (title, body) => {
+        notifyImportant(title, body);
       },
       onTyping: (asdfChannelId, discordUserId, username) => {
         broadcast({
@@ -3085,6 +3221,12 @@ server.listen(PORT, async () => {
       saveImage: async (buf) => {
         const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.webp`;
         await sharp(buf, { animated: false }).resize({ width: 1600, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(UPLOAD_DIR, filename));
+        return `/uploads/${filename}`;
+      },
+      saveFile: async (buf, originalName) => {
+        const safeName = path.basename(originalName).replace(/[^a-zA-Z0-9._-]/g, '_');
+        const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}-${safeName}`;
+        fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
         return `/uploads/${filename}`;
       },
       saveAvatar: async (key, url) => {

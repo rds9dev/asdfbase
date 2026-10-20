@@ -7,7 +7,10 @@ exports.getBoundAsdfChannelIds = getBoundAsdfChannelIds;
 exports.isDiscordBotConfigured = isDiscordBotConfigured;
 exports.getDiscordStatus = getDiscordStatus;
 exports.refreshDiscordCommands = refreshDiscordCommands;
+exports.getDiscordVoiceStatus = getDiscordVoiceStatus;
 exports.relayToDiscordBot = relayToDiscordBot;
+exports.relayReactionToDiscord = relayReactionToDiscord;
+exports.relayPinToDiscord = relayPinToDiscord;
 exports.editRelayedOnDiscord = editRelayedOnDiscord;
 exports.startDiscordBot = startDiscordBot;
 // Discord Bot 連携
@@ -169,6 +172,78 @@ async function handleCommand(interaction) {
         await interaction.reply({ content: `**asdfbase 同期状態**\n${lines}${status.intentWarning ? `\n⚠️ ${status.intentWarning}` : ''}`, ephemeral: true });
     }
 }
+function formatDiscordContent(content) {
+    if (!content)
+        return '';
+    let text = content;
+    // カスタム絵文字 <:name:id> / <a:name:id> を Markdown 画像に変換
+    text = text.replace(/<a:([a-zA-Z0-9_]+):([0-9]+)>/g, '![$1](https://cdn.discordapp.com/emojis/$2.gif?size=48&quality=lossless)');
+    text = text.replace(/<:([a-zA-Z0-9_]+):([0-9]+)>/g, '![$1](https://cdn.discordapp.com/emojis/$2.webp?size=48&quality=lossless)');
+    // @everyone / @here を強調
+    text = text.replace(/@(everyone|here)\b/g, '**[@$1]**');
+    return text;
+}
+function formatEmbeds(embeds) {
+    const parts = [];
+    for (const e of embeds) {
+        if (e.video)
+            continue;
+        const lines = [];
+        const title = e.title?.trim();
+        const url = e.url?.trim();
+        if (title && url) {
+            lines.push(`> 🔗 **[${title}](${url})**`);
+        }
+        else if (title) {
+            lines.push(`> 🔗 **${title}**`);
+        }
+        else if (url) {
+            lines.push(`> 🔗 <${url}>`);
+        }
+        if (e.description?.trim()) {
+            const desc = e.description.trim().slice(0, 300);
+            lines.push(`> ${desc.replace(/\n/g, '\n> ')}`);
+        }
+        if (e.image?.url) {
+            lines.push(`> ![embed-image](${e.image.url})`);
+        }
+        else if (e.thumbnail?.url && !e.image) {
+            lines.push(`> ![embed-thumb](${e.thumbnail.url})`);
+        }
+        if (lines.length > 0) {
+            parts.push(lines.join('\n'));
+        }
+    }
+    return parts;
+}
+function getDiscordVoiceStatus() {
+    if (!client || !connected)
+        return [];
+    const result = [];
+    for (const gid of allowedGuildIds) {
+        const guild = client.guilds.cache.get(gid);
+        if (!guild)
+            continue;
+        for (const channel of guild.channels.cache.values()) {
+            if (channel.isVoiceBased()) {
+                const members = Array.from(channel.members.values()).map(m => ({
+                    id: m.id,
+                    name: m.displayName || m.user.globalName || m.user.username,
+                    avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
+                }));
+                if (members.length > 0) {
+                    result.push({
+                        guildName: guild.name,
+                        channelName: channel.name,
+                        channelId: channel.id,
+                        members,
+                    });
+                }
+            }
+        }
+    }
+    return result;
+}
 function isVideo(att) {
     return (att.contentType || '').startsWith('video/') || /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(att.name || '');
 }
@@ -199,9 +274,15 @@ async function handleDiscordMessage(msg) {
     const name = `[Discord] ${msg.member?.displayName || msg.author.globalName || msg.author.username}`;
     const avatarUrl = await avatarFor(msg);
     const parts = [];
-    const text = msg.cleanContent?.trim();
+    const rawText = msg.cleanContent?.trim();
+    const text = rawText ? formatDiscordContent(rawText) : '';
     if (text)
         parts.push(text);
+    // @everyone / @here 通知
+    if (msg.mentions.everyone || /@everyone|@here/.test(msg.content)) {
+        const chName = msg.channel?.name || 'channel';
+        deps?.notifyImportant?.(`📢 Discord #${chName} で全体メンション`, `**${name}**: ${text || '(添付ファイル)'}`);
+    }
     for (const att of msg.attachments.values()) {
         if (isVideo(att)) {
             parts.push(VIDEO_NOTICE);
@@ -219,22 +300,48 @@ async function handleDiscordMessage(msg) {
             }
         }
         else {
-            parts.push(`(ファイルが送信されています: ${att.name})`);
+            // 一般ファイル (PDF, txt, zip, 音声等)
+            if (att.size <= 25 * 1024 * 1024 && deps?.saveFile) {
+                try {
+                    const res = await fetch(att.url, { signal: AbortSignal.timeout(20000) });
+                    const buf = Buffer.from(await res.arrayBuffer());
+                    const url = await deps.saveFile(buf, att.name || 'file');
+                    parts.push(`[📎 ${att.name || '添付ファイル'}](${url})`);
+                }
+                catch (err) {
+                    console.error('[discord] file download failed:', err.message);
+                    parts.push(`(ファイルの取り込みに失敗しました: ${att.name})`);
+                }
+            }
+            else {
+                parts.push(`[📎 ${att.name || '添付ファイル'}](${att.url})`);
+            }
         }
     }
     for (const sticker of msg.stickers.values())
         parts.push(`(スタンプ: ${sticker.name})`);
     if (msg.embeds.some(e => e.video))
         parts.push(VIDEO_NOTICE);
+    // Embed (URLプレビュー等) のテキスト追加
+    const embedTexts = formatEmbeds(msg.embeds);
+    if (embedTexts.length > 0) {
+        if (parts.length > 0) {
+            parts[0] = `${parts[0]}\n\n${embedTexts.join('\n\n')}`;
+        }
+        else {
+            parts.push(embedTexts.join('\n\n'));
+        }
+    }
     if (parts.length === 0)
         return;
+    const replyToDiscordMsgId = msg.reference?.messageId || null;
     for (const t of targets) {
-        // 画像は1枚ずつ別メッセージにする (asdfbase のチャット表示に合わせる)
         for (let i = 0; i < parts.length; i++) {
             await deps.ingest(t.asdfChannelId, name, parts[i], {
                 avatarUrl,
                 discordChannelId: msg.channelId,
                 discordMessageId: i === 0 && text ? msg.id : null,
+                replyToDiscordMsgId: i === 0 ? replyToDiscordMsgId : null,
             });
         }
     }
@@ -249,13 +356,18 @@ async function handleDiscordEdit(msg) {
     const bindings = await getBindings();
     if (!bindings.some(b => b.discordChannelId === full.channelId))
         return;
-    const text = full.cleanContent?.trim();
+    const rawText = full.cleanContent?.trim() || '';
+    let text = rawText ? formatDiscordContent(rawText) : '';
+    const embedTexts = formatEmbeds(full.embeds);
+    if (embedTexts.length > 0) {
+        text = text ? `${text}\n\n${embedTexts.join('\n\n')}` : embedTexts.join('\n\n');
+    }
     if (!text)
         return;
     await deps.ingestEdit(full.id, text);
 }
 // asdfbase のメッセージを連携先の Discord チャンネルへ送信。送った Discord メッセージを返す (空なら未送信)
-async function relayToDiscordBot(asdfChannelId, username, content) {
+async function relayToDiscordBot(asdfChannelId, username, content, replyTargetDiscordMessageId) {
     if (!client || !connected || !deps)
         return [];
     const targets = (await getBindings()).filter(b => b.asdfChannelId === asdfChannelId);
@@ -275,6 +387,9 @@ async function relayToDiscordBot(asdfChannelId, username, content) {
         files: isVideoMsg ? [] : files,
         allowedMentions: { parse: [] },
     };
+    if (replyTargetDiscordMessageId) {
+        payload.reply = { messageReference: replyTargetDiscordMessageId, failIfNotExists: false };
+    }
     const sent = [];
     for (const t of targets) {
         try {
@@ -290,6 +405,55 @@ async function relayToDiscordBot(asdfChannelId, username, content) {
         }
     }
     return sent;
+}
+// asdfbase で付けられたリアクションを Discord に反映
+async function relayReactionToDiscord(discordChannelId, discordMessageId, emoji, isRemove = false) {
+    if (!client || !connected)
+        return;
+    try {
+        const ch = (await client.channels.fetch(discordChannelId));
+        if (!ch || !('messages' in ch) || !isGuildAllowed(ch.guildId))
+            return;
+        const msg = await ch.messages.fetch(discordMessageId).catch(() => null);
+        if (!msg)
+            return;
+        if (isRemove) {
+            const r = msg.reactions.resolve(emoji);
+            if (r && client.user) {
+                await r.users.remove(client.user.id).catch(() => { });
+            }
+        }
+        else {
+            await msg.react(emoji).catch(() => { });
+        }
+    }
+    catch (err) {
+        console.warn('[discord] relayReaction failed:', err.message);
+    }
+}
+// asdfbase でピン留めされた状態を Discord に反映
+async function relayPinToDiscord(discordChannelId, discordMessageId, isPinned) {
+    if (!client || !connected)
+        return;
+    try {
+        const ch = (await client.channels.fetch(discordChannelId));
+        if (!ch || !('messages' in ch) || !isGuildAllowed(ch.guildId))
+            return;
+        const msg = await ch.messages.fetch(discordMessageId).catch(() => null);
+        if (!msg)
+            return;
+        if (isPinned) {
+            if (!msg.pinned)
+                await msg.pin().catch(() => { });
+        }
+        else {
+            if (msg.pinned)
+                await msg.unpin().catch(() => { });
+        }
+    }
+    catch (err) {
+        console.warn('[discord] relayPin failed:', err.message);
+    }
 }
 // Bot が送ったメッセージを編集 (Discord 側にも「編集済み」が付く)。1つでも編集できれば true
 async function editRelayedOnDiscord(links, username, content) {
@@ -314,13 +478,19 @@ async function editRelayedOnDiscord(links, username, content) {
     return edited;
 }
 function createClient(withMessageContent) {
-    const intents = [discord_js_1.GatewayIntentBits.Guilds, discord_js_1.GatewayIntentBits.GuildMessages, discord_js_1.GatewayIntentBits.GuildMessageTyping];
+    const intents = [
+        discord_js_1.GatewayIntentBits.Guilds,
+        discord_js_1.GatewayIntentBits.GuildMessages,
+        discord_js_1.GatewayIntentBits.GuildMessageTyping,
+        discord_js_1.GatewayIntentBits.GuildMessageReactions,
+        discord_js_1.GatewayIntentBits.GuildVoiceStates,
+    ];
     if (withMessageContent)
         intents.push(discord_js_1.GatewayIntentBits.MessageContent);
     return new discord_js_1.Client({
         intents,
-        // キャッシュしていないメッセージの編集も受け取る
-        partials: [discord_js_1.Partials.Message, discord_js_1.Partials.Channel],
+        // キャッシュしていないメッセージの編集・リアクションも受け取る
+        partials: [discord_js_1.Partials.Message, discord_js_1.Partials.Channel, discord_js_1.Partials.Reaction],
         // VPS のメモリ節約のためキャッシュを最小限に
         makeCache: discord_js_1.Options.cacheWithLimits({
             ...discord_js_1.Options.DefaultMakeCacheSettings,
@@ -356,6 +526,9 @@ async function startDiscordBot(d) {
                 lastError = `許可されたサーバーの一部に Bot が参加していません: ${missing.join(', ')}`;
             }
             await refreshDiscordCommands();
+            if (deps?.onVoiceStatusUpdate) {
+                deps.onVoiceStatusUpdate(getDiscordVoiceStatus());
+            }
         });
         c.on(discord_js_1.Events.ShardDisconnect, () => {
             connected = false;
@@ -375,6 +548,76 @@ async function startDiscordBot(d) {
         });
         c.on(discord_js_1.Events.MessageUpdate, (_old, m) => {
             handleDiscordEdit(m).catch(err => console.error('[discord] edit handling failed:', err));
+        });
+        c.on(discord_js_1.Events.MessageDelete, m => {
+            try {
+                if (m.guildId && !isGuildAllowed(m.guildId))
+                    return;
+                if (deps?.ingestDelete) {
+                    deps.ingestDelete(m.id).catch(err => console.error('[discord] delete handling failed:', err));
+                }
+            }
+            catch (err) {
+                console.error('[discord] delete error:', err.message);
+            }
+        });
+        c.on(discord_js_1.Events.MessageReactionAdd, async (reaction, user) => {
+            try {
+                if (user.bot)
+                    return;
+                const fullMsg = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+                if (!fullMsg || !isGuildAllowed(fullMsg.guildId))
+                    return;
+                const emoji = reaction.emoji.name;
+                if (!emoji || !deps?.ingestReaction)
+                    return;
+                await deps.ingestReaction(fullMsg.id, emoji, user.id, 'add');
+            }
+            catch (err) {
+                console.error('[discord] reactionAdd failed:', err.message);
+            }
+        });
+        c.on(discord_js_1.Events.MessageReactionRemove, async (reaction, user) => {
+            try {
+                if (user.bot)
+                    return;
+                const fullMsg = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+                if (!fullMsg || !isGuildAllowed(fullMsg.guildId))
+                    return;
+                const emoji = reaction.emoji.name;
+                if (!emoji || !deps?.ingestReaction)
+                    return;
+                await deps.ingestReaction(fullMsg.id, emoji, user.id, 'remove');
+            }
+            catch (err) {
+                console.error('[discord] reactionRemove failed:', err.message);
+            }
+        });
+        c.on(discord_js_1.Events.ChannelPinsUpdate, async (channel) => {
+            try {
+                if (!('guildId' in channel) || !isGuildAllowed(channel.guildId))
+                    return;
+                if (!deps?.syncPinsForChannel)
+                    return;
+                const textCh = channel;
+                if (typeof textCh.messages?.fetchPinned === 'function') {
+                    const pinnedMessages = await textCh.messages.fetchPinned().catch(() => null);
+                    if (pinnedMessages) {
+                        const pinnedIds = Array.from(pinnedMessages.keys());
+                        await deps.syncPinsForChannel(channel.id, pinnedIds);
+                    }
+                }
+            }
+            catch (err) {
+                console.error('[discord] pinsUpdate failed:', err.message);
+            }
+        });
+        c.on(discord_js_1.Events.VoiceStateUpdate, (_oldState, newState) => {
+            if (!isGuildAllowed(newState.guild?.id))
+                return;
+            if (deps?.onVoiceStatusUpdate) {
+                deps.onVoiceStatusUpdate(getDiscordVoiceStatus());
+            }
         });
         c.on(discord_js_1.Events.TypingStart, async (typing) => {
             try {

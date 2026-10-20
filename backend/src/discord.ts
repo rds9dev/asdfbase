@@ -30,12 +30,20 @@ export interface DiscordIngestMeta {
   discordChannelId: string;
   // 本文 (テキスト部分) のときだけ。あとで Discord 側の編集を反映するのに使う
   discordMessageId: string | null;
+  replyToDiscordMsgId?: string | null;
 }
 
 // asdfbase → Discord に Bot が送ったメッセージ
 export interface RelayedMessage {
   discordChannelId: string;
   discordMessageId: string;
+}
+
+export interface DiscordVoiceChannelInfo {
+  guildName: string;
+  channelName: string;
+  channelId: string;
+  members: { id: string; name: string; avatarUrl: string | null }[];
 }
 
 export interface DiscordDeps {
@@ -46,10 +54,22 @@ export interface DiscordDeps {
   ingest: (asdfChannelId: number, username: string, content: string, meta: DiscordIngestMeta) => Promise<void>;
   // Discord 側でメッセージが編集された
   ingestEdit: (discordMessageId: string, content: string) => Promise<void>;
+  // Discord 側でメッセージが削除された (取り消し線反映)
+  ingestDelete?: (discordMessageId: string) => Promise<void>;
+  // Discord 側でリアクション追加/削除
+  ingestReaction?: (discordMessageId: string, emoji: string, discordUserId: string, action: 'add' | 'remove') => Promise<void>;
+  // ピン留め一覧の同期
+  syncPinsForChannel?: (discordChannelId: string, pinnedDiscordMsgIds: string[]) => Promise<void>;
   // Discord 側の入力中イベント
   onTyping?: (asdfChannelId: number, discordUserId: string, username: string) => void;
+  // Discord の VC 参加状態の更新
+  onVoiceStatusUpdate?: (vcs: DiscordVoiceChannelInfo[]) => void;
+  // 重要通知 (@everyone / @here)
+  notifyImportant?: (title: string, body: string) => void;
   // Discord の画像を保存して /uploads/... のパスを返す
   saveImage: (buf: Buffer) => Promise<string>;
+  // Discord のファイルを保存して /uploads/... のパスを返す
+  saveFile?: (buf: Buffer, originalName: string) => Promise<string>;
   // Discord のアイコンを (名前が同じなら使い回して) 保存し /uploads/... のパスを返す
   saveAvatar: (key: string, url: string) => Promise<string | null>;
   uploadDir: string;
@@ -214,6 +234,74 @@ async function handleCommand(interaction: ChatInputCommandInteraction) {
   }
 }
 
+function formatDiscordContent(content: string): string {
+  if (!content) return '';
+  let text = content;
+  // カスタム絵文字 <:name:id> / <a:name:id> を Markdown 画像に変換
+  text = text.replace(/<a:([a-zA-Z0-9_]+):([0-9]+)>/g, '![$1](https://cdn.discordapp.com/emojis/$2.gif?size=48&quality=lossless)');
+  text = text.replace(/<:([a-zA-Z0-9_]+):([0-9]+)>/g, '![$1](https://cdn.discordapp.com/emojis/$2.webp?size=48&quality=lossless)');
+  // @everyone / @here を強調
+  text = text.replace(/@(everyone|here)\b/g, '**[@$1]**');
+  return text;
+}
+
+function formatEmbeds(embeds: any[]): string[] {
+  const parts: string[] = [];
+  for (const e of embeds) {
+    if (e.video) continue;
+    const lines: string[] = [];
+    const title = e.title?.trim();
+    const url = e.url?.trim();
+    if (title && url) {
+      lines.push(`> 🔗 **[${title}](${url})**`);
+    } else if (title) {
+      lines.push(`> 🔗 **${title}**`);
+    } else if (url) {
+      lines.push(`> 🔗 <${url}>`);
+    }
+    if (e.description?.trim()) {
+      const desc = e.description.trim().slice(0, 300);
+      lines.push(`> ${desc.replace(/\n/g, '\n> ')}`);
+    }
+    if (e.image?.url) {
+      lines.push(`> ![embed-image](${e.image.url})`);
+    } else if (e.thumbnail?.url && !e.image) {
+      lines.push(`> ![embed-thumb](${e.thumbnail.url})`);
+    }
+    if (lines.length > 0) {
+      parts.push(lines.join('\n'));
+    }
+  }
+  return parts;
+}
+
+export function getDiscordVoiceStatus(): DiscordVoiceChannelInfo[] {
+  if (!client || !connected) return [];
+  const result: DiscordVoiceChannelInfo[] = [];
+  for (const gid of allowedGuildIds) {
+    const guild = client.guilds.cache.get(gid);
+    if (!guild) continue;
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.isVoiceBased()) {
+        const members = Array.from(channel.members.values()).map(m => ({
+          id: m.id,
+          name: m.displayName || m.user.globalName || m.user.username,
+          avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
+        }));
+        if (members.length > 0) {
+          result.push({
+            guildName: guild.name,
+            channelName: channel.name,
+            channelId: channel.id,
+            members,
+          });
+        }
+      }
+    }
+  }
+  return result;
+}
+
 function isVideo(att: { contentType?: string | null; name?: string | null }) {
   return (att.contentType || '').startsWith('video/') || /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(att.name || '');
 }
@@ -244,8 +332,15 @@ async function handleDiscordMessage(msg: DiscordMessage) {
   const name = `[Discord] ${msg.member?.displayName || msg.author.globalName || msg.author.username}`;
   const avatarUrl = await avatarFor(msg);
   const parts: string[] = [];
-  const text = msg.cleanContent?.trim();
+  const rawText = msg.cleanContent?.trim();
+  const text = rawText ? formatDiscordContent(rawText) : '';
   if (text) parts.push(text);
+
+  // @everyone / @here 通知
+  if (msg.mentions.everyone || /@everyone|@here/.test(msg.content)) {
+    const chName = (msg.channel as any)?.name || 'channel';
+    deps?.notifyImportant?.(`📢 Discord #${chName} で全体メンション`, `**${name}**: ${text || '(添付ファイル)'}`);
+  }
 
   for (const att of msg.attachments.values()) {
     if (isVideo(att)) {
@@ -261,20 +356,46 @@ async function handleDiscordMessage(msg: DiscordMessage) {
         parts.push(`(画像の取り込みに失敗しました: ${att.name})`);
       }
     } else {
-      parts.push(`(ファイルが送信されています: ${att.name})`);
+      // 一般ファイル (PDF, txt, zip, 音声等)
+      if (att.size <= 25 * 1024 * 1024 && deps?.saveFile) {
+        try {
+          const res = await fetch(att.url, { signal: AbortSignal.timeout(20000) });
+          const buf = Buffer.from(await res.arrayBuffer());
+          const url = await deps.saveFile(buf, att.name || 'file');
+          parts.push(`[📎 ${att.name || '添付ファイル'}](${url})`);
+        } catch (err: any) {
+          console.error('[discord] file download failed:', err.message);
+          parts.push(`(ファイルの取り込みに失敗しました: ${att.name})`);
+        }
+      } else {
+        parts.push(`[📎 ${att.name || '添付ファイル'}](${att.url})`);
+      }
     }
   }
   for (const sticker of msg.stickers.values()) parts.push(`(スタンプ: ${sticker.name})`);
   if (msg.embeds.some(e => e.video)) parts.push(VIDEO_NOTICE);
+
+  // Embed (URLプレビュー等) のテキスト追加
+  const embedTexts = formatEmbeds(msg.embeds);
+  if (embedTexts.length > 0) {
+    if (parts.length > 0) {
+      parts[0] = `${parts[0]}\n\n${embedTexts.join('\n\n')}`;
+    } else {
+      parts.push(embedTexts.join('\n\n'));
+    }
+  }
+
   if (parts.length === 0) return;
 
+  const replyToDiscordMsgId = msg.reference?.messageId || null;
+
   for (const t of targets) {
-    // 画像は1枚ずつ別メッセージにする (asdfbase のチャット表示に合わせる)
     for (let i = 0; i < parts.length; i++) {
       await deps!.ingest(t.asdfChannelId, name, parts[i], {
         avatarUrl,
         discordChannelId: msg.channelId,
         discordMessageId: i === 0 && text ? msg.id : null,
+        replyToDiscordMsgId: i === 0 ? replyToDiscordMsgId : null,
       });
     }
   }
@@ -287,13 +408,23 @@ async function handleDiscordEdit(msg: DiscordMessage | PartialMessage) {
   if (!full || full.author.bot || full.webhookId) return;
   const bindings = await getBindings();
   if (!bindings.some(b => b.discordChannelId === full.channelId)) return;
-  const text = full.cleanContent?.trim();
+  const rawText = full.cleanContent?.trim() || '';
+  let text = rawText ? formatDiscordContent(rawText) : '';
+  const embedTexts = formatEmbeds(full.embeds);
+  if (embedTexts.length > 0) {
+    text = text ? `${text}\n\n${embedTexts.join('\n\n')}` : embedTexts.join('\n\n');
+  }
   if (!text) return;
   await deps!.ingestEdit(full.id, text);
 }
 
 // asdfbase のメッセージを連携先の Discord チャンネルへ送信。送った Discord メッセージを返す (空なら未送信)
-export async function relayToDiscordBot(asdfChannelId: number, username: string, content: string): Promise<RelayedMessage[]> {
+export async function relayToDiscordBot(
+  asdfChannelId: number,
+  username: string,
+  content: string,
+  replyTargetDiscordMessageId?: string | null
+): Promise<RelayedMessage[]> {
   if (!client || !connected || !deps) return [];
   const targets = (await getBindings()).filter(b => b.asdfChannelId === asdfChannelId);
   if (targets.length === 0) return [];
@@ -307,11 +438,14 @@ export async function relayToDiscordBot(asdfChannelId: number, username: string,
   const isVideoMsg = /\.(mp4|mov|webm|mkv)(\?|$)/i.test(content);
 
   const body = isVideoMsg ? VIDEO_NOTICE : text;
-  const payload = {
+  const payload: any = {
     content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000),
     files: isVideoMsg ? [] : files,
     allowedMentions: { parse: [] as never[] },
   };
+  if (replyTargetDiscordMessageId) {
+    payload.reply = { messageReference: replyTargetDiscordMessageId, failIfNotExists: false };
+  }
 
   const sent: RelayedMessage[] = [];
   for (const t of targets) {
@@ -327,6 +461,45 @@ export async function relayToDiscordBot(asdfChannelId: number, username: string,
     }
   }
   return sent;
+}
+
+// asdfbase で付けられたリアクションを Discord に反映
+export async function relayReactionToDiscord(discordChannelId: string, discordMessageId: string, emoji: string, isRemove = false) {
+  if (!client || !connected) return;
+  try {
+    const ch = (await client.channels.fetch(discordChannelId)) as TextBasedChannel | null;
+    if (!ch || !('messages' in ch) || !isGuildAllowed((ch as any).guildId)) return;
+    const msg = await (ch as any).messages.fetch(discordMessageId).catch(() => null);
+    if (!msg) return;
+    if (isRemove) {
+      const r = msg.reactions.resolve(emoji);
+      if (r && client.user) {
+        await r.users.remove(client.user.id).catch(() => {});
+      }
+    } else {
+      await msg.react(emoji).catch(() => {});
+    }
+  } catch (err: any) {
+    console.warn('[discord] relayReaction failed:', err.message);
+  }
+}
+
+// asdfbase でピン留めされた状態を Discord に反映
+export async function relayPinToDiscord(discordChannelId: string, discordMessageId: string, isPinned: boolean) {
+  if (!client || !connected) return;
+  try {
+    const ch = (await client.channels.fetch(discordChannelId)) as TextBasedChannel | null;
+    if (!ch || !('messages' in ch) || !isGuildAllowed((ch as any).guildId)) return;
+    const msg = await (ch as any).messages.fetch(discordMessageId).catch(() => null);
+    if (!msg) return;
+    if (isPinned) {
+      if (!msg.pinned) await msg.pin().catch(() => {});
+    } else {
+      if (msg.pinned) await msg.unpin().catch(() => {});
+    }
+  } catch (err: any) {
+    console.warn('[discord] relayPin failed:', err.message);
+  }
 }
 
 // Bot が送ったメッセージを編集 (Discord 側にも「編集済み」が付く)。1つでも編集できれば true
@@ -350,12 +523,18 @@ export async function editRelayedOnDiscord(links: RelayedMessage[], username: st
 }
 
 function createClient(withMessageContent: boolean) {
-  const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageTyping];
+  const intents = [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageTyping,
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildVoiceStates,
+  ];
   if (withMessageContent) intents.push(GatewayIntentBits.MessageContent);
   return new Client({
     intents,
-    // キャッシュしていないメッセージの編集も受け取る
-    partials: [Partials.Message, Partials.Channel],
+    // キャッシュしていないメッセージの編集・リアクションも受け取る
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction],
     // VPS のメモリ節約のためキャッシュを最小限に
     makeCache: Options.cacheWithLimits({
       ...Options.DefaultMakeCacheSettings,
@@ -394,6 +573,9 @@ export async function startDiscordBot(d: DiscordDeps) {
         lastError = `許可されたサーバーの一部に Bot が参加していません: ${missing.join(', ')}`;
       }
       await refreshDiscordCommands();
+      if (deps?.onVoiceStatusUpdate) {
+        deps.onVoiceStatusUpdate(getDiscordVoiceStatus());
+      }
     });
     c.on(Events.ShardDisconnect, () => {
       connected = false;
@@ -413,6 +595,62 @@ export async function startDiscordBot(d: DiscordDeps) {
     });
     c.on(Events.MessageUpdate, (_old, m) => {
       handleDiscordEdit(m).catch(err => console.error('[discord] edit handling failed:', err));
+    });
+    c.on(Events.MessageDelete, m => {
+      try {
+        if (m.guildId && !isGuildAllowed(m.guildId)) return;
+        if (deps?.ingestDelete) {
+          deps.ingestDelete(m.id).catch(err => console.error('[discord] delete handling failed:', err));
+        }
+      } catch (err: any) {
+        console.error('[discord] delete error:', err.message);
+      }
+    });
+    c.on(Events.MessageReactionAdd, async (reaction, user) => {
+      try {
+        if (user.bot) return;
+        const fullMsg = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+        if (!fullMsg || !isGuildAllowed(fullMsg.guildId)) return;
+        const emoji = reaction.emoji.name;
+        if (!emoji || !deps?.ingestReaction) return;
+        await deps.ingestReaction(fullMsg.id, emoji, user.id, 'add');
+      } catch (err: any) {
+        console.error('[discord] reactionAdd failed:', err.message);
+      }
+    });
+    c.on(Events.MessageReactionRemove, async (reaction, user) => {
+      try {
+        if (user.bot) return;
+        const fullMsg = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+        if (!fullMsg || !isGuildAllowed(fullMsg.guildId)) return;
+        const emoji = reaction.emoji.name;
+        if (!emoji || !deps?.ingestReaction) return;
+        await deps.ingestReaction(fullMsg.id, emoji, user.id, 'remove');
+      } catch (err: any) {
+        console.error('[discord] reactionRemove failed:', err.message);
+      }
+    });
+    c.on(Events.ChannelPinsUpdate, async channel => {
+      try {
+        if (!('guildId' in channel) || !isGuildAllowed((channel as any).guildId)) return;
+        if (!deps?.syncPinsForChannel) return;
+        const textCh = channel as any;
+        if (typeof textCh.messages?.fetchPinned === 'function') {
+          const pinnedMessages = await textCh.messages.fetchPinned().catch(() => null);
+          if (pinnedMessages) {
+            const pinnedIds = Array.from(pinnedMessages.keys()) as string[];
+            await deps.syncPinsForChannel(channel.id, pinnedIds);
+          }
+        }
+      } catch (err: any) {
+        console.error('[discord] pinsUpdate failed:', err.message);
+      }
+    });
+    c.on(Events.VoiceStateUpdate, (_oldState, newState) => {
+      if (!isGuildAllowed(newState.guild?.id)) return;
+      if (deps?.onVoiceStatusUpdate) {
+        deps.onVoiceStatusUpdate(getDiscordVoiceStatus());
+      }
     });
     c.on(Events.TypingStart, async typing => {
       try {

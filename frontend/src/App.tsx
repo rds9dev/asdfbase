@@ -448,6 +448,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
+  const [discordVcs, setDiscordVcs] = useState<{ guildName: string; channelName: string; channelId: string; members: { id: string; name: string; avatarUrl: string | null }[] }[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   // 送信待ちの画像 (Ctrl+V / ドロップ / 画像ボタン)。入力欄の上に小さくプレビューする
   const [pendingImages, setPendingImages] = useState<{ id: string; file: File; url: string }[]>([]);
@@ -1113,6 +1114,8 @@ export default function App() {
         const p = msg.payload || {};
         if (p.userId === currentUserRef.current?.id || Date.now() - (p.t || 0) > 6000) return;
         setTypingUsers(prev => ({ ...prev, [p.userId]: { username: p.username, channelId: p.channelId, until: Date.now() + 5000 } }));
+      } else if (msg.type === 'DISCORD_VOICE_STATUS') {
+        setDiscordVcs(msg.payload || []);
       } else if (msg.type === 'CALENDAR_UPDATED') {
         setCalendarEvents(prev => [...prev.filter(e => e.id !== msg.payload.id), msg.payload]);
       } else if (msg.type === 'CALENDAR_DELETED') {
@@ -1281,6 +1284,7 @@ export default function App() {
     const results = await Promise.allSettled([
       get('/api/channels').then(data => Array.isArray(data) && setChannels(data)),
       get('/api/users').then(data => Array.isArray(data) && setOnlineUsers(data)),
+      get('/api/discord/voice-status').then(data => data?.vcs && setDiscordVcs(data.vcs)).catch(() => {}),
       get('/api/notes').then((data: MemoSlot[]) => {
         if (!Array.isArray(data)) return;
         setMemoSlots(data);
@@ -4203,6 +4207,37 @@ export default function App() {
             {/* Right: Members Sidebar */}
             {!isMembersCollapsed && (
               <aside className="absolute lg:static inset-y-0 right-0 z-40 w-60 lg:w-56 border-l border-stone-800 bg-[#0C0D10] p-3 flex flex-col shrink-0 min-h-0 overflow-y-auto anim-slide-right lg:animate-none shadow-2xl lg:shadow-none">
+                {/* Discord VC 参加者 */}
+                {discordVcs && discordVcs.length > 0 && (
+                  <div className="mb-3 pb-3 border-b border-stone-800/80">
+                    <div className="text-[11px] uppercase tracking-wider text-indigo-400 px-2 mb-1.5 font-bold flex items-center gap-1.5">
+                      <Volume2 className="w-3.5 h-3.5 text-indigo-400 animate-pulse" /> Discord VC
+                    </div>
+                    <div className="space-y-1.5">
+                      {discordVcs.map(vc => (
+                        <div key={vc.channelId} className="px-2 py-1.5 rounded-lg bg-[#16181D] border border-stone-800/60">
+                          <div className="text-[11px] font-medium text-stone-300 truncate flex items-center gap-1 mb-1">
+                            <span className="text-indigo-300 font-semibold">🔊 {vc.channelName}</span>
+                            <span className="text-[10px] text-stone-500">({vc.guildName})</span>
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {vc.members.map(m => (
+                              <span key={m.id} className="inline-flex items-center gap-1 text-[11px] bg-stone-800 text-stone-200 px-1.5 py-0.5 rounded-full" title={m.name}>
+                                {m.avatarUrl ? (
+                                  <img src={m.avatarUrl} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
+                                ) : (
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                                )}
+                                <span className="max-w-[70px] truncate">{m.name}</span>
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {(['online', 'away', 'offline'] as const).map(group => {
                   const members = onlineUsers.filter(u =>
                     group === 'offline' ? (u.status !== 'online' && u.status !== 'away') : u.status === group
