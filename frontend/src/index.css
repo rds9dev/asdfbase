@@ -350,3 +350,27 @@ button:not(:disabled):active {
   line-height: 1.4;
   color: #d6d3d1;
 }
+
+/* メッセージリンク・返信元へジャンプした時のハイライト */
+@keyframes msgHighlight {
+  0%, 60% { background-color: rgba(245, 158, 11, 0.22); box-shadow: inset 3px 0 0 #f59e0b; }
+  100% { background-color: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
+.msg-highlight { animation: msgHighlight 2.4s ease-out both; }
+
+@keyframes slideInUp {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+.anim-slide-up { animation: slideInUp 0.22s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* タッチ端末: 長押しメニューと文字選択がぶつからないように。入力欄は16px以上にして iOS の自動ズームを防ぐ */
+@media (hover: none) and (pointer: coarse) {
+  .msg-row { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  /* チャット入力欄とメンション色付け用の下敷きは同じ大きさにそろえる */
+  .composer-text { font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-highlight { animation: none; background-color: rgba(245, 158, 11, 0.15); }
+  .anim-slide-up { animation: none; }
+}

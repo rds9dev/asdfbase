@@ -119,7 +119,11 @@ async function runGeminiAgent(input) {
     const maxSteps = input.maxSteps ?? 6;
     for (let round = 0; round <= maxSteps; round++) {
         // 上限に達したらツールなしで答えさせる
-        const roundConfig = round === maxSteps ? { systemInstruction: input.systemInstruction } : config;
+        const roundConfig = round === maxSteps
+            ? { systemInstruction: input.systemInstruction }
+            : round === 0 && input.forceFirstTool && input.tools.some(t => t.name === input.forceFirstTool)
+                ? { ...config, toolConfig: { functionCallingConfig: { mode: genai_1.FunctionCallingConfigMode.ANY, allowedFunctionNames: [input.forceFirstTool] } } }
+                : config;
         const response = await generateWithFallback(contents, roundConfig, pinned);
         const calls = response.functionCalls || [];
         if (calls.length === 0) {

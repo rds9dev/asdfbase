@@ -171,6 +171,53 @@ async function initDb() {
       );
       CREATE INDEX IF NOT EXISTS calendar_events_date_idx ON calendar_events (event_date);
     `).catch(err => console.warn('Migration test/avatar/calendar warning:', err.message));
+        // マイグレーション: クラス (1〜6組) / 編集済み / Discord 連携 / 既読位置 / 宿題
+        await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS class_no INT DEFAULT NULL;
+      ALTER TABLE timetables ADD COLUMN IF NOT EXISTS items TEXT DEFAULT '';
+      ALTER TABLE timetables ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
+      ALTER TABLE timetables ADD COLUMN IF NOT EXISTS class_no INT NOT NULL DEFAULT 1;
+      ALTER TABLE assignments ADD COLUMN IF NOT EXISTS class_no INT DEFAULT NULL;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS author_avatar TEXT DEFAULT NULL;
+      CREATE INDEX IF NOT EXISTS timetables_class_idx ON timetables (class_no, day_of_week, period);
+      CREATE TABLE IF NOT EXISTS discord_message_links (
+        asdf_message_id INT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        discord_channel_id VARCHAR(32) NOT NULL,
+        discord_message_id VARCHAR(32) NOT NULL,
+        direction VARCHAR(3) NOT NULL,
+        PRIMARY KEY (discord_message_id, asdf_message_id)
+      );
+      CREATE INDEX IF NOT EXISTS discord_links_asdf_idx ON discord_message_links (asdf_message_id);
+      CREATE TABLE IF NOT EXISTS channel_reads (
+        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        channel_id INT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        last_read_id INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, channel_id)
+      );
+      CREATE TABLE IF NOT EXISTS homework (
+        id SERIAL PRIMARY KEY,
+        class_no INT DEFAULT NULL,
+        subject VARCHAR(50) NOT NULL,
+        content TEXT NOT NULL,
+        due_date DATE NOT NULL,
+        user_id INT REFERENCES users(id) ON DELETE SET NULL,
+        username VARCHAR(50),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS homework_due_idx ON homework (due_date);
+      CREATE TABLE IF NOT EXISTS homework_done (
+        homework_id INT NOT NULL REFERENCES homework(id) ON DELETE CASCADE,
+        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        PRIMARY KEY (homework_id, user_id)
+      );
+    `).catch(err => console.warn('Migration class/edit/discord/homework warning:', err.message));
+        // 以前の編集 (updated_at だけ更新されていたもの) にも「編集済み」を付ける (初回のみ)
+        const editMigrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_message_edited_at'`);
+        if (editMigrated.rows.length === 0) {
+            await client.query(`UPDATE messages SET edited_at = updated_at WHERE edited_at IS NULL AND updated_at > created_at + INTERVAL '2 seconds'`);
+            await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_message_edited_at', 'done') ON CONFLICT DO NOTHING`);
+        }
         // 既存のテスト記録はテスト名から種別を推定 (初回のみ)
         const migrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_test_exam_type'`);
         if (migrated.rows.length === 0) {

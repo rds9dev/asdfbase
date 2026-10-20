@@ -8,9 +8,11 @@ import {
   GatewayIntentBits,
   Options,
   Events,
+  Partials,
   PermissionFlagsBits,
   ApplicationCommandOptionType,
   type Message as DiscordMessage,
+  type PartialMessage,
   type ChatInputCommandInteraction,
   type TextBasedChannel,
 } from 'discord.js';
@@ -22,14 +24,31 @@ export interface DiscordBinding {
   asdfChannelId: number;
 }
 
+export interface DiscordIngestMeta {
+  avatarUrl: string | null;
+  discordChannelId: string;
+  // 本文 (テキスト部分) のときだけ。あとで Discord 側の編集を反映するのに使う
+  discordMessageId: string | null;
+}
+
+// asdfbase → Discord に Bot が送ったメッセージ
+export interface RelayedMessage {
+  discordChannelId: string;
+  discordMessageId: string;
+}
+
 export interface DiscordDeps {
   getSetting: (key: string, fallback?: string) => Promise<string>;
   setSetting: (key: string, value: string) => Promise<void>;
   listAsdfChannels: () => Promise<{ id: number; name: string; type: string }[]>;
   // Discord から来たメッセージを asdfbase に保存・配信
-  ingest: (asdfChannelId: number, username: string, content: string) => Promise<void>;
+  ingest: (asdfChannelId: number, username: string, content: string, meta: DiscordIngestMeta) => Promise<void>;
+  // Discord 側でメッセージが編集された
+  ingestEdit: (discordMessageId: string, content: string) => Promise<void>;
   // Discord の画像を保存して /uploads/... のパスを返す
   saveImage: (buf: Buffer) => Promise<string>;
+  // Discord のアイコンを (名前が同じなら使い回して) 保存し /uploads/... のパスを返す
+  saveAvatar: (key: string, url: string) => Promise<string | null>;
   uploadDir: string;
   audit: (action: string, details: object) => void;
 }
@@ -190,6 +209,18 @@ function isImage(att: { contentType?: string | null; name?: string | null }) {
   return (att.contentType || '').startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(att.name || '');
 }
 
+// サーバーアイコン > ユーザーアイコン の順。アイコンが変わったら別ファイルになる
+async function avatarFor(msg: DiscordMessage): Promise<string | null> {
+  try {
+    const hash = msg.member?.avatar || msg.author.avatar || 'default';
+    const url = msg.member?.displayAvatarURL({ extension: 'png', size: 128 }) || msg.author.displayAvatarURL({ extension: 'png', size: 128 });
+    return await deps!.saveAvatar(`${msg.author.id}-${hash}`, url);
+  } catch (err: any) {
+    console.error('[discord] avatar save failed:', err.message);
+    return null;
+  }
+}
+
 async function handleDiscordMessage(msg: DiscordMessage) {
   if (msg.guildId !== guildId) return;
   if (msg.author.bot || msg.webhookId) return; // 自分の転送を再取り込みしない
@@ -198,6 +229,7 @@ async function handleDiscordMessage(msg: DiscordMessage) {
   if (targets.length === 0) return;
 
   const name = `[Discord] ${msg.member?.displayName || msg.author.globalName || msg.author.username}`;
+  const avatarUrl = await avatarFor(msg);
   const parts: string[] = [];
   const text = msg.cleanContent?.trim();
   if (text) parts.push(text);
@@ -225,15 +257,33 @@ async function handleDiscordMessage(msg: DiscordMessage) {
 
   for (const t of targets) {
     // 画像は1枚ずつ別メッセージにする (asdfbase のチャット表示に合わせる)
-    for (const p of parts) await deps!.ingest(t.asdfChannelId, name, p);
+    for (let i = 0; i < parts.length; i++) {
+      await deps!.ingest(t.asdfChannelId, name, parts[i], {
+        avatarUrl,
+        discordChannelId: msg.channelId,
+        discordMessageId: i === 0 && text ? msg.id : null,
+      });
+    }
   }
 }
 
-// asdfbase のメッセージを連携先の Discord チャンネルへ送信。送信先が1つでもあれば true
-export async function relayToDiscordBot(asdfChannelId: number, username: string, content: string): Promise<boolean> {
-  if (!client || !connected || !deps) return false;
+// Discord 側の編集: 本文が変わっていれば asdfbase の該当メッセージも書き換える
+async function handleDiscordEdit(msg: DiscordMessage | PartialMessage) {
+  if (msg.guildId !== guildId) return;
+  const full = msg.partial ? await msg.fetch().catch(() => null) : msg;
+  if (!full || full.author.bot || full.webhookId) return;
+  const bindings = await getBindings();
+  if (!bindings.some(b => b.discordChannelId === full.channelId)) return;
+  const text = full.cleanContent?.trim();
+  if (!text) return;
+  await deps!.ingestEdit(full.id, text);
+}
+
+// asdfbase のメッセージを連携先の Discord チャンネルへ送信。送った Discord メッセージを返す (空なら未送信)
+export async function relayToDiscordBot(asdfChannelId: number, username: string, content: string): Promise<RelayedMessage[]> {
+  if (!client || !connected || !deps) return [];
   const targets = (await getBindings()).filter(b => b.asdfChannelId === asdfChannelId);
-  if (targets.length === 0) return false;
+  if (targets.length === 0) return [];
 
   const files: string[] = [];
   const text = content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, (_m, p: string) => {
@@ -250,13 +300,13 @@ export async function relayToDiscordBot(asdfChannelId: number, username: string,
     allowedMentions: { parse: [] as never[] },
   };
 
-  let sent = false;
+  const sent: RelayedMessage[] = [];
   for (const t of targets) {
     try {
       const ch = (await client.channels.fetch(t.discordChannelId)) as TextBasedChannel | null;
       if (ch && 'send' in ch && (ch as any).guildId === guildId) {
-        await (ch as any).send(payload);
-        sent = true;
+        const m = await (ch as any).send(payload);
+        sent.push({ discordChannelId: t.discordChannelId, discordMessageId: m.id });
       }
     } catch (err: any) {
       lastError = `送信失敗: ${err.message}`;
@@ -266,11 +316,33 @@ export async function relayToDiscordBot(asdfChannelId: number, username: string,
   return sent;
 }
 
+// Bot が送ったメッセージを編集 (Discord 側にも「編集済み」が付く)。1つでも編集できれば true
+export async function editRelayedOnDiscord(links: RelayedMessage[], username: string, content: string): Promise<boolean> {
+  if (!client || !connected || links.length === 0) return false;
+  const body = content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, '').trim();
+  let edited = false;
+  for (const l of links) {
+    try {
+      const ch = (await client.channels.fetch(l.discordChannelId)) as TextBasedChannel | null;
+      if (!ch || !('messages' in ch) || (ch as any).guildId !== guildId) continue;
+      const m = await (ch as any).messages.fetch(l.discordMessageId);
+      await m.edit({ content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000), allowedMentions: { parse: [] } });
+      edited = true;
+    } catch (err: any) {
+      lastError = `編集の反映に失敗: ${err.message}`;
+      console.error('[discord] edit relay failed:', err.message);
+    }
+  }
+  return edited;
+}
+
 function createClient(withMessageContent: boolean) {
   const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
   if (withMessageContent) intents.push(GatewayIntentBits.MessageContent);
   return new Client({
     intents,
+    // キャッシュしていないメッセージの編集も受け取る
+    partials: [Partials.Message, Partials.Channel],
     // VPS のメモリ節約のためキャッシュを最小限に
     makeCache: Options.cacheWithLimits({
       ...Options.DefaultMakeCacheSettings,
@@ -323,6 +395,9 @@ export async function startDiscordBot(d: DiscordDeps) {
     });
     c.on(Events.MessageCreate, m => {
       handleDiscordMessage(m).catch(err => console.error('[discord] message handling failed:', err));
+    });
+    c.on(Events.MessageUpdate, (_old, m) => {
+      handleDiscordEdit(m).catch(err => console.error('[discord] edit handling failed:', err));
     });
     c.on(Events.InteractionCreate, i => {
       if (i.isChatInputCommand()) {

@@ -79,6 +79,8 @@ import {
   BellRing,
   WifiOff,
   ChevronDown,
+  BookOpenCheck,
+  Square,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -91,11 +93,14 @@ import {
 import { RealtimeClient, type RealtimeStatus, type ConcreteTransport } from './realtime';
 import { UiHost, HoverCard, Modal, confirmDialog, toast } from './ui';
 import {
-  DEFAULT_CONFIG, SCHEDULE_LABELS, DAY_LABELS, MAX_PERIODS, SUBJECTS,
+  DEFAULT_CONFIG, SCHEDULE_LABELS, DAY_LABELS, MAX_PERIODS, SUBJECTS, CLASS_NUMBERS,
   computeSchoolStatus, daySlots, periodCountFor, closingFor,
   type ScheduleType, type ScheduleDef, type TimetableConfig, type TimetableItem,
 } from './schedule';
-import { renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates } from './chatText';
+import { renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates, DiscordBadge, splitSenderName } from './chatText';
+import { ReactionBar } from './Reactions';
+import HomeworkTab, { type Homework } from './HomeworkTab';
+import { drawStroke, drawText, playTimelapse, timelapsePlan } from './boardTimelapse';
 import { setFaviconBadge } from './favicon';
 import AiTab from './AiTab';
 import TestScoresTab from './TestScoresTab';
@@ -109,6 +114,7 @@ interface User {
   role: string;
   status: string;
   avatar_url?: string | null;
+  class_no?: number | null;
 }
 
 interface Message {
@@ -123,6 +129,9 @@ interface Message {
   reactions?: Record<string, number[]>;
   is_pinned?: boolean;
   created_at: string;
+  edited_at?: string | null;
+  // Discord から来たメッセージのアイコン (サーバーに保存済みの /uploads/...)
+  author_avatar?: string | null;
   client_nonce?: string | null;
   pending?: boolean;
   failed?: boolean;
@@ -140,20 +149,17 @@ function summarizeContent(content?: string): string {
 }
 
 // 楽観的送信メッセージ(負のID)を確定メッセージで置換しつつ、重複を排除してマージ
+// 確定メッセージは常に ID 順 (再接続時の取りこぼし補完が後から届いても並びが崩れない)
 function mergeIncomingMessage(prev: Message[], msg: Message): Message[] {
   const exists = prev.some(m => m.id === msg.id);
   const nonceIdx = msg.client_nonce ? prev.findIndex(m => m.id < 0 && m.client_nonce === msg.client_nonce) : -1;
-  if (nonceIdx >= 0) {
-    const next = [...prev];
-    if (exists) next.splice(nonceIdx, 1);
-    else next[nonceIdx] = msg;
-    return next;
-  }
-  if (exists) return prev;
+  const base = nonceIdx >= 0 ? [...prev.slice(0, nonceIdx), ...prev.slice(nonceIdx + 1)] : prev;
+  if (exists) return base;
   // 送信中メッセージは常に末尾に保つ
-  const firstPending = prev.findIndex(m => m.id < 0);
-  if (firstPending === -1) return [...prev, msg];
-  return [...prev.slice(0, firstPending), msg, ...prev.slice(firstPending)];
+  const firstPending = base.findIndex(m => m.id < 0);
+  let idx = firstPending === -1 ? base.length : firstPending;
+  while (idx > 0 && base[idx - 1].id > msg.id) idx--;
+  return [...base.slice(0, idx), msg, ...base.slice(idx)];
 }
 
 const TRANSPORT_LABELS: Record<string, string> = {
@@ -209,12 +215,13 @@ const LS = {
   },
 };
 
-type TabId = 'chat' | 'memo' | 'ai' | 'assignments' | 'board' | 'more' | 'settings' | 'help';
+type TabId = 'chat' | 'memo' | 'ai' | 'assignments' | 'homework' | 'board' | 'more' | 'settings' | 'help';
 const TABS: { id: TabId; label: string; icon: any }[] = [
   { id: 'chat', label: 'チャット', icon: MessageSquare },
   { id: 'memo', label: 'メモ', icon: FileText },
   { id: 'ai', label: 'AI', icon: Bot },
   { id: 'assignments', label: '提出物', icon: CheckSquare },
+  { id: 'homework', label: '宿題', icon: BookOpenCheck },
   { id: 'board', label: 'ボード', icon: Layout },
   { id: 'more', label: 'その他', icon: MoreHorizontal },
   { id: 'settings', label: '設定', icon: Settings },
@@ -248,8 +255,16 @@ interface MemoSlot {
   updated_at: string;
 }
 
+// スマホの下部タブバーに直接出すタブ (残りは「メニュー」から)
+const MOBILE_MAIN_TABS: TabId[] = ['chat', 'memo', 'assignments', 'homework', 'ai'];
+
+// ボードの描画領域 (全員共通の座標)。横長の画面に合わせて横を広めに取る
+const BOARD_WIDTH = 2200;
+const BOARD_HEIGHT = 1000;
+
 interface Assignment {
   id: number;
+  class_no?: number | null;
   title: string;
   subject: string;
   description?: string;
@@ -377,6 +392,10 @@ export default function App() {
   const [integrations, setIntegrations] = useState<any>(null);
   const [integrationStatus, setIntegrationStatus] = useState('');
   const [auditFilter, setAuditFilter] = useState('');
+  // '' = 全員 / 'system' = 操作者なし / ユーザーID
+  const [auditUserFilter, setAuditUserFilter] = useState('');
+  const [auditSummary, setAuditSummary] = useState<{ text: string; count: number } | null>(null);
+  const [isSummarizingAudit, setIsSummarizingAudit] = useState(false);
   const [expandedAuditId, setExpandedAuditId] = useState<number | null>(null);
   const [webhookUrlInput, setWebhookUrlInput] = useState('');
   const [webhookStatus, setWebhookStatus] = useState('');
@@ -461,10 +480,6 @@ export default function App() {
   const [isEditingPeriods, setIsEditingPeriods] = useState(false);
   const [periodDraft, setPeriodDraft] = useState<ScheduleDef | null>(null);
   const [timetables, setTimetables] = useState<TimetableItem[]>([]);
-  const scheduleTypeRef = useRef(scheduleType);
-  scheduleTypeRef.current = scheduleType;
-  const todayScheduleRef = useRef(todaySchedule);
-  todayScheduleRef.current = todaySchedule;
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [assignmentFilter, setAssignmentFilter] = useState<'all' | 'unstarted' | 'in_progress' | 'submitted' | 'passed'>('all');
   const [newAssignTitle, setNewAssignTitle] = useState('');
@@ -475,6 +490,17 @@ export default function App() {
   const [newAssignDesc, setNewAssignDesc] = useState('');
   const [isSummarizingAI, setIsSummarizingAI] = useState<number | null>(null);
   const [summarizedTexts, setSummarizedTexts] = useState<Record<number, string>>({});
+  // 提出物の表示クラス ('mine' = 自分のクラス) と、登録するクラス (null = 全クラス共通)
+  const [assignClassView, setAssignClassView] = useState<number | 'all' | 'mine'>('mine');
+  const [newAssignClass, setNewAssignClass] = useState<number | null | 'mine'>('mine');
+  // 宿題
+  const [homework, setHomework] = useState<Homework[]>([]);
+  // 時間割モーダルで表示・編集するクラス
+  const [ttClassNo, setTtClassNo] = useState<number>(1);
+  const ttClassNoRef = useRef(ttClassNo);
+  ttClassNoRef.current = ttClassNo;
+  const myClassRef = useRef<number | null>(null);
+  myClassRef.current = currentUser?.class_no ?? null;
 
   // Phase 4 State: Collaborative Whiteboard
   const [boardStrokes, setBoardStrokes] = useState<any[]>([]);
@@ -486,6 +512,8 @@ export default function App() {
   const [boardMode, setBoardMode] = useState<'draw' | 'eraser' | 'text'>('draw');
   const [newBoardText, setNewBoardText] = useState('');
   const [isTimelapsePlaying, setIsTimelapsePlaying] = useState(false);
+  const [timelapseProgress, setTimelapseProgress] = useState(0);
+  const stopTimelapseRef = useRef<(() => void) | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Phase 4 State: Shared Clipboard
@@ -520,6 +548,21 @@ export default function App() {
   // Chat Ergonomics & Pagination & Cursor Following
   const [hasMoreMessages, setHasMoreMessages] = useState<boolean>(true);
   const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState<boolean>(false);
+  // チャンネルの読み込み状態 (失敗したら自動で再試行し、再接続時にも読み直す)
+  const [channelLoadState, setChannelLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const channelLoadStateRef = useRef(channelLoadState);
+  channelLoadStateRef.current = channelLoadState;
+  const channelLoadSeqRef = useRef(0);
+  // リンクから過去の位置を開いている間は、表示より新しいメッセージがある (新着は末尾に足さない)
+  const [hasNewerMessages, setHasNewerMessages] = useState(false);
+  const hasNewerRef = useRef(false);
+  hasNewerRef.current = hasNewerMessages;
+  const [isLoadingNewer, setIsLoadingNewer] = useState(false);
+  const pendingJumpRef = useRef<{ channelId: number; context: any } | null>(null);
+  // スマホ: メッセージ長押しの操作メニュー / 下部の「メニュー」
+  const [msgActionSheet, setMsgActionSheet] = useState<Message | null>(null);
+  const msgLongPressRef = useRef<{ timer: any; x: number; y: number } | null>(null);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const unreadMessageRef = useRef<HTMLDivElement | null>(null);
 
@@ -577,12 +620,45 @@ export default function App() {
     });
   };
 
+  // 既読位置はサーバーにも保存して、他の端末 (スマホ ⇔ PC) と揃える。まとめて0.8秒ごとに送る
+  const serverReadRef = useRef<Record<number, number>>({});
+  const pendingReadsRef = useRef<Record<number, number>>({});
+  const readFlushTimerRef = useRef<any>(null);
+  const pushReadToServer = (channelId: number, messageId: number) => {
+    if (messageId <= 0 || messageId <= (serverReadRef.current[channelId] || 0) || messageId <= (pendingReadsRef.current[channelId] || 0)) return;
+    pendingReadsRef.current[channelId] = messageId;
+    if (readFlushTimerRef.current) return;
+    readFlushTimerRef.current = setTimeout(() => {
+      readFlushTimerRef.current = null;
+      const batch = pendingReadsRef.current;
+      pendingReadsRef.current = {};
+      const tk = tokenRef.current;
+      if (!tk) return;
+      for (const [ch, id] of Object.entries(batch)) {
+        safeFetch(`/api/channels/${ch}/read?connId=${encodeURIComponent(realtimeRef.current?.connId || '')}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tk}` },
+          body: JSON.stringify({ messageId: id }),
+        })
+          .then(r => (r.ok ? r.json() : null))
+          .then(d => {
+            if (d?.lastReadId) serverReadRef.current[Number(ch)] = Math.max(serverReadRef.current[Number(ch)] || 0, d.lastReadId);
+          })
+          .catch(() => {
+            // 送れなかった分は次に既読にした時にまとめて送られる
+          });
+      }
+    }, 800);
+  };
+
   const markChannelRead = (channelId: number, messageId: number) => {
     setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
     setMentionCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
     if (messageId > 0 && (lastReadMessageIdsRef.current[channelId] || 0) < messageId) {
-      setLastReadMessageIds(prev => ({ ...prev, [channelId]: messageId }));
+      lastReadMessageIdsRef.current = { ...lastReadMessageIdsRef.current, [channelId]: messageId };
+      setLastReadMessageIds(prev => ((prev[channelId] || 0) >= messageId ? prev : { ...prev, [channelId]: messageId }));
     }
+    pushReadToServer(channelId, messageId);
   };
 
   useEffect(() => {
@@ -658,23 +734,49 @@ export default function App() {
 
 
   // Weather (Takamatsu - via internal backend API to bypass external domain filters)
+  // 取得に失敗したら 15秒 → 30秒 → … (最大5分) で取り直す。成功したら10分ごと
+  const refetchWeatherRef = useRef<() => void>(() => {});
+  const weatherFailedRef = useRef(false);
   useEffect(() => {
-    async function fetchWeather() {
+    let timer: any = null;
+    let failures = 0;
+    let cancelled = false;
+    const run = async () => {
+      clearTimeout(timer);
+      let ok = false;
       try {
-        const res = await fetch(`${getApiBaseUrl()}/api/weather`).catch(() => null);
-        if (res && res.ok) {
+        const res = await fetch(`${getApiBaseUrl()}/api/weather`, { cache: 'no-store' });
+        if (res.ok) {
           const data = await res.json();
-          if (data && typeof data.temp === 'number') {
-            setWeather({ ...data, temp: data.source === 'fallback' ? null : data.temp, desc: data.desc || '不明' });
+          if (data && typeof data.temp === 'number' && data.source !== 'fallback') {
+            if (!cancelled) setWeather({ ...data, desc: data.desc || '不明' });
+            ok = true;
           }
         }
       } catch (e) {
-        console.error('Weather error:', e);
+        console.warn('Weather error:', e);
       }
-    }
-    fetchWeather();
-    const interval = setInterval(fetchWeather, 600000);
-    return () => clearInterval(interval);
+      if (cancelled) return;
+      // 取れなかった時は、前に取れていた情報があればそのまま表示しておく
+      if (!ok) setWeather(prev => (prev.temp === null ? { temp: null, desc: '取得失敗' } : prev));
+      weatherFailedRef.current = !ok;
+      failures = ok ? 0 : failures + 1;
+      timer = setTimeout(run, ok ? 600000 : Math.min(15000 * 2 ** (failures - 1), 300000));
+    };
+    refetchWeatherRef.current = () => {
+      failures = 0;
+      run();
+    };
+    run();
+    const onOnline = () => {
+      if (weatherFailedRef.current) refetchWeatherRef.current();
+    };
+    window.addEventListener('online', onOnline);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      window.removeEventListener('online', onOnline);
+    };
   }, []);
 
   // Safe fetch helper: always strictly same-origin relative path
@@ -752,7 +854,9 @@ export default function App() {
     const me = currentUserRef.current;
     const isMine = Boolean(me && newMsg.user_id === me.id);
     const isActiveChannel = newMsg.channel_id === activeChannelIdRef.current;
-    const isViewing = isActiveChannel && activeTabRef.current === 'chat' && !document.hidden;
+    // リンクで過去の位置を見ている間は、新着を末尾に足さず「最新へ」から読み込む
+    const isDetached = isActiveChannel && hasNewerRef.current;
+    const isViewing = isActiveChannel && !isDetached && activeTabRef.current === 'chat' && !document.hidden;
 
     const isImportant = Boolean(
       me && !isMine && newMsg.sender_username !== me.username &&
@@ -780,7 +884,9 @@ export default function App() {
       }
     }
 
-    if (isActiveChannel) {
+    if (isDetached) {
+      setNewBelowCount(c => c + 1);
+    } else if (isActiveChannel) {
       setMessages(prev => {
         const next = mergeIncomingMessage(prev, newMsg);
         // 最下部を見ている間は、画面に持つメッセージを直近400件に抑える (上へスクロールすれば再取得)
@@ -799,7 +905,7 @@ export default function App() {
       }
     }
 
-    if (isViewing || isMine) {
+    if (isViewing || (isMine && !isDetached)) {
       markChannelRead(newMsg.channel_id, newMsg.id);
     } else {
       setUnreadCounts(prev => ({
@@ -844,6 +950,13 @@ export default function App() {
     const tk = tokenRef.current;
     const channelId = activeChannelIdRef.current;
     if (!tk || !channelId) return;
+    // まだ読み込めていない (起動直後の失敗など) なら最初から読み込む
+    if (channelLoadStateRef.current !== 'ready') {
+      loadChannelMessagesRef.current(channelId);
+      return;
+    }
+    // 過去の位置を見ている間は、表示中の範囲を崩さない
+    if (hasNewerRef.current) return;
     try {
       const res = await safeFetch(`/api/channels/${channelId}/messages?limit=50`, {
         headers: { Authorization: `Bearer ${tk}` },
@@ -853,57 +966,110 @@ export default function App() {
       if (fresh.length === 0) return;
       const minId = fresh[0].id;
       setMessages(prev => {
-        const older = prev.filter(m => m.id > 0 && m.id < minId);
+        const confirmed = prev.filter(m => m.id > 0);
+        const prevMax = confirmed.length ? confirmed[confirmed.length - 1].id : 0;
         const pending = prev.filter(m => m.id < 0 && !fresh.some(f => f.client_nonce && f.client_nonce === m.client_nonce));
+        // 切断中に50件より多く届いた: 手元の古いログとの間が抜けるので、最新50件から表示し直す
+        if (fresh.length >= 50 && prevMax > 0 && prevMax < minId) {
+          setHasMoreMessages(true);
+          return [...fresh, ...pending];
+        }
+        const older = confirmed.filter(m => m.id < minId);
         return [...older, ...fresh, ...pending];
       });
       fresh.forEach(m => {
         processedMessageIdsRef.current.add(m.id);
         if (m.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = m.id;
       });
+      if (activeTabRef.current === 'chat' && !document.hidden) markChannelRead(channelId, fresh[fresh.length - 1].id);
     } catch (_) {}
   };
   const refreshActiveChannelRef = useRef(refreshActiveChannel);
   refreshActiveChannelRef.current = refreshActiveChannel;
 
+  // 未読数と既読位置 (サーバー ⇔ この端末) を取り直す。最新のメッセージIDを返す
+  const unreadCountsRef = useRef(unreadCounts);
+  unreadCountsRef.current = unreadCounts;
+  const refreshUnreadCounts = async (): Promise<number | null> => {
+    const tk = tokenRef.current;
+    if (!tk) return null;
+    try {
+      const res = await safeFetch('/api/channels/unread-counts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tk}` },
+        body: JSON.stringify({ lastRead: lastReadMessageIdsRef.current }),
+      });
+      if (!res.ok) return null;
+      const rows: { channelId: number; lastMessageId: number; lastReadId: number | null; unread: number; mentions?: number }[] = await res.json();
+      const counts: Record<number, number> = {};
+      const mentions: Record<number, number> = {};
+      const reads: Record<number, number> = {};
+      const viewing = activeTabRef.current === 'chat' && !document.hidden && !hasNewerRef.current ? activeChannelIdRef.current : null;
+      let maxId = 0;
+      for (const r of rows) {
+        maxId = Math.max(maxId, r.lastMessageId);
+        if (r.lastReadId == null) {
+          // どの端末でも開いたことがないチャンネル: それまでの履歴は既読扱い
+          reads[r.channelId] = r.lastMessageId;
+          continue;
+        }
+        serverReadRef.current[r.channelId] = Math.max(serverReadRef.current[r.channelId] || 0, r.lastReadId);
+        if ((lastReadMessageIdsRef.current[r.channelId] || 0) < r.lastReadId) reads[r.channelId] = r.lastReadId;
+        if (r.channelId !== viewing && r.unread > 0) {
+          counts[r.channelId] = r.unread;
+          if (r.mentions) mentions[r.channelId] = r.mentions;
+        }
+      }
+      if (Object.keys(reads).length > 0) {
+        lastReadMessageIdsRef.current = { ...lastReadMessageIdsRef.current, ...reads };
+        setLastReadMessageIds(prev => {
+          const next = { ...prev };
+          for (const [ch, id] of Object.entries(reads)) if ((next[Number(ch)] || 0) < id) next[Number(ch)] = id;
+          return next;
+        });
+      }
+      setUnreadCounts(counts);
+      setMentionCounts(mentions);
+      return maxId;
+    } catch (_) {
+      return null;
+    }
+  };
+  const refreshUnreadCountsRef = useRef(refreshUnreadCounts);
+  refreshUnreadCountsRef.current = refreshUnreadCounts;
+  const unreadRefreshTimerRef = useRef<any>(null);
+  const scheduleUnreadRefresh = () => {
+    clearTimeout(unreadRefreshTimerRef.current);
+    unreadRefreshTimerRef.current = setTimeout(() => refreshUnreadCountsRef.current(), 400);
+  };
+
+  // チャット画面に戻ってきた時: 見ていなかった間の新着に「新着」線を付けてから既読にする
+  const messagesRef = useRef<Message[]>([]);
+  messagesRef.current = messages;
+  const markActiveChannelSeen = () => {
+    if (activeTabRef.current !== 'chat' || document.hidden || hasNewerRef.current) return;
+    const ch = activeChannelIdRef.current;
+    if ((unreadCountsRef.current[ch] || 0) > 0) {
+      setUnreadAnchor({ channelId: ch, lastReadId: lastReadMessageIdsRef.current[ch] || 0 });
+    }
+    const confirmed = messagesRef.current.filter(m => m.id > 0 && m.channel_id === ch);
+    const last = confirmed[confirmed.length - 1];
+    if (last) markChannelRead(ch, last.id);
+    else setUnreadCounts(prev => (prev[ch] ? { ...prev, [ch]: 0 } : prev));
+  };
+  const markActiveChannelSeenRef = useRef(markActiveChannelSeen);
+  markActiveChannelSeenRef.current = markActiveChannelSeen;
+
   // 未読数 & 同期起点の初期化
   useEffect(() => {
     if (!token) return;
     syncReadyRef.current = false;
-    safeFetch('/api/channels/unread-counts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ lastRead: lastReadMessageIdsRef.current }),
-    })
-      .then(res => (res.ok ? res.json() : []))
-      .then((rows: { channelId: number; lastMessageId: number; unread: number; mentions?: number }[]) => {
-        const counts: Record<number, number> = {};
-        const mentions: Record<number, number> = {};
-        const initRead: Record<number, number> = {};
-        let maxId = 0;
-        for (const r of rows) {
-          maxId = Math.max(maxId, r.lastMessageId);
-          if (lastReadMessageIdsRef.current[r.channelId] === undefined) {
-            // 初回はそれまでの履歴を既読扱い
-            initRead[r.channelId] = r.lastMessageId;
-          } else if (r.channelId !== activeChannelIdRef.current && r.unread > 0) {
-            counts[r.channelId] = r.unread;
-            if (r.mentions) mentions[r.channelId] = r.mentions;
-          }
-        }
-        if (Object.keys(initRead).length > 0) {
-          setLastReadMessageIds(prev => ({ ...initRead, ...prev }));
-        }
-        setUnreadCounts(counts);
-        setMentionCounts(mentions);
-        lastSeenMessageIdRef.current = Math.max(lastSeenMessageIdRef.current, maxId);
-        syncReadyRef.current = true;
-        // 初期化中に届いた分を補完
-        syncMissedMessagesRef.current();
-      })
-      .catch(() => {
-        syncReadyRef.current = true;
-      });
+    refreshUnreadCountsRef.current().then(maxId => {
+      if (maxId) lastSeenMessageIdRef.current = Math.max(lastSeenMessageIdRef.current, maxId);
+      syncReadyRef.current = true;
+      // 初期化中に届いた分を補完
+      syncMissedMessagesRef.current();
+    });
   }, [token]);
 
   // リアルタイムイベント処理 (WS / SSE / ロングポーリング / ポーリング共通)
@@ -934,8 +1100,8 @@ export default function App() {
           return prev.map(u => u.id === msg.payload.userId ? { ...u, status: msg.payload.status } : u);
         });
       } else if (msg.type === 'TIMETABLE_UPDATED') {
-        const t = msg.payload?.scheduleType;
-        if (!t || t === scheduleTypeRef.current || t === todayScheduleRef.current) {
+        const c = msg.payload?.classNo;
+        if (c == null || c === ttClassNoRef.current || c === (myClassRef.current ?? 1)) {
           handleFetchTimetablesRef.current();
         }
       } else if (msg.type === 'TIMETABLE_CONFIG_UPDATED') {
@@ -995,7 +1161,28 @@ export default function App() {
       } else if (msg.type === 'MESSAGE_DELETED') {
         setMessages(prev => prev.filter(m => m.id !== msg.payload.messageId));
       } else if (msg.type === 'MESSAGE_UPDATED') {
-        setMessages(prev => prev.map(m => m.id === msg.payload.id ? { ...m, content: msg.payload.content } : m));
+        const p = msg.payload;
+        setMessages(prev => prev.map(m => m.id === p.id ? { ...m, content: p.content, edited_at: p.edited_at ?? m.edited_at } : m));
+      } else if (msg.type === 'READ_STATE_UPDATED') {
+        // 他の端末で読んだ
+        const { channelId, lastReadId } = msg.payload || {};
+        if (channelId && lastReadId) {
+          serverReadRef.current[channelId] = Math.max(serverReadRef.current[channelId] || 0, lastReadId);
+          if ((lastReadMessageIdsRef.current[channelId] || 0) < lastReadId) {
+            lastReadMessageIdsRef.current = { ...lastReadMessageIdsRef.current, [channelId]: lastReadId };
+            setLastReadMessageIds(prev => ((prev[channelId] || 0) >= lastReadId ? prev : { ...prev, [channelId]: lastReadId }));
+          }
+          scheduleUnreadRefresh();
+        }
+      } else if (msg.type === 'HOMEWORK_CREATED') {
+        setHomework(prev => (prev.some(h => h.id === msg.payload.id) ? prev : [...prev, { ...msg.payload, my_done: false }]));
+      } else if (msg.type === 'HOMEWORK_UPDATED') {
+        setHomework(prev => prev.map(h => (h.id === msg.payload.id ? { ...h, ...msg.payload, my_done: h.my_done } : h)));
+      } else if (msg.type === 'HOMEWORK_DELETED') {
+        setHomework(prev => prev.filter(h => h.id !== msg.payload.id));
+      } else if (msg.type === 'HOMEWORK_PROGRESS') {
+        const { id, userId, done, doneCount } = msg.payload;
+        setHomework(prev => prev.map(h => (h.id === id ? { ...h, done_count: doneCount, my_done: userId === currentUserRef.current?.id ? done : h.my_done } : h)));
       } else if (msg.type === 'NOTE_CONTENT_SYNC') {
         if (msg.payload.slotIndex === selectedSlotIndexRef.current) {
           setMemoContent(msg.payload.content);
@@ -1044,6 +1231,10 @@ export default function App() {
             refreshActiveChannelRef.current();
             loadInitialDataRef.current();
             retryFailedMessagesRef.current();
+            scheduleUnreadRefresh();
+            if (weatherFailedRef.current) refetchWeatherRef.current();
+          } else if (channelLoadStateRef.current === 'error') {
+            refreshActiveChannelRef.current();
           }
           hasBeenOnlineRef.current = true;
         }
@@ -1053,6 +1244,7 @@ export default function App() {
         syncMissedMessagesRef.current();
         refreshActiveChannelRef.current();
         loadInitialDataRef.current();
+        scheduleUnreadRefresh();
       },
     });
     realtimeRef.current = client;
@@ -1060,7 +1252,11 @@ export default function App() {
 
     const handleVisibilityStatus = () => {
       client.send({ type: 'SET_STATUS', status: document.hidden ? 'away' : 'online' }).catch(() => {});
-      if (!document.hidden) syncMissedMessagesRef.current();
+      if (!document.hidden) {
+        syncMissedMessagesRef.current();
+        // 取りこぼし補完が届いてから既読にする
+        setTimeout(() => markActiveChannelSeenRef.current(), 600);
+      }
     };
     document.addEventListener('visibilitychange', handleVisibilityStatus);
 
@@ -1100,6 +1296,7 @@ export default function App() {
         }
       }),
       get('/api/assignments').then(data => Array.isArray(data) && setAssignments(data)),
+      get('/api/homework').then(data => Array.isArray(data) && setHomework(data)),
       get('/api/assignments/progress/all').then((data: { assignment_id: number; user_id: number; status: string; username: string }[]) => {
         const grouped: Record<number, { userId: number; username: string; status: string }[]> = {};
         for (const row of data) {
@@ -1200,6 +1397,125 @@ export default function App() {
     } catch (_) {}
   };
 
+  // ===== チャンネルの読み込み =====
+  // 最新50件 (aroundId 指定時はそのメッセージの前後)。失敗したら 1→2→4…秒で再試行 (Render の起動待ちなど)
+  const loadChannelMessages = async (channelId: number, attempt = 0) => {
+    const tk = tokenRef.current;
+    if (!tk) return;
+    const seq = ++channelLoadSeqRef.current;
+    const anchorId = lastReadMessageIdsRef.current[channelId] || 0;
+    setChannelLoadState('loading');
+    try {
+      const res = await safeFetch(`/api/channels/${channelId}/messages?limit=50`, { headers: { Authorization: `Bearer ${tk}` } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: Message[] = await res.json();
+      if (seq !== channelLoadSeqRef.current || channelId !== activeChannelIdRef.current) return;
+      const maxId = data.length > 0 ? data[data.length - 1].id : 0;
+      lastSeenAtMountRef.current = maxId;
+      // 読み込み中に WS で届いた分と送信中の分は保持
+      setMessages(prev => {
+        let next = data;
+        for (const m of prev) {
+          if (m.channel_id === channelId && (m.id > maxId || m.id < 0)) next = mergeIncomingMessage(next, m);
+        }
+        return next;
+      });
+      data.forEach(m => {
+        processedMessageIdsRef.current.add(m.id);
+        if (m.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = m.id;
+      });
+      setHasMoreMessages(data.length >= 50);
+      setHasNewerMessages(false);
+      setNewBelowCount(0);
+      setChannelLoadState('ready');
+      if (maxId > 0 && activeTabRef.current === 'chat' && !document.hidden) markChannelRead(channelId, maxId);
+      // Scroll behavior based on unread position and user preference
+      setTimeout(() => {
+        const hasUnread = anchorId > 0 && maxId > anchorId;
+        const mode = chatAutoScrollModeRef.current;
+        if (mode === 'unread_anchor' && hasUnread && unreadMessageRef.current) {
+          unreadMessageRef.current.scrollIntoView({ behavior: 'auto', block: 'center' });
+        } else if (mode !== 'off' || !hasUnread) {
+          scheduleScrollToBottom(false);
+        }
+      }, 50);
+    } catch (err) {
+      if (seq !== channelLoadSeqRef.current) return;
+      console.warn('Channel load failed:', err);
+      setChannelLoadState('error');
+      if (attempt < 6) {
+        setTimeout(() => {
+          if (seq === channelLoadSeqRef.current && channelId === activeChannelIdRef.current) {
+            loadChannelMessagesRef.current(channelId, attempt + 1);
+          }
+        }, Math.min(1000 * 2 ** attempt, 30000));
+      }
+    }
+  };
+  const loadChannelMessagesRef = useRef(loadChannelMessages);
+  loadChannelMessagesRef.current = loadChannelMessages;
+
+  // メッセージの前後 (GET /api/messages/:id/context の結果) を表示して、そのメッセージへスクロール
+  const applyMessageContext = (ctx: { channelId: number; messageId: number; hasOlder: boolean; hasNewer: boolean; messages: Message[] }) => {
+    channelLoadSeqRef.current++;
+    const maxId = ctx.messages.length > 0 ? ctx.messages[ctx.messages.length - 1].id : 0;
+    setMessages(ctx.messages);
+    ctx.messages.forEach(m => processedMessageIdsRef.current.add(m.id));
+    lastSeenAtMountRef.current = maxId;
+    setHasMoreMessages(ctx.hasOlder);
+    setHasNewerMessages(ctx.hasNewer);
+    hasNewerRef.current = ctx.hasNewer;
+    setNewBelowCount(0);
+    setChannelLoadState('ready');
+    isNearBottomRef.current = false;
+    if (!ctx.hasNewer && maxId > 0) markChannelRead(ctx.channelId, maxId);
+    // 描画後にジャンプ (画像の読み込みで位置がずれないよう少し後にもう一度合わせる)
+    setTimeout(() => jumpToMessage(ctx.messageId, 'auto'), 60);
+    setTimeout(() => jumpToMessage(ctx.messageId, 'auto', false), 600);
+  };
+
+  // メッセージリンク・返信元へのジャンプ。読み込んでいなければ前後を取ってきて表示する
+  const openMessageLink = async (messageId: number) => {
+    setActiveTab('chat');
+    setMsgActionSheet(null);
+    if (messagesRef.current.some(m => m.id === messageId && m.channel_id === activeChannelIdRef.current)) {
+      requestAnimationFrame(() => jumpToMessage(messageId));
+      return;
+    }
+    const tk = tokenRef.current;
+    if (!tk) return;
+    try {
+      const res = await safeFetch(`/api/messages/${messageId}/context?limit=25`, { headers: { Authorization: `Bearer ${tk}` } });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || 'メッセージを開けませんでした', { kind: 'error' });
+        return;
+      }
+      if (data.channelId !== activeChannelIdRef.current) {
+        // チャンネル切替の読み込みで上書きされないよう、切替後にこの内容を使ってもらう
+        pendingJumpRef.current = { channelId: data.channelId, context: data };
+        setActiveChannelId(data.channelId);
+      } else {
+        applyMessageContext(data);
+      }
+    } catch {
+      toast('メッセージを開けませんでした (通信エラー)', { kind: 'error' });
+    }
+  };
+  const openMessageLinkRef = useRef(openMessageLink);
+  openMessageLinkRef.current = openMessageLink;
+
+  // 最新へ戻る (リンクで過去の位置を見ていた時)
+  const jumpToLatest = () => {
+    if (hasNewerRef.current) {
+      setHasNewerMessages(false);
+      hasNewerRef.current = false;
+      loadChannelMessages(activeChannelIdRef.current);
+    } else {
+      scheduleScrollToBottom(true);
+    }
+  };
+
   // Messages Load & Channel Switch with unread line tracking
   useEffect(() => {
     if (!token || !activeChannelId) return;
@@ -1207,49 +1523,44 @@ export default function App() {
     const anchorId = lastReadMessageIdsRef.current[channelId] || 0;
     setUnreadAnchor({ channelId, lastReadId: anchorId });
     setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
+    setMentionCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
     setNewBelowCount(0);
     setMessages([]);
     setHasMoreMessages(true);
+    setHasNewerMessages(false);
+    hasNewerRef.current = false;
     lastSeenAtMountRef.current = Number.MAX_SAFE_INTEGER;
-    safeFetch(`${API_BASE_URL}/api/channels/${channelId}/messages?limit=50`, {
-      headers: { Authorization: `Bearer ${token}` }
-    })
-      .then(res => res.json())
-      .then((data: Message[]) => {
-        if (channelId !== activeChannelIdRef.current) return;
-        const maxId = data.length > 0 ? data[data.length - 1].id : 0;
-        lastSeenAtMountRef.current = maxId;
-        // 読み込み中に WS で届いた分は保持
-        setMessages(prev => [...data, ...prev.filter(m => m.channel_id === channelId && (m.id > maxId || m.id < 0))]);
-        data.forEach(m => {
-          processedMessageIdsRef.current.add(m.id);
-          if (m.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = m.id;
-        });
-        if (data.length < 50) {
-          setHasMoreMessages(false);
-        }
-        if (maxId > 0) markChannelRead(channelId, maxId);
-        // Scroll behavior based on unread position and user preference
-        setTimeout(() => {
-          const hasUnread = anchorId > 0 && maxId > anchorId;
-          const mode = chatAutoScrollModeRef.current;
-          if (mode === 'unread_anchor' && hasUnread && unreadMessageRef.current) {
-            unreadMessageRef.current.scrollIntoView({ behavior: 'auto', block: 'center' });
-          } else if (mode !== 'off' || !hasUnread) {
-            scheduleScrollToBottom(false);
-          }
-        }, 50);
-      })
-      .catch(console.error);
+    const jump = pendingJumpRef.current;
+    if (jump && jump.channelId === channelId) {
+      pendingJumpRef.current = null;
+      applyMessageContext(jump.context);
+    } else {
+      loadChannelMessages(channelId);
+    }
   }, [token, activeChannelId]);
+
+  // URL の #msg-123 (コピーしたメッセージリンク) を開いた時: そのメッセージへ移動
+  const isLoggedIn = Boolean(currentUser);
+  useEffect(() => {
+    if (!token || !isLoggedIn) return;
+    const handleHash = () => {
+      const m = window.location.hash.match(/^#msg-(\d+)$/);
+      if (!m) return;
+      // 同じリンクを何度も処理しないよう、URL からは消しておく
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+      openMessageLinkRef.current(Number(m[1]));
+    };
+    handleHash();
+    window.addEventListener('hashchange', handleHash);
+    return () => window.removeEventListener('hashchange', handleHash);
+  }, [token, isLoggedIn]);
 
   // チャットタブに戻った時: 表示中チャンネルを既読化し、スクロール位置を戻す
   const chatScrollTopRef = useRef<number | null>(null);
   useEffect(() => {
     if (activeTab !== 'chat') return;
-    const realMsgs = messages.filter(m => m.id > 0);
-    const last = realMsgs[realMsgs.length - 1];
-    if (last) markChannelRead(activeChannelId, last.id);
+    markActiveChannelSeen();
+    if (hasNewerRef.current) return;
     // タブを開き直すと表示が作り直されるので、自動スクロールが有効なら最新へ
     if (chatAutoScrollModeRef.current !== 'off' || chatScrollTopRef.current === null) {
       scheduleScrollToBottom(false);
@@ -1266,11 +1577,15 @@ export default function App() {
     if (!el) return;
     chatScrollTopRef.current = el.scrollTop;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-    isNearBottomRef.current = nearBottom;
-    if (nearBottom && newBelowCount > 0) setNewBelowCount(0);
+    isNearBottomRef.current = nearBottom && !hasNewerRef.current;
+    if (nearBottom && newBelowCount > 0 && !hasNewerMessages) setNewBelowCount(0);
     // 上端付近で自動的に過去ログ読み込み
     if (el.scrollTop < 80 && hasMoreMessages && !isLoadingMoreMessages && !chatSearchQuery) {
       handleLoadMoreMessages();
+    }
+    // 過去の位置を見ている時は、下端で新しい側を読み込む
+    if (nearBottom && hasNewerMessages && !isLoadingNewer && !chatSearchQuery) {
+      handleLoadNewerMessages();
     }
   };
 
@@ -1302,6 +1617,36 @@ export default function App() {
       console.error(e);
     } finally {
       setIsLoadingMoreMessages(false);
+    }
+  };
+
+  // 過去の位置を見ている時の、新しい側の読み込み。最新まで追いついたら通常表示に戻る
+  const handleLoadNewerMessages = async () => {
+    const confirmed = messages.filter(m => m.id > 0);
+    const newest = confirmed[confirmed.length - 1];
+    if (!token || !newest || isLoadingNewer || !hasNewerMessages) return;
+    const channelId = activeChannelId;
+    setIsLoadingNewer(true);
+    try {
+      const res = await safeFetch(`/api/channels/${channelId}/messages?limit=50&afterId=${newest.id}`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok || channelId !== activeChannelIdRef.current) return;
+      const newer: Message[] = await res.json();
+      newer.forEach(m => {
+        processedMessageIdsRef.current.add(m.id);
+        if (m.id > lastSeenMessageIdRef.current) lastSeenMessageIdRef.current = m.id;
+      });
+      setMessages(prev => newer.reduce((acc, m) => mergeIncomingMessage(acc, m), prev));
+      if (newer.length < 50) {
+        setHasNewerMessages(false);
+        hasNewerRef.current = false;
+        setNewBelowCount(0);
+        const last = newer[newer.length - 1] || newest;
+        markChannelRead(channelId, last.id);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsLoadingNewer(false);
     }
   };
 
@@ -1527,12 +1872,13 @@ export default function App() {
     setTimeout(() => chatInputRef.current?.focus(), 0);
   };
 
-  const jumpToMessage = (id: number) => {
+  const jumpToMessage = (id: number, behavior: ScrollBehavior = 'smooth', highlight = true) => {
     const el = document.getElementById(`msg-${id}`);
     if (!el) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    el.classList.add('ring-2', 'ring-amber-400/70');
-    setTimeout(() => el.classList.remove('ring-2', 'ring-amber-400/70'), 1500);
+    el.scrollIntoView({ behavior, block: 'center' });
+    if (!highlight) return;
+    el.classList.add('msg-highlight');
+    setTimeout(() => el.classList.remove('msg-highlight'), 2400);
   };
 
   const handleRetryMessage = (m: Message) => {
@@ -1616,7 +1962,10 @@ export default function App() {
 
   const handleCopyMessageLink = (messageId: number) => {
     const url = `${window.location.origin}/#msg-${messageId}`;
-    navigator.clipboard.writeText(url);
+    navigator.clipboard.writeText(url).then(
+      () => toast('メッセージのリンクをコピーしました', { kind: 'success' }),
+      () => toast('コピーできませんでした', { kind: 'error' })
+    );
     setCopiedLinkMessageId(messageId);
     setTimeout(() => setCopiedLinkMessageId(null), 2000);
   };
@@ -1649,8 +1998,11 @@ export default function App() {
       });
       if (res.ok) {
         const updated = await res.json();
-        setMessages(prev => prev.map(m => m.id === messageId ? { ...m, content: updated.content } : m));
+        setMessages(prev => prev.map(m => m.id === messageId ? { ...m, content: updated.content, edited_at: updated.edited_at ?? m.edited_at } : m));
         cancelEditing();
+      } else {
+        const d = await res.json().catch(() => ({}));
+        toast(d.error || '編集できませんでした', { kind: 'error' });
       }
     } catch (err) {
       console.error(err);
@@ -1716,9 +2068,15 @@ export default function App() {
         name: s.label, time: `${s.time.start}-${s.time.end}`, subject: s.subject || undefined,
         items: todayRowsNow.find(t => `p${t.period}` === s.key)?.items || undefined,
       })),
-      assignments: assignments.filter(a => !a.is_archived).map(a => ({
-        title: a.title, subject: a.subject, deadline: a.deadline, resubmit_deadline: a.resubmit_deadline, my_status: a.my_status,
-      })),
+      my_class: currentUser?.class_no ? `${currentUser.class_no}組` : '未設定',
+      assignments: assignments
+        .filter(a => !a.is_archived && (a.class_no == null || !currentUser?.class_no || a.class_no === currentUser.class_no))
+        .map(a => ({
+          title: a.title, subject: a.subject, deadline: a.deadline, resubmit_deadline: a.resubmit_deadline, my_status: a.my_status,
+        })),
+      homework: homework
+        .filter(h => !h.my_done && (h.class_no == null || !currentUser?.class_no || h.class_no === currentUser.class_no))
+        .map(h => ({ subject: h.subject, content: h.content, due: h.due_date })),
       upcoming_events: calendarEvents.filter(e => e.event_date >= today).slice(0, 20).map(e => ({ date: e.event_date, time: e.event_time, title: e.title, by: e.username })),
       channels: channels.map(c => c.name),
       memo_slots: memoSlots.filter(m => m.slot_index <= 10).map(m => ({ slot: m.slot_index, title: m.title })),
@@ -1777,13 +2135,14 @@ export default function App() {
     toast('校正前の内容に戻しました', { kind: 'success' });
   };
 
-  const handleFetchTimetables = async () => {
+  // 時間割 (教科) はクラスごと。短縮・S短でも教科は同じで、時刻だけが変わる
+  const handleFetchTimetables = async (classNo = ttClassNoRef.current) => {
     if (!token) return;
     try {
-      const res = await safeFetch(`${API_BASE_URL}/api/timetables?scheduleType=${scheduleType}`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/timetables?classNo=${classNo}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      if (res.ok) {
+      if (res.ok && classNo === ttClassNoRef.current) {
         const data = await res.json();
         setTimetables(data);
       }
@@ -1792,12 +2151,15 @@ export default function App() {
     }
   };
 
-  const fetchTodayTimetables = async (type: ScheduleType = todayScheduleRef.current) => {
+  // ヘッダー用: 自分のクラスの時間割
+  const fetchTodayTimetables = async () => {
     const tk = tokenRef.current;
     if (!tk) return;
-    const res = await safeFetch(`/api/timetables?scheduleType=${type}`, { headers: { Authorization: `Bearer ${tk}` } });
+    const classNo = myClassRef.current ?? 1;
+    const res = await safeFetch(`/api/timetables?classNo=${classNo}`, { headers: { Authorization: `Bearer ${tk}` } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    setTodayTimetables(await res.json());
+    const rows = await res.json();
+    if (classNo === (myClassRef.current ?? 1)) setTodayTimetables(rows);
   };
 
   const fetchTimetableConfig = async () => {
@@ -1824,14 +2186,16 @@ export default function App() {
     fetchTodayTimetables().catch(() => {});
   };
 
-  // 時程切替時・ログイン時に時間割を取り直す
+  // クラス切替時・ログイン時に時間割を取り直す
   useEffect(() => {
-    handleFetchTimetables();
-  }, [scheduleType, token]);
+    handleFetchTimetables(ttClassNo);
+  }, [ttClassNo, token]);
 
+  const myClassNo = currentUser?.class_no ?? null;
   useEffect(() => {
-    fetchTodayTimetables(todaySchedule).catch(() => {});
-  }, [todaySchedule, token]);
+    fetchTodayTimetables().catch(() => {});
+    if (myClassNo) setTtClassNo(myClassNo);
+  }, [myClassNo, token]);
 
   // 日付が変わったら「今日の時程」を取り直す (前日の短縮時程が残らないように)
   const todayKey = ymd(now);
@@ -1847,13 +2211,13 @@ export default function App() {
       const res = await safeFetch('/api/timetables', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ dayOfWeek: day, period, subject: subject.trim(), scheduleType, ...extra }),
+        body: JSON.stringify({ dayOfWeek: day, period, subject: subject.trim(), classNo: ttClassNo, ...extra }),
       });
       if (!res.ok) throw new Error();
       const row: TimetableItem = await res.json();
       setTimetables(prev => [...prev.filter(t => !(t.day_of_week === day && t.period === period)), row]);
-      if (scheduleType === todaySchedule) fetchTodayTimetables().catch(() => {});
-      setTtSaveStatus(`${DAY_LABELS[day]}曜${period}限 を「${row.subject}」に保存しました`);
+      if (ttClassNo === (myClassRef.current ?? 1)) fetchTodayTimetables().catch(() => {});
+      setTtSaveStatus(`${ttClassNo}組 ${DAY_LABELS[day]}曜${period}限 を「${row.subject}」に保存しました`);
       return row;
     } catch {
       setTtSaveStatus('保存に失敗しました');
@@ -2084,14 +2448,37 @@ export default function App() {
     setIntegrationStatus(r && r.ok ? 'テスト送信しました。Discord を確認してください' : d.error || 'テスト送信に失敗しました');
   };
 
-  const loadAuditLogs = async (action = auditFilter) => {
+  const loadAuditLogs = async (action = auditFilter, user = auditUserFilter) => {
     if (!token) return;
     try {
-      const r = await safeFetch(`/api/audit-logs?limit=200${action ? `&action=${encodeURIComponent(action)}` : ''}`, {
+      const params = new URLSearchParams({ limit: '200' });
+      if (action) params.set('action', action);
+      if (user) params.set('user', user);
+      const r = await safeFetch(`/api/audit-logs?${params}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (r.ok) setAuditLogs(await r.json());
     } catch (_) {}
+  };
+
+  // 表示中の条件 (種類・ユーザー) のログを AI で要約
+  const summarizeAuditLogs = async () => {
+    if (!token || isSummarizingAudit) return;
+    setIsSummarizingAudit(true);
+    try {
+      const r = await safeFetch('/api/audit-logs/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ action: auditFilter || undefined, user: auditUserFilter || undefined }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.summary) throw new Error(d.error || '要約できませんでした');
+      setAuditSummary({ text: d.summary, count: d.count });
+    } catch (err: any) {
+      toast(err.message || '要約できませんでした', { kind: 'error' });
+    } finally {
+      setIsSummarizingAudit(false);
+    }
   };
 
   const deleteAuditLog = async (id: number) => {
@@ -2284,7 +2671,8 @@ export default function App() {
           subject: newAssignSubject,
           deadline: newAssignDeadline,
           resubmitDeadline: newAssignResubmitDeadline || undefined,
-          description: newAssignDesc
+          description: newAssignDesc,
+          classNo: newAssignClass === 'mine' ? myClassRef.current : newAssignClass,
         })
       });
       if (res.ok) {
@@ -2356,7 +2744,8 @@ export default function App() {
           subject: editingAssignment.subject,
           deadline: editingAssignment.deadline,
           resubmitDeadline: editingAssignment.resubmit_deadline,
-          description: editingAssignment.description
+          description: editingAssignment.description,
+          classNo: editingAssignment.class_no ?? null,
         })
       });
       if (res.ok) {
@@ -2428,45 +2817,9 @@ export default function App() {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // Draw strokes
-    for (const stroke of strokes) {
-      if (!stroke.points || stroke.points.length < 2) continue;
-      if (stroke.color === 'eraser') {
-        ctx.save();
-        ctx.globalCompositeOperation = 'destination-out';
-        ctx.lineWidth = stroke.width || 9;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.beginPath();
-        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-        for (let i = 1; i < stroke.points.length; i++) {
-          ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
-        }
-        ctx.stroke();
-        ctx.restore();
-      } else {
-        ctx.strokeStyle = stroke.color || '#f59e0b';
-        ctx.lineWidth = stroke.width || 3;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.beginPath();
-        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-        for (let i = 1; i < stroke.points.length; i++) {
-          ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
-        }
-        ctx.stroke();
-      }
-    }
-
-    // Draw texts
-    for (const t of texts) {
-      ctx.font = '14px "JetBrains Mono", monospace';
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(t.text, t.x, t.y);
-    }
+    for (const stroke of strokes) drawStroke(ctx, stroke);
+    for (const t of texts) drawText(ctx, t);
   };
 
   useEffect(() => {
@@ -2605,59 +2958,31 @@ export default function App() {
     }
   };
 
-  // タイムラプス再生 (履歴を最初から順次描画)
+  // タイムラプス再生: 描いた順に少しずつ描き直す。長い時は全体が約30秒になるよう倍速
   const handlePlayTimelapse = () => {
-    if ((boardStrokes.length === 0 && boardTexts.length === 0) || isTimelapsePlaying) return;
-    setIsTimelapsePlaying(true);
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    let i = 0;
-    const interval = setInterval(() => {
-      if (i >= boardStrokes.length) {
-        clearInterval(interval);
-        // テキストも描画して終了
-        for (const t of boardTexts) {
-          ctx.font = '14px "JetBrains Mono", monospace';
-          ctx.fillStyle = '#ffffff';
-          ctx.fillText(t.text, t.x, t.y);
-        }
+    if (!canvas || (boardStrokes.length === 0 && boardTexts.length === 0) || isTimelapsePlaying) return;
+    setIsTimelapsePlaying(true);
+    setTimelapseProgress(0);
+    stopTimelapseRef.current = playTimelapse(canvas, boardStrokes, boardTexts, {
+      onProgress: setTimelapseProgress,
+      onDone: () => {
+        stopTimelapseRef.current = null;
         setIsTimelapsePlaying(false);
-        return;
-      }
-      const stroke = boardStrokes[i];
-      if (stroke.points && stroke.points.length >= 2) {
-        if (stroke.color === 'eraser') {
-          ctx.save();
-          ctx.globalCompositeOperation = 'destination-out';
-          ctx.lineWidth = stroke.width || 9;
-          ctx.lineCap = 'round';
-          ctx.beginPath();
-          ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-          for (let p = 1; p < stroke.points.length; p++) {
-            ctx.lineTo(stroke.points[p].x, stroke.points[p].y);
-          }
-          ctx.stroke();
-          ctx.restore();
-        } else {
-          ctx.strokeStyle = stroke.color || '#f59e0b';
-          ctx.lineWidth = stroke.width || 3;
-          ctx.lineCap = 'round';
-          ctx.beginPath();
-          ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-          for (let p = 1; p < stroke.points.length; p++) {
-            ctx.lineTo(stroke.points[p].x, stroke.points[p].y);
-          }
-          ctx.stroke();
-        }
-      }
-      i++;
-    }, 100);
+      },
+    });
   };
+
+  const stopTimelapse = () => {
+    stopTimelapseRef.current?.();
+    stopTimelapseRef.current = null;
+    setIsTimelapsePlaying(false);
+  };
+
+  // ボードを離れたら再生を止める
+  useEffect(() => {
+    if (activeTab !== 'board') stopTimelapse();
+  }, [activeTab]);
 
   // Phase 4: Shared Clipboard Handlers
   // 1文字ごとに送らず、入力が止まってから共有
@@ -2706,8 +3031,10 @@ export default function App() {
 
   const isMonacoLocked = (selectedSlotIndex >= 11 || memoMode === 'monaco') && memoAssignedUser !== null && memoAssignedUser !== currentUser?.id && currentUser?.role !== 'admin';
 
-  // Filtered assignments
+  // Filtered assignments (クラス: 全クラス共通のものはどのクラスにも出す)
+  const assignViewClass = assignClassView === 'mine' ? (currentUser?.class_no ?? null) : assignClassView === 'all' ? null : assignClassView;
   const filteredAssignments = assignments.filter(a => {
+    if (assignViewClass && a.class_no != null && a.class_no !== assignViewClass) return false;
     if (assignmentFilter === 'all') return !a.is_archived;
     return a.my_status === assignmentFilter && !a.is_archived;
   });
@@ -2732,6 +3059,24 @@ export default function App() {
     } finally {
       setIsUploadingAvatar(false);
     }
+  };
+
+  // 自分のクラス (時間割・提出物・宿題の既定の表示)
+  const handleSetMyClass = async (classNo: number | null) => {
+    if (!token) return;
+    const res = await safeFetch('/api/users/me/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ classNo }),
+    }).catch(() => null);
+    const d = res ? await res.json().catch(() => ({})) : {};
+    if (!res || !res.ok) {
+      toast(d.error || 'クラスを保存できませんでした', { kind: 'error' });
+      return;
+    }
+    setCurrentUser(u => (u ? { ...u, class_no: d.class_no } : u));
+    setOnlineUsers(prev => prev.map(u => (u.id === currentUser?.id ? { ...u, class_no: d.class_no } : u)));
+    toast(d.class_no ? `自分のクラスを ${d.class_no}組 にしました` : 'クラスの設定を外しました', { kind: 'success' });
   };
 
   const handleRemoveAvatar = async () => {
@@ -2873,6 +3218,13 @@ export default function App() {
   const knownUsernames = new Set(onlineUsers.map(u => u.username));
   const channelByName = new Map(channels.filter(c => c.type !== 'voice').map(c => [c.name, c.id]));
   const typingHere = Object.entries(typingUsers).filter(([, v]) => v.channelId === activeChannelId).map(([, v]) => v.username);
+  // 今日・明日が期限で、まだやっていない自分のクラスの宿題
+  const urgentHomework = homework.filter(h => {
+    if (h.my_done || (currentUser.class_no && h.class_no != null && h.class_no !== currentUser.class_no)) return false;
+    const d = new Date(`${h.due_date}T00:00:00`).getTime() - new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    return d <= 86400000;
+  }).length;
+  const nameOfUser = (id: number) => userById.get(id)?.username;
   const activeChannelName = channels.find(c => c.id === activeChannelId)?.name || 'chat';
 
   // 補完候補
@@ -2956,6 +3308,11 @@ export default function App() {
                   )}
                   {tab.id === 'chat' && totalMentions === 0 && totalUnread > 0 && activeTab !== 'chat' && (
                     <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,0.8)]" />
+                  )}
+                  {tab.id === 'homework' && urgentHomework > 0 && (
+                    <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-black text-[10px] font-bold leading-[18px] text-center" title="今日・明日までの宿題">
+                      {urgentHomework}
+                    </span>
                   )}
                 </button>
               );
@@ -3316,10 +3673,29 @@ export default function App() {
                 )}
 
                 {messages.filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
+                  channelLoadState !== 'ready' && !chatSearchQuery ? (
+                    <div className="h-full flex flex-col items-center justify-center text-stone-500 text-xs space-y-3 anim-fade">
+                      {channelLoadState === 'loading' ? (
+                        <>
+                          <RefreshCw className="w-6 h-6 animate-spin text-amber-400" />
+                          <p>メッセージを読み込み中…</p>
+                        </>
+                      ) : (
+                        <>
+                          <WifiOff className="w-7 h-7 text-red-400" />
+                          <p>メッセージを読み込めませんでした。自動で再試行しています</p>
+                          <button onClick={() => loadChannelMessages(activeChannelId)} className="px-3 py-1.5 rounded-lg btn-primary font-bold">
+                            今すぐ再読み込み
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  ) : (
                   <div className="h-full flex flex-col items-center justify-center text-stone-600 text-xs space-y-2 anim-fade">
                     <MessageSquare className="w-8 h-8 opacity-40 text-amber-400" />
                     <p>{chatSearchQuery ? '見つかりませんでした' : 'まだメッセージはありません'}</p>
                   </div>
+                  )
                 ) : (
                   messages
                     .filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase()))
@@ -3330,6 +3706,7 @@ export default function App() {
                       const isUnread = lastReadId > 0 && m.id > lastReadId && !isMine;
                       const isFirstUnread = isUnread && (!prevMsg || prevMsg.id <= lastReadId || prevMsg.id < 0);
                       const senderName = m.sender_username || m.username || 'unknown';
+                      const { name: displayName, fromDiscord } = splitSenderName(senderName);
                       const isGemini = senderName === 'Gemini';
                       const created = new Date(m.created_at);
                       const prevCreated = prevMsg ? new Date(prevMsg.created_at) : null;
@@ -3366,7 +3743,36 @@ export default function App() {
 
                           <div
                             id={`msg-${m.id}`}
-                            className={`flex items-start gap-2.5 sm:gap-3 group relative px-2 rounded-lg transition-colors hover:bg-white/[0.03] ${
+                            // スマホ: 長押しで操作メニュー (ホバーのボタンが出ないため)
+                            onTouchStart={e => {
+                              if (m.id <= 0 || editingMessageId === m.id) return;
+                              if ((e.target as HTMLElement).closest('button, a, textarea, input')) return;
+                              const t = e.touches[0];
+                              clearTimeout(msgLongPressRef.current?.timer);
+                              msgLongPressRef.current = {
+                                x: t.clientX,
+                                y: t.clientY,
+                                timer: setTimeout(() => {
+                                  msgLongPressRef.current = null;
+                                  navigator.vibrate?.(10);
+                                  setMsgActionSheet(m);
+                                }, 480),
+                              };
+                            }}
+                            onTouchMove={e => {
+                              const lp = msgLongPressRef.current;
+                              if (!lp) return;
+                              const t = e.touches[0];
+                              if (Math.abs(t.clientX - lp.x) > 10 || Math.abs(t.clientY - lp.y) > 10) {
+                                clearTimeout(lp.timer);
+                                msgLongPressRef.current = null;
+                              }
+                            }}
+                            onTouchEnd={() => {
+                              clearTimeout(msgLongPressRef.current?.timer);
+                              msgLongPressRef.current = null;
+                            }}
+                            className={`msg-row flex items-start gap-2.5 sm:gap-3 group relative px-2 rounded-lg transition-colors hover:bg-white/[0.03] ${
                               isGrouped ? 'py-0.5' : 'pt-2 pb-0.5 mt-1.5'
                             } ${m.is_pinned ? 'bg-amber-500/5 border-l-2 border-amber-500/60' : ''} ${
                               isMentioningMe ? 'bg-amber-500/10 border-l-2 border-amber-400' : ''
@@ -3377,15 +3783,16 @@ export default function App() {
                                 {timeLabel}
                               </div>
                             ) : (
-                              <Avatar name={senderName} url={m.user_id ? userById.get(m.user_id)?.avatar_url : null} />
+                              <Avatar name={senderName} url={m.user_id ? userById.get(m.user_id)?.avatar_url : m.author_avatar} />
                             )}
 
                             <div className="flex-1 min-w-0">
                               {!isGrouped && (
                                 <div className="flex items-baseline gap-2 mb-0.5">
-                                  <span className={`text-sm font-bold ${isGemini ? 'text-amber-400' : isMine ? 'text-amber-200' : 'text-stone-100'}`}>
-                                    {senderName}
+                                  <span className={`text-sm font-bold ${isGemini ? 'text-amber-400' : isMine ? 'text-amber-200' : fromDiscord ? 'text-indigo-200' : 'text-stone-100'}`}>
+                                    {displayName}
                                   </span>
+                                  {fromDiscord && <DiscordBadge className="self-center -ml-1" />}
                                   <span className="text-[11px] text-stone-500">{timeLabel}</span>
                                   {m.is_pinned && (
                                     <span className="flex items-center gap-0.5 text-[10px] text-amber-400 bg-amber-400/10 px-1.5 rounded border border-amber-400/20">
@@ -3398,7 +3805,7 @@ export default function App() {
                               {m.reply_to && (
                                 <button
                                   type="button"
-                                  onClick={() => jumpToMessage(m.reply_to!.id)}
+                                  onClick={() => openMessageLink(m.reply_to!.id)}
                                   className="flex items-center gap-1.5 text-[11px] text-stone-500 hover:text-stone-300 mb-0.5 max-w-full text-left"
                                 >
                                   <CornerReplyIcon />
@@ -3406,7 +3813,7 @@ export default function App() {
                                     <span className="italic">削除されたメッセージ</span>
                                   ) : (
                                     <>
-                                      <span className="font-bold text-stone-400 shrink-0">@{m.reply_to.username}</span>
+                                      <span className="font-bold text-stone-400 shrink-0">@{splitSenderName(m.reply_to.username || '').name}</span>
                                       <span className="truncate">{summarizeContent(m.reply_to.content)}</span>
                                     </>
                                   )}
@@ -3461,7 +3868,7 @@ export default function App() {
                                       loading="lazy"
                                       onLoad={() => {
                                         // 画像の読み込みで高さが変わっても最下部追従を維持
-                                        if (isNearBottomRef.current || chatAutoScrollModeRef.current === 'always') {
+                                        if (!hasNewerRef.current && (isNearBottomRef.current || chatAutoScrollModeRef.current === 'always')) {
                                           const el = chatScrollContainerRef.current;
                                           if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 600) scheduleScrollToBottom(false);
                                         }
@@ -3484,7 +3891,16 @@ export default function App() {
                                         channels: channelByName,
                                         me: currentUser.username,
                                         onChannelClick: id => setActiveChannelId(id),
+                                        onMessageLink: id => openMessageLink(id),
                                       })}
+                                    </span>
+                                  )}
+                                  {m.edited_at && (
+                                    <span
+                                      className="ml-1 text-[10px] text-stone-500 select-none whitespace-nowrap"
+                                      title={`編集: ${new Date(m.edited_at).toLocaleString('ja-JP')}`}
+                                    >
+                                      (編集済み)
                                     </span>
                                   )}
                                 </div>
@@ -3502,27 +3918,17 @@ export default function App() {
                               )}
 
                               {m.reactions && Object.keys(m.reactions).length > 0 && (
-                                <div className="flex items-center gap-1.5 mt-1 flex-wrap">
-                                  {Object.entries(m.reactions).map(([emoji, userIds]) => (
-                                    <button
-                                      key={emoji}
-                                      onClick={() => handleToggleReaction(m.id, emoji)}
-                                      className={`text-xs px-2 py-0.5 rounded-md border flex items-center gap-1 ${
-                                        userIds.includes(currentUser?.id)
-                                          ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                                          : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-600'
-                                      }`}
-                                    >
-                                      <span>{emoji}</span>
-                                      <span>{userIds.length}</span>
-                                    </button>
-                                  ))}
-                                </div>
+                                <ReactionBar
+                                  reactions={m.reactions}
+                                  meId={currentUser.id}
+                                  nameOf={nameOfUser}
+                                  onToggle={emoji => handleToggleReaction(m.id, emoji)}
+                                />
                               )}
                             </div>
 
                             {m.id > 0 && (
-                            <div className="opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition absolute right-2 -top-3 bg-[#16181D] border border-stone-800 rounded-lg p-1 flex items-center gap-0.5 shadow-md z-10">
+                            <div className="hidden [@media(hover:hover)]:flex opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition absolute right-2 -top-3 bg-[#16181D] border border-stone-800 rounded-lg p-1 items-center gap-0.5 shadow-md z-10">
                               <button onClick={() => startReply(m)} title="返信" className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400">
                                 <Reply className="w-3.5 h-3.5" />
                               </button>
@@ -3557,11 +3963,31 @@ export default function App() {
                       );
                     })
                 )}
+                {hasNewerMessages && messages.length > 0 && !chatSearchQuery && (
+                  <div className="flex justify-center py-3">
+                    <button
+                      onClick={handleLoadNewerMessages}
+                      disabled={isLoadingNewer}
+                      className="px-4 py-1.5 rounded-full bg-stone-900 border border-stone-800 hover:border-amber-500/50 text-stone-300 hover:text-amber-400 text-xs flex items-center gap-1.5 disabled:opacity-50"
+                    >
+                      {isLoadingNewer ? <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" /> : <ArrowDown className="w-3.5 h-3.5 text-amber-400" />}
+                      <span>{isLoadingNewer ? '読み込み中…' : '続きのメッセージ'}</span>
+                    </button>
+                  </div>
+                )}
                 <div ref={messagesEndRef} />
               </div>
 
-                {/* 新着ピル / 最下部へ */}
-                {newBelowCount > 0 ? (
+                {/* 新着ピル / 最下部へ / (過去の位置を見ている時) 最新へ戻る */}
+                {hasNewerMessages ? (
+                  <button
+                    onClick={jumpToLatest}
+                    className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full btn-primary text-xs font-bold shadow-lg flex items-center gap-1 z-20 anim-pop whitespace-nowrap"
+                  >
+                    <ArrowDown className="w-3.5 h-3.5" />
+                    最新のメッセージへ{newBelowCount > 0 ? ` (新着 ${newBelowCount} 件)` : ''}
+                  </button>
+                ) : newBelowCount > 0 ? (
                   <button
                     onClick={scrollToBottom}
                     className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full btn-primary text-xs font-bold shadow-lg flex items-center gap-1 z-20 anim-pop"
@@ -3699,7 +4125,7 @@ export default function App() {
                       <div
                         ref={composerBackdropRef}
                         aria-hidden="true"
-                        className="absolute inset-0 text-sm leading-relaxed py-0.5 whitespace-pre-wrap break-words text-transparent overflow-hidden pointer-events-none"
+                        className="composer-text absolute inset-0 text-sm leading-relaxed py-0.5 whitespace-pre-wrap break-words text-transparent overflow-hidden pointer-events-none"
                       >
                         {renderComposerHighlight(chatInput, knownUsernames, channelByName)}
                       </div>
@@ -3758,7 +4184,7 @@ export default function App() {
                           }
                         }}
                         placeholder={`#${activeChannelName} へメッセージ`}
-                        className="relative block w-full bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 resize-none leading-relaxed max-h-[200px] py-0.5"
+                        className="composer-text relative block w-full bg-transparent text-sm text-white focus:outline-none placeholder-stone-600 resize-none leading-relaxed max-h-[200px] py-0.5"
                       />
                     </div>
                     <button
@@ -4124,6 +4550,26 @@ export default function App() {
               {isAssignFormOpen && (
               <form onSubmit={handleCreateAssignment} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-4 sm:p-5 space-y-3 font-mono text-xs shadow-lg anim-pop">
                 <div className="space-y-1.5">
+                  <div className="text-[10px] text-stone-400 font-bold">クラス</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {([...CLASS_NUMBERS, null] as (number | null)[]).map(n => {
+                      const selected = (newAssignClass === 'mine' ? currentUser.class_no ?? null : newAssignClass) === n;
+                      return (
+                        <button
+                          type="button"
+                          key={String(n)}
+                          onClick={() => setNewAssignClass(n)}
+                          className={`px-2.5 py-1 rounded-lg border text-[11px] ${
+                            selected ? 'bg-amber-500 text-black font-bold border-amber-400' : 'bg-[#16181D] text-stone-300 border-stone-800 hover:border-stone-500 hover:text-white'
+                          }`}
+                        >
+                          {n === null ? '全クラス共通' : `${n}組${n === currentUser.class_no ? ' ★' : ''}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="space-y-1.5">
                   <div className="text-[10px] text-stone-400 font-bold">教科</div>
                   <div className="flex flex-wrap gap-1.5">
                     {[...SUBJECTS, 'その他'].map(subj => (
@@ -4215,6 +4661,39 @@ export default function App() {
               </form>
               )}
 
+              {/* クラス */}
+              <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs">
+                <span className="text-stone-500 mr-1">クラス:</span>
+                {CLASS_NUMBERS.map(n => (
+                  <button
+                    key={n}
+                    onClick={() => setAssignClassView(n === currentUser.class_no ? 'mine' : n)}
+                    className={`px-2.5 py-1 rounded-lg border ${
+                      assignViewClass === n
+                        ? 'bg-amber-500 text-black font-bold border-amber-400'
+                        : 'bg-[#111214] text-stone-400 border-stone-800 hover:border-stone-500 hover:text-white'
+                    }`}
+                  >
+                    {n}組{n === currentUser.class_no ? ' ★' : ''}
+                  </button>
+                ))}
+                <button
+                  onClick={() => setAssignClassView('all')}
+                  className={`px-2.5 py-1 rounded-lg border ${
+                    assignViewClass === null
+                      ? 'bg-amber-500 text-black font-bold border-amber-400'
+                      : 'bg-[#111214] text-stone-400 border-stone-800 hover:border-stone-500 hover:text-white'
+                  }`}
+                >
+                  すべて
+                </button>
+                {!currentUser.class_no && (
+                  <button onClick={() => { setActiveTab('settings'); setSettingsSection('account'); }} className="ml-1 text-amber-400 hover:underline">
+                    自分のクラスを設定
+                  </button>
+                )}
+              </div>
+
               {/* フィルター */}
               <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
                 {[
@@ -4256,6 +4735,9 @@ export default function App() {
                           <div className="flex items-center gap-2.5 flex-wrap">
                             <span className="px-2.5 py-0.5 rounded-lg text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 font-bold">
                               {item.subject}
+                            </span>
+                            <span className="px-2 py-0.5 rounded-lg text-[10px] font-mono bg-stone-800/80 text-stone-400 border border-stone-700/60">
+                              {item.class_no ? `${item.class_no}組` : '全クラス'}
                             </span>
                             <span className="font-bold text-white text-base">{item.title}</span>
                           </div>
@@ -4368,6 +4850,24 @@ export default function App() {
           </div>
         )}
 
+        {/* 宿題 (次の授業までの簡単なもの) */}
+        {activeTab === 'homework' && (
+          <div className="flex-1 min-h-0 flex anim-tab">
+            <HomeworkTab
+              token={token}
+              safeFetch={safeFetch}
+              currentUser={currentUser}
+              users={onlineUsers}
+              homework={homework}
+              setHomework={setHomework}
+              onOpenSettings={() => {
+                setActiveTab('settings');
+                setSettingsSection('account');
+              }}
+            />
+          </div>
+        )}
+
         {/* TAB 5: リアルタイム共同作業ボード & クリップボード同期 (Phase 4 Full Feature) */}
         {activeTab === 'board' && (
           <div className="flex-1 flex flex-col p-2 sm:p-4 bg-[#090A0C] overflow-hidden anim-tab">
@@ -4450,14 +4950,33 @@ export default function App() {
               </div>
 
               <div className="flex items-center gap-2">
-                <button
-                  onClick={handlePlayTimelapse}
-                  disabled={isTimelapsePlaying || boardStrokes.length === 0}
-                  className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-amber-400 rounded-xl flex items-center gap-1.5 transition disabled:opacity-40"
-                >
-                  <Play className="w-3.5 h-3.5 text-amber-400" />
-                  <span className="hidden sm:inline">{isTimelapsePlaying ? '再生中…' : 'タイムラプス'}</span>
-                </button>
+                {isTimelapsePlaying ? (
+                  <button
+                    onClick={stopTimelapse}
+                    className="relative overflow-hidden px-3 py-1.5 bg-stone-900 border border-amber-500/40 text-amber-300 rounded-xl flex items-center gap-1.5 transition"
+                    title="再生を止める"
+                  >
+                    <span className="absolute inset-y-0 left-0 bg-amber-500/20" style={{ width: `${Math.round(timelapseProgress * 100)}%` }} />
+                    <Square className="relative w-3 h-3 fill-current" />
+                    <span className="relative tabular-nums">{Math.round(timelapseProgress * 100)}%</span>
+                  </button>
+                ) : (
+                  (() => {
+                    const plan = timelapsePlan(boardStrokes, boardTexts);
+                    return (
+                      <button
+                        onClick={handlePlayTimelapse}
+                        disabled={plan.total === 0}
+                        title={plan.total === 0 ? 'まだ何も描かれていません' : `約${Math.max(1, Math.round(plan.duration / 1000))}秒で再生${plan.speed > 1.05 ? ` (×${plan.speed.toFixed(1)}倍速)` : ''}`}
+                        className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-amber-400 rounded-xl flex items-center gap-1.5 transition disabled:opacity-40"
+                      >
+                        <Play className="w-3.5 h-3.5 text-amber-400" />
+                        <span className="hidden sm:inline">タイムラプス</span>
+                        {plan.speed > 1.05 && <span className="hidden sm:inline text-[10px] text-stone-500">×{plan.speed.toFixed(1)}</span>}
+                      </button>
+                    );
+                  })()
+                )}
 
                 <button
                   onClick={handleClearBoard}
@@ -4473,8 +4992,8 @@ export default function App() {
             <div className="flex-1 relative border border-stone-800/80 rounded-2xl bg-[#0C0D10] overflow-hidden flex items-center justify-center cursor-crosshair">
               <canvas
                 ref={canvasRef}
-                width={1400}
-                height={800}
+                width={BOARD_WIDTH}
+                height={BOARD_HEIGHT}
                 onPointerDown={handleCanvasPointerDown}
                 onPointerMove={handleCanvasPointerMove}
                 onPointerUp={finishStroke}
@@ -4800,6 +5319,31 @@ export default function App() {
                     </button>
                   </div>
 
+                  {/* クラス */}
+                  <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 sm:p-6 text-xs space-y-3">
+                    <div className="text-white font-bold text-sm flex items-center gap-1.5">
+                      <Users className="w-4 h-4 text-amber-400" /> 自分のクラス
+                    </div>
+                    <p className="text-stone-400">時間割・提出物・宿題は、最初にこのクラスのものが表示されます。ほかのクラスもそれぞれの画面で切り替えて見られます。</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {CLASS_NUMBERS.map(n => (
+                        <button
+                          key={n}
+                          onClick={() => n !== currentUser.class_no && handleSetMyClass(n)}
+                          aria-pressed={currentUser.class_no === n}
+                          className={`w-14 py-2 rounded-xl border font-bold transition ${
+                            currentUser.class_no === n
+                              ? 'bg-amber-500 border-amber-400 text-black shadow-[0_0_0_3px_rgba(245,158,11,0.2)]'
+                              : 'bg-[#16181D] border-stone-800 text-stone-300 hover:border-amber-500/50 hover:text-amber-300'
+                          }`}
+                        >
+                          {n}組
+                        </button>
+                      ))}
+                    </div>
+                    {!currentUser.class_no && <div className="text-amber-300">まだ設定されていません (時間割は1組が表示されます)</div>}
+                  </div>
+
                   {/* パスワード変更 */}
                   <form onSubmit={handleChangePassword} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-6 font-mono text-xs space-y-3">
                     <div className="text-stone-400 uppercase font-bold tracking-wider flex items-center gap-1.5">
@@ -5073,17 +5617,36 @@ export default function App() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-white font-bold text-sm mr-auto">監査ログ</span>
                     <select
+                      value={auditUserFilter}
+                      onChange={e => {
+                        setAuditUserFilter(e.target.value);
+                        setAuditSummary(null);
+                        loadAuditLogs(auditFilter, e.target.value);
+                      }}
+                      className="bg-[#16181D] border border-stone-800 rounded-lg px-2 py-1.5 text-stone-200 focus:outline-none max-w-[10rem]"
+                      aria-label="ユーザーで絞り込み"
+                    >
+                      <option value="">全員</option>
+                      {[...onlineUsers].sort((a, b) => a.username.localeCompare(b.username)).map(u => (
+                        <option key={u.id} value={String(u.id)}>{u.username}</option>
+                      ))}
+                      <option value="system">システム・Discord</option>
+                    </select>
+                    <select
                       value={auditFilter}
                       onChange={e => {
                         setAuditFilter(e.target.value);
-                        loadAuditLogs(e.target.value);
+                        setAuditSummary(null);
+                        loadAuditLogs(e.target.value, auditUserFilter);
                       }}
                       className="bg-[#16181D] border border-stone-800 rounded-lg px-2 py-1.5 text-stone-200 focus:outline-none"
+                      aria-label="種類で絞り込み"
                     >
                       <option value="">すべて</option>
                       <option value="login">ログイン</option>
                       <option value="message">メッセージ</option>
                       <option value="assignment">提出物</option>
+                      <option value="homework">宿題</option>
                       <option value="timetable">時間割</option>
                       <option value="channel">チャンネル</option>
                       <option value="discord">Discord</option>
@@ -5091,6 +5654,15 @@ export default function App() {
                     </select>
                     <button onClick={() => loadAuditLogs()} className="p-2 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-300" title="更新">
                       <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={summarizeAuditLogs}
+                      disabled={isSummarizingAudit || auditLogs.length === 0}
+                      className="btn-chip text-xs disabled:opacity-40"
+                      title="表示中の条件のログ (最新200件まで) を AI が要約"
+                    >
+                      <Sparkles className={`w-3.5 h-3.5 text-amber-400 ${isSummarizingAudit ? 'animate-pulse' : ''}`} />
+                      {isSummarizingAudit ? '要約中…' : 'AIで要約'}
                     </button>
                     {currentUser?.role === 'admin' && (
                       <button
@@ -5101,6 +5673,23 @@ export default function App() {
                       </button>
                     )}
                   </div>
+                  {auditSummary && (
+                    <div className="p-3 rounded-xl bg-amber-500/5 border border-amber-500/30 space-y-2 anim-fade">
+                      <div className="flex items-center gap-2 text-amber-300 font-bold">
+                        <Sparkles className="w-3.5 h-3.5" /> AI 要約
+                        <span className="text-stone-500 font-normal">
+                          ({auditUserFilter ? (auditUserFilter === 'system' ? 'システム・Discord' : userById.get(Number(auditUserFilter))?.username || '') : '全員'}
+                          {auditFilter ? ` · ${auditFilter}` : ''} · 直近{auditSummary.count}件)
+                        </span>
+                        <button onClick={() => setAuditSummary(null)} className="ml-auto p-1 rounded text-stone-500 hover:text-white" aria-label="閉じる">
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <div className="markdown-body text-stone-200 text-xs">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{auditSummary.text}</ReactMarkdown>
+                      </div>
+                    </div>
+                  )}
                   <div className="divide-y divide-stone-800/60">
                     {auditLogs.length === 0 ? (
                       <div className="py-6 text-center text-stone-500">監査ログはありません</div>
@@ -5168,21 +5757,29 @@ export default function App() {
         )}
       </main>
 
-      {/* スマホ: 下部タブバー */}
+      {/* スマホ: 下部タブバー (よく使う5つ + メニュー) */}
       <nav className="md:hidden shrink-0 border-t border-stone-800/80 bg-[#0C0D10]/95 backdrop-blur-md pb-safe z-40">
-        <div className="flex overflow-x-auto">
-          {TABS.map(tab => {
+        <div className="flex">
+          {[...TABS.filter(t => MOBILE_MAIN_TABS.includes(t.id)), { id: 'menu' as const, label: 'メニュー', icon: Menu }].map(tab => {
             const Icon = tab.icon;
-            const isActive = activeTab === tab.id;
+            const inMenu = !MOBILE_MAIN_TABS.includes(activeTab);
+            const isActive = tab.id === 'menu' ? inMenu || isMobileMenuOpen : activeTab === tab.id && !isMobileMenuOpen;
             return (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`relative flex-1 min-w-[3.25rem] flex flex-col items-center gap-0.5 py-1.5 text-[10px] ${isActive ? 'text-amber-400' : 'text-stone-500'}`}
+                onClick={() => {
+                  if (tab.id === 'menu') {
+                    setIsMobileMenuOpen(v => !v);
+                  } else {
+                    setIsMobileMenuOpen(false);
+                    setActiveTab(tab.id);
+                  }
+                }}
+                className={`relative flex-1 min-w-0 flex flex-col items-center gap-0.5 pt-2 pb-1.5 text-[10px] ${isActive ? 'text-amber-400' : 'text-stone-500'}`}
               >
                 {isActive && <span className="absolute top-0 left-1/4 right-1/4 h-0.5 rounded-b bg-amber-400 anim-fade" />}
                 <Icon className="w-5 h-5" />
-                <span>{tab.label}</span>
+                <span className="truncate max-w-full">{tab.id === 'menu' && inMenu ? TABS.find(t => t.id === activeTab)?.label : tab.label}</span>
                 {tab.id === 'chat' && totalMentions > 0 && (
                   <span className="absolute top-0.5 left-1/2 ml-1.5 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center anim-badge">
                     {totalMentions > 99 ? '99+' : totalMentions}
@@ -5191,17 +5788,118 @@ export default function App() {
                 {tab.id === 'chat' && totalMentions === 0 && totalUnread > 0 && !isActive && (
                   <span className="absolute top-1 left-1/2 ml-2 w-2 h-2 rounded-full bg-white" />
                 )}
+                {tab.id === 'homework' && urgentHomework > 0 && (
+                  <span className="absolute top-0.5 left-1/2 ml-1.5 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-black text-[9px] font-bold leading-4 text-center">
+                    {urgentHomework}
+                  </span>
+                )}
               </button>
             );
           })}
         </div>
       </nav>
 
+      {/* スマホ: メニュー (下部タブに無いタブ) */}
+      {isMobileMenuOpen && (
+        <div className="md:hidden fixed inset-0 z-[45] bg-black/50 anim-fade" onClick={() => setIsMobileMenuOpen(false)}>
+          <div
+            onClick={e => e.stopPropagation()}
+            className="absolute left-2 right-2 bottom-[calc(3.75rem+env(safe-area-inset-bottom))] bg-[#111214] border border-stone-800 rounded-2xl p-2 shadow-2xl grid grid-cols-4 gap-1 anim-pop"
+          >
+            {TABS.filter(t => !MOBILE_MAIN_TABS.includes(t.id)).map(tab => {
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => {
+                    setActiveTab(tab.id);
+                    setIsMobileMenuOpen(false);
+                  }}
+                  className={`flex flex-col items-center gap-1 py-3 rounded-xl text-[11px] ${
+                    activeTab === tab.id ? 'bg-amber-500/15 text-amber-300' : 'text-stone-300 active:bg-stone-800'
+                  }`}
+                >
+                  <Icon className="w-5 h-5" />
+                  {tab.id === 'more' ? 'テスト点数' : tab.label}
+                </button>
+              );
+            })}
+            <button
+              onClick={() => {
+                setIsMobileMenuOpen(false);
+                setShowCamera(v => !v);
+              }}
+              className="flex flex-col items-center gap-1 py-3 rounded-xl text-[11px] text-stone-300 active:bg-stone-800"
+            >
+              <Camera className="w-5 h-5" />
+              カメラ
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* スマホ: メッセージ長押しの操作メニュー */}
+      {msgActionSheet && (() => {
+        const m = msgActionSheet;
+        const isMine = m.user_id === currentUser.id;
+        const isImage = IMAGE_MESSAGE_RE.test(m.content.trim());
+        const close = () => setMsgActionSheet(null);
+        const item = 'w-full flex items-center gap-3 px-4 py-3 text-sm text-left active:bg-stone-800 rounded-xl';
+        return (
+          <div className="fixed inset-0 z-[80] bg-black/60 flex items-end anim-fade" onClick={close}>
+            <div onClick={e => e.stopPropagation()} className="w-full bg-[#111214] border-t border-stone-800 rounded-t-2xl p-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] anim-slide-up">
+              <div className="px-4 pt-2 pb-3 text-xs text-stone-400 border-b border-stone-800 mb-1">
+                <b className="text-stone-200">{splitSenderName(m.sender_username || m.username || '').name}</b>
+                <span className="ml-2 line-clamp-2">{summarizeContent(m.content)}</span>
+              </div>
+              <div className="flex justify-around py-2">
+                {['👍', '❤️', '😂', '😮', '🙏'].map(e => (
+                  <button
+                    key={e}
+                    onClick={() => {
+                      handleToggleReaction(m.id, e);
+                      close();
+                    }}
+                    className="w-12 h-12 rounded-full bg-stone-900 border border-stone-800 text-xl active:scale-95"
+                  >
+                    {e}
+                  </button>
+                ))}
+              </div>
+              <button className={item} onClick={() => { startReply(m); close(); }}><Reply className="w-4 h-4 text-amber-400" /> 返信</button>
+              {!isImage && (
+                <button
+                  className={item}
+                  onClick={() => {
+                    navigator.clipboard.writeText(m.content).then(() => toast('テキストをコピーしました', { kind: 'success' }), () => {});
+                    close();
+                  }}
+                >
+                  <Copy className="w-4 h-4 text-stone-400" /> テキストをコピー
+                </button>
+              )}
+              <button className={item} onClick={() => { handleCopyMessageLink(m.id); close(); }}><Link className="w-4 h-4 text-stone-400" /> リンクをコピー</button>
+              <button className={item} onClick={() => { handleTogglePin(m.id); close(); }}><Pin className="w-4 h-4 text-stone-400" /> {m.is_pinned ? 'ピン留めを外す' : 'ピン留め'}</button>
+              {isMine && !isImage && (
+                <button className={item} onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content); close(); }}>
+                  <Edit3 className="w-4 h-4 text-stone-400" /> 編集
+                </button>
+              )}
+              {(isMine || currentUser.role === 'admin') && (
+                <button className={`${item} text-red-400`} onClick={() => { close(); handleDeleteMessage(m.id); }}>
+                  <Trash2 className="w-4 h-4" /> 削除
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
       <UiHost />
 
       {showWeather && (
         <Modal onClose={() => setShowWeather(false)} className="max-w-2xl">
-          <WeatherDetail weather={weather} onClose={() => setShowWeather(false)} />
+          <WeatherDetail weather={weather} onClose={() => setShowWeather(false)} onRefresh={() => refetchWeatherRef.current()} />
         </Modal>
       )}
 
@@ -5479,8 +6177,34 @@ export default function App() {
             <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
               {/* 左: 週間グリッド */}
               <div className="flex-1 min-w-0 min-h-0 overflow-auto p-3 sm:p-4 space-y-3">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-stone-400 mr-1">クラス:</span>
+                  {CLASS_NUMBERS.map(n => (
+                    <button
+                      key={n}
+                      onClick={() => {
+                        setTtClassNo(n);
+                        setSelectedTtCell(null);
+                        setTtSaveStatus('');
+                      }}
+                      className={`px-2.5 py-1 rounded-lg border ${
+                        ttClassNo === n ? 'bg-amber-500 text-black font-bold border-amber-500' : 'border-stone-800 text-stone-400 hover:text-white hover:border-stone-600'
+                      }`}
+                    >
+                      {n}組{n === currentUser.class_no ? ' ★' : ''}
+                    </button>
+                  ))}
+                  {!currentUser.class_no && (
+                    <button
+                      onClick={() => handleSetMyClass(ttClassNo)}
+                      className="ml-1 px-2.5 py-1 rounded-lg border border-amber-500/40 text-amber-300 hover:bg-amber-500/10"
+                    >
+                      {ttClassNo}組を自分のクラスにする
+                    </button>
+                  )}
+                </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-stone-400">表示・編集する時程:</span>
+                  <span className="text-stone-400" title="短縮・S短でも教科は同じで、時刻だけが変わります">時刻を表示する時程:</span>
                   {(Object.keys(SCHEDULE_LABELS) as ScheduleType[]).map(t => (
                     <button
                       key={t}
@@ -5516,7 +6240,7 @@ export default function App() {
                       )}
                       {draftRow('帰りの会', periodDraft.closing, v => setPeriodDraft(d => (d ? { ...d, closing: v } : d)))}
                     </div>
-                    <div className="text-[10px] text-stone-500">5限の日は、帰りの会が5限のすぐ後になります。</div>
+                    <div className="text-[10px] text-stone-500">5限の日は、帰りの会が5限のすぐ後になります。時程は全クラス共通で、時間割 (教科) は時程を変えても同じです。</div>
                     <button onClick={handleSavePeriodTimes} className="px-4 py-1.5 btn-primary font-bold rounded-lg">
                       時刻を保存
                     </button>
@@ -5618,7 +6342,7 @@ export default function App() {
                     <div className="flex items-center justify-between">
                       <span className="text-white font-bold text-sm">
                         {DAY_LABELS[selectedTtCell.day]}曜 {selectedTtCell.period}限
-                        <span className="text-stone-500 font-normal ml-1">({SCHEDULE_LABELS[scheduleType]})</span>
+                        <span className="text-stone-500 font-normal ml-1">({ttClassNo}組)</span>
                       </span>
                       <button onClick={() => setSelectedTtCell(null)} className="text-stone-500 hover:text-white"><X className="w-3.5 h-3.5" /></button>
                     </div>
@@ -5775,6 +6499,18 @@ export default function App() {
                     className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="text-[10px] text-stone-400 block mb-1">クラス</label>
+                <select
+                  value={editingAssignment.class_no == null ? '' : String(editingAssignment.class_no)}
+                  onChange={e => setEditingAssignment({ ...editingAssignment, class_no: e.target.value ? Number(e.target.value) : null })}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                >
+                  <option value="">全クラス共通</option>
+                  {CLASS_NUMBERS.map(n => <option key={n} value={n}>{n}組</option>)}
+                </select>
               </div>
 
               <div>

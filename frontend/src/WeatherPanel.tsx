@@ -1,5 +1,6 @@
 // 天気: ヘッダーのホバー概要と、クリックで開く詳細 (1時間ごと・週間予報)
-import { Cloud, CloudRain, CloudSnow, CloudSun, Droplets, Sun, Sunrise, Sunset, Thermometer, Umbrella, Wind, X, Zap } from 'lucide-react';
+import { useState } from 'react';
+import { Cloud, CloudRain, CloudSnow, CloudSun, Droplets, RefreshCw, Sun, Sunrise, Sunset, Thermometer, Umbrella, Wind, X, Zap } from 'lucide-react';
 
 export interface WeatherDay {
   date: string;
@@ -86,8 +87,9 @@ export function WeatherHoverSummary({ weather }: { weather: WeatherInfo }) {
   );
 }
 
-export function WeatherDetail({ weather, onClose }: { weather: WeatherInfo; onClose: () => void }) {
+export function WeatherDetail({ weather, onClose, onRefresh }: { weather: WeatherInfo; onClose: () => void; onRefresh?: () => Promise<void> | void }) {
   const Icon = weatherIcon(weather.weatherCode);
+  const [refreshing, setRefreshing] = useState(false);
   const stats = [
     { icon: Thermometer, label: '体感', value: weather.feelsLike != null ? `${weather.feelsLike}℃` : '--' },
     { icon: Droplets, label: '湿度', value: weather.humidity != null ? `${weather.humidity}%` : '--' },
@@ -100,11 +102,34 @@ export function WeatherDetail({ weather, onClose }: { weather: WeatherInfo; onCl
     <>
       <div className="p-4 border-b border-stone-800 flex items-center justify-between">
         <span className="font-bold text-white text-sm">高松市の天気</span>
-        <button onClick={onClose} className="p-1 rounded-lg text-stone-500 hover:text-white hover:bg-stone-800" aria-label="閉じる">
-          <X className="w-4 h-4" />
-        </button>
+        <div className="flex items-center gap-1">
+          {onRefresh && (
+            <button
+              onClick={async () => {
+                setRefreshing(true);
+                try {
+                  await onRefresh();
+                } finally {
+                  setTimeout(() => setRefreshing(false), 600);
+                }
+              }}
+              className="px-2 py-1 rounded-lg text-xs text-stone-400 hover:text-white hover:bg-stone-800 flex items-center gap-1"
+              title="天気を取り直す"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} /> 再取得
+            </button>
+          )}
+          <button onClick={onClose} className="p-1 rounded-lg text-stone-500 hover:text-white hover:bg-stone-800" aria-label="閉じる">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-5 text-xs">
+        {weather.temp === null && (
+          <div className="p-2.5 rounded-xl bg-red-950/30 border border-red-900 text-red-300">
+            天気を取得できませんでした。自動で取り直しています (右上の「再取得」ですぐ試せます)。
+          </div>
+        )}
         <div className="flex items-center gap-4">
           <Icon className="w-14 h-14 text-amber-400" />
           <div>

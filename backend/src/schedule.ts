@@ -88,3 +88,45 @@ export interface TimetableConfig {
   schedules: Record<ScheduleType, ScheduleDef>;
   dayPeriodCounts: Record<string, number>;
 }
+
+// YYYY-MM-DD に日数を足す
+export function addDaysYmd(ymd: string, n: number) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+const normalizeSubject = (s: string) => s.replace(/[\s・]/g, '');
+
+// 教科の次の授業日 (今日より後の平日で、時間割にその教科がある最初の日)。見つからなければ null
+export function nextLessonDate(
+  rows: { day_of_week: number; period: number; subject: string }[],
+  subject: string,
+  fromYmd: string,
+  dayPeriodCounts: Record<string, number> = DEFAULT_DAY_PERIOD_COUNTS
+): string | null {
+  const target = normalizeSubject(subject);
+  if (!target) return null;
+  const matches = (s: string) => {
+    const n = normalizeSubject(s);
+    return n === target || n.includes(target) || target.includes(n);
+  };
+  for (let i = 1; i <= 14; i++) {
+    const ymd = addDaysYmd(fromYmd, i);
+    const dow = new Date(`${ymd}T00:00:00Z`).getUTCDay();
+    if (dow === 0 || dow === 6) continue;
+    const count = dayPeriodCounts[String(dow)] || MAX_PERIODS;
+    if (rows.some(r => r.day_of_week === dow && r.period <= count && matches(r.subject))) return ymd;
+  }
+  return null;
+}
+
+// 次の平日
+export function nextWeekday(fromYmd: string) {
+  for (let i = 1; i <= 7; i++) {
+    const ymd = addDaysYmd(fromYmd, i);
+    const dow = new Date(`${ymd}T00:00:00Z`).getUTCDay();
+    if (dow !== 0 && dow !== 6) return ymd;
+  }
+  return addDaysYmd(fromYmd, 1);
+}

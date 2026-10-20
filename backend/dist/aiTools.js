@@ -6,6 +6,7 @@ exports.createAiToolRunner = createAiToolRunner;
 // 書き込み系は既存の API を本人のトークンで呼ぶので、権限チェック・配信・監査ログは通常操作と同じになる
 const genai_1 = require("@google/genai");
 const schedule_js_1 = require("./schedule.js");
+const webSearch_js_1 = require("./webSearch.js");
 const DAY = ['日', '月', '火', '水', '木', '金', '土'];
 const SCHEDULE_LABELS = { normal: '通常時程', short: '短縮時程', s_short: 'S短時程' };
 const STATUS_LABELS = {
@@ -23,11 +24,19 @@ const isYmd = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const READ_TOOLS = [
     {
         name: 'get_timetable',
-        description: '時間割と時程 (朝の会・各時限・帰りの会の時刻、教科、持ち物) を取得する。曜日を省略すると月〜金すべて。',
+        description: '時間割と時程 (朝の会・各時限・帰りの会の時刻、教科、持ち物) を取得する。曜日を省略すると月〜金すべて。クラスを省略すると話している相手のクラス。',
         parameters: {
             type: genai_1.Type.OBJECT,
-            properties: { day_of_week: { type: genai_1.Type.INTEGER, description: '1=月 … 5=金' } },
+            properties: {
+                day_of_week: { type: genai_1.Type.INTEGER, description: '1=月 … 5=金' },
+                class_no: { type: genai_1.Type.INTEGER, description: '1〜6 (組)' },
+            },
         },
+    },
+    {
+        name: 'get_homework',
+        description: '宿題 (次の授業までにやってくる簡単な課題) の一覧と、自分がやったかどうかを取得する。',
+        parameters: { type: genai_1.Type.OBJECT, properties: { include_done: { type: genai_1.Type.BOOLEAN, description: 'やった宿題も含める' } } },
     },
     {
         name: 'get_assignments',
@@ -105,6 +114,27 @@ const READ_TOOLS = [
         description: '学校周辺の現在の天気・今日の予報・週間予報を取得する。',
         parameters: { type: genai_1.Type.OBJECT, properties: {} },
     },
+    {
+        name: 'web_search',
+        description: 'インターネットを検索する。サイト外の知識、ニュース、最新の情報、調べものに使う。結果はタイトル・URL・抜粋。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                query: { type: genai_1.Type.STRING, description: '検索語 (日本語可)' },
+                limit: { type: genai_1.Type.INTEGER, description: '最大8' },
+            },
+            required: ['query'],
+        },
+    },
+    {
+        name: 'read_webpage',
+        description: 'Web ページの本文を読む。web_search の抜粋だけでは足りないときに URL を指定して使う。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: { url: { type: genai_1.Type.STRING } },
+            required: ['url'],
+        },
+    },
 ];
 const WRITE_TOOLS = [
     {
@@ -131,6 +161,19 @@ const WRITE_TOOLS = [
                 status: { type: genai_1.Type.STRING, enum: Object.keys(STATUS_LABELS) },
             },
             required: ['assignment_id', 'status'],
+        },
+    },
+    {
+        name: 'add_homework',
+        description: '宿題を登録する (クラスで共有)。期限を省略すると、時間割からその教科の次の授業日になる。ユーザーが登録を頼んだときだけ使う。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                subject: { type: genai_1.Type.STRING },
+                content: { type: genai_1.Type.STRING, description: '例: ワーク P.12〜13' },
+                due_date: { type: genai_1.Type.STRING, description: 'YYYY-MM-DD (任意)' },
+            },
+            required: ['subject', 'content'],
         },
     },
     {
@@ -182,10 +225,19 @@ function createAiToolRunner(ctx) {
         const r = await ctx.pool.query(`SELECT id, name FROM channels WHERE type <> 'voice' AND (name = $1 OR name ILIKE $2) ORDER BY (name = $1) DESC LIMIT 1`, [clean, `%${clean}%`]);
         return r.rows[0];
     };
+    let classCache;
+    const myClass = async () => {
+        if (classCache === undefined) {
+            const r = await ctx.pool.query(`SELECT class_no FROM users WHERE id = $1`, [ctx.userId]);
+            classCache = r.rows[0]?.class_no ?? null;
+        }
+        return classCache ?? null;
+    };
     const handlers = {
         async get_timetable(args) {
             const config = await api('/api/timetables/config');
-            const rows = await api('/api/timetables?scheduleType=normal');
+            const classNo = args.class_no >= 1 && args.class_no <= 6 ? args.class_no : await myClass();
+            const rows = await api(`/api/timetables${classNo ? `?classNo=${classNo}` : ''}`);
             const def = config.schedules[config.activeScheduleType] || config.schedules.normal;
             const days = args.day_of_week >= 1 && args.day_of_week <= 5 ? [args.day_of_week] : [1, 2, 3, 4, 5];
             const result = days.map(dow => {
@@ -211,15 +263,43 @@ function createAiToolRunner(ctx) {
                 };
             });
             return {
-                label: args.day_of_week ? `${DAY[args.day_of_week]}曜の時間割を確認` : '時間割を確認',
-                result: { today_schedule: SCHEDULE_LABELS[config.activeScheduleType], days: result },
+                label: `${classNo ? `${classNo}組 ` : ''}${args.day_of_week ? `${DAY[args.day_of_week]}曜の時間割を確認` : '時間割を確認'}`,
+                result: { class_no: classNo, today_schedule: SCHEDULE_LABELS[config.activeScheduleType], days: result },
             };
+        },
+        async get_homework(args) {
+            const classNo = await myClass();
+            const rows = await api('/api/homework');
+            const today = (0, schedule_js_1.nowInTokyo)().date;
+            const list = rows
+                .filter(h => h.class_no == null || !classNo || h.class_no === classNo)
+                .filter(h => args.include_done || !h.my_done)
+                .filter(h => h.due_date >= today || !h.my_done)
+                .map(h => ({
+                id: h.id, subject: h.subject, content: h.content, due: h.due_date,
+                days_left: Math.round((Date.parse(h.due_date) - Date.parse(today)) / 86400000),
+                done: h.my_done, class: h.class_no ? `${h.class_no}組` : '全クラス',
+            }));
+            return { label: `宿題を確認 (${list.length}件)`, result: list };
+        },
+        async web_search(args) {
+            const q = String(args.query || '').trim();
+            if (!q)
+                throw new Error('検索語が空です');
+            const { provider, results } = await (0, webSearch_js_1.webSearch)(q, Math.min(Math.max(Number(args.limit) || 6, 1), 8));
+            return { label: `Web検索「${q}」(${results.length}件)`, result: { provider, results } };
+        },
+        async read_webpage(args) {
+            const page = await (0, webSearch_js_1.readWebPage)(String(args.url || ''));
+            return { label: `ページを読む: ${page.title || page.url}`.slice(0, 80), result: page };
         },
         async get_assignments(args) {
             const rows = await api('/api/assignments');
             const today = (0, schedule_js_1.nowInTokyo)().date;
+            const classNo = await myClass();
             const list = rows
                 .filter(a => args.include_archived || !a.is_archived)
+                .filter(a => a.class_no == null || !classNo || a.class_no === classNo)
                 .map(a => {
                 const deadline = jstDate(a.deadline);
                 return {
@@ -347,6 +427,15 @@ function createAiToolRunner(ctx) {
                 throw new Error('進捗の値が正しくありません');
             await api(`/api/assignments/${Number(args.assignment_id)}/progress`, { method: 'PUT', body: { status: args.status } });
             return { label: `提出物 #${args.assignment_id} を「${STATUS_LABELS[args.status]}」に変更`, result: { ok: true } };
+        },
+        async add_homework(args) {
+            if (args.due_date && !isYmd(args.due_date))
+                throw new Error('期限は YYYY-MM-DD で指定してください');
+            const created = await api('/api/homework', {
+                method: 'POST',
+                body: { subject: args.subject, content: String(args.content || '').slice(0, 2000), dueDate: args.due_date || undefined },
+            });
+            return { label: `宿題を登録: ${created.subject} ${created.content} (${created.due_date}まで)`, result: { ok: true, id: created.id, due: created.due_date } };
         },
         async add_calendar_event(args) {
             const created = await api('/api/calendar', {

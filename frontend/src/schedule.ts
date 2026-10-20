@@ -23,6 +23,8 @@ export interface TimetableItem {
 }
 
 export const SCHEDULE_LABELS: Record<ScheduleType, string> = { normal: '通常時程', short: '短縮時程', s_short: 'S短時程' };
+// クラス (1〜6組)
+export const CLASS_NUMBERS = [1, 2, 3, 4, 5, 6];
 export const DAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
 export const MAX_PERIODS = 6;
 
@@ -137,4 +139,18 @@ export function computeSchoolStatus(now: Date, config: TimetableConfig, today: T
     }
   }
   return { kind: 'after', label: '放課後', sub: `${periodCountFor(config, dow)}限授業の日` };
+}
+
+// 'YYYY-MM-DD' (ローカル日付) → 「10/22(木)」
+export function shortDateLabel(ymdStr: string): string {
+  const d = new Date(`${ymdStr}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return ymdStr;
+  return `${d.getMonth() + 1}/${d.getDate()}(${DAY_LABELS[d.getDay()]})`;
+}
+
+// 今日から見て何日後か (ローカル日付)
+export function daysFromToday(ymdStr: string, now = new Date()): number {
+  const d = new Date(`${ymdStr}T00:00:00`);
+  const t = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((d.getTime() - t.getTime()) / 86400000);
 }

@@ -48,7 +48,7 @@ const aiProxy = createProxyMiddleware({
   target: BACKEND_TARGET,
   changeOrigin: true,
   secure: true,
-  pathFilter: ['/api/ai/**', '/api/assignments/summarize', '/api/test-scores/advice'],
+  pathFilter: ['/api/ai/**', '/api/assignments/summarize', '/api/test-scores/advice', '/api/audit-logs/summarize'],
   proxyTimeout: 120000,
   timeout: 120000,
   on: {

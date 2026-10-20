@@ -8,6 +8,7 @@ exports.isDiscordBotConfigured = isDiscordBotConfigured;
 exports.getDiscordStatus = getDiscordStatus;
 exports.refreshDiscordCommands = refreshDiscordCommands;
 exports.relayToDiscordBot = relayToDiscordBot;
+exports.editRelayedOnDiscord = editRelayedOnDiscord;
 exports.startDiscordBot = startDiscordBot;
 // Discord Bot 連携
 // - 許可されたサーバー (DISCORD_GUILD_ID) 以外では一切動作しない
@@ -165,6 +166,18 @@ function isVideo(att) {
 function isImage(att) {
     return (att.contentType || '').startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(att.name || '');
 }
+// サーバーアイコン > ユーザーアイコン の順。アイコンが変わったら別ファイルになる
+async function avatarFor(msg) {
+    try {
+        const hash = msg.member?.avatar || msg.author.avatar || 'default';
+        const url = msg.member?.displayAvatarURL({ extension: 'png', size: 128 }) || msg.author.displayAvatarURL({ extension: 'png', size: 128 });
+        return await deps.saveAvatar(`${msg.author.id}-${hash}`, url);
+    }
+    catch (err) {
+        console.error('[discord] avatar save failed:', err.message);
+        return null;
+    }
+}
 async function handleDiscordMessage(msg) {
     if (msg.guildId !== guildId)
         return;
@@ -175,6 +188,7 @@ async function handleDiscordMessage(msg) {
     if (targets.length === 0)
         return;
     const name = `[Discord] ${msg.member?.displayName || msg.author.globalName || msg.author.username}`;
+    const avatarUrl = await avatarFor(msg);
     const parts = [];
     const text = msg.cleanContent?.trim();
     if (text)
@@ -207,17 +221,37 @@ async function handleDiscordMessage(msg) {
         return;
     for (const t of targets) {
         // 画像は1枚ずつ別メッセージにする (asdfbase のチャット表示に合わせる)
-        for (const p of parts)
-            await deps.ingest(t.asdfChannelId, name, p);
+        for (let i = 0; i < parts.length; i++) {
+            await deps.ingest(t.asdfChannelId, name, parts[i], {
+                avatarUrl,
+                discordChannelId: msg.channelId,
+                discordMessageId: i === 0 && text ? msg.id : null,
+            });
+        }
     }
 }
-// asdfbase のメッセージを連携先の Discord チャンネルへ送信。送信先が1つでもあれば true
+// Discord 側の編集: 本文が変わっていれば asdfbase の該当メッセージも書き換える
+async function handleDiscordEdit(msg) {
+    if (msg.guildId !== guildId)
+        return;
+    const full = msg.partial ? await msg.fetch().catch(() => null) : msg;
+    if (!full || full.author.bot || full.webhookId)
+        return;
+    const bindings = await getBindings();
+    if (!bindings.some(b => b.discordChannelId === full.channelId))
+        return;
+    const text = full.cleanContent?.trim();
+    if (!text)
+        return;
+    await deps.ingestEdit(full.id, text);
+}
+// asdfbase のメッセージを連携先の Discord チャンネルへ送信。送った Discord メッセージを返す (空なら未送信)
 async function relayToDiscordBot(asdfChannelId, username, content) {
     if (!client || !connected || !deps)
-        return false;
+        return [];
     const targets = (await getBindings()).filter(b => b.asdfChannelId === asdfChannelId);
     if (targets.length === 0)
-        return false;
+        return [];
     const files = [];
     const text = content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, (_m, p) => {
         const filePath = path_1.default.join(deps.uploadDir, path_1.default.basename(p));
@@ -232,13 +266,13 @@ async function relayToDiscordBot(asdfChannelId, username, content) {
         files: isVideoMsg ? [] : files,
         allowedMentions: { parse: [] },
     };
-    let sent = false;
+    const sent = [];
     for (const t of targets) {
         try {
             const ch = (await client.channels.fetch(t.discordChannelId));
             if (ch && 'send' in ch && ch.guildId === guildId) {
-                await ch.send(payload);
-                sent = true;
+                const m = await ch.send(payload);
+                sent.push({ discordChannelId: t.discordChannelId, discordMessageId: m.id });
             }
         }
         catch (err) {
@@ -248,12 +282,36 @@ async function relayToDiscordBot(asdfChannelId, username, content) {
     }
     return sent;
 }
+// Bot が送ったメッセージを編集 (Discord 側にも「編集済み」が付く)。1つでも編集できれば true
+async function editRelayedOnDiscord(links, username, content) {
+    if (!client || !connected || links.length === 0)
+        return false;
+    const body = content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, '').trim();
+    let edited = false;
+    for (const l of links) {
+        try {
+            const ch = (await client.channels.fetch(l.discordChannelId));
+            if (!ch || !('messages' in ch) || ch.guildId !== guildId)
+                continue;
+            const m = await ch.messages.fetch(l.discordMessageId);
+            await m.edit({ content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000), allowedMentions: { parse: [] } });
+            edited = true;
+        }
+        catch (err) {
+            lastError = `編集の反映に失敗: ${err.message}`;
+            console.error('[discord] edit relay failed:', err.message);
+        }
+    }
+    return edited;
+}
 function createClient(withMessageContent) {
     const intents = [discord_js_1.GatewayIntentBits.Guilds, discord_js_1.GatewayIntentBits.GuildMessages];
     if (withMessageContent)
         intents.push(discord_js_1.GatewayIntentBits.MessageContent);
     return new discord_js_1.Client({
         intents,
+        // キャッシュしていないメッセージの編集も受け取る
+        partials: [discord_js_1.Partials.Message, discord_js_1.Partials.Channel],
         // VPS のメモリ節約のためキャッシュを最小限に
         makeCache: discord_js_1.Options.cacheWithLimits({
             ...discord_js_1.Options.DefaultMakeCacheSettings,
@@ -303,6 +361,9 @@ async function startDiscordBot(d) {
         });
         c.on(discord_js_1.Events.MessageCreate, m => {
             handleDiscordMessage(m).catch(err => console.error('[discord] message handling failed:', err));
+        });
+        c.on(discord_js_1.Events.MessageUpdate, (_old, m) => {
+            handleDiscordEdit(m).catch(err => console.error('[discord] edit handling failed:', err));
         });
         c.on(discord_js_1.Events.InteractionCreate, i => {
             if (i.isChatInputCommand()) {

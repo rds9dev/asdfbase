@@ -14,9 +14,11 @@ import { pool, initDb } from './db.js';
 import { askGemini, getAvailableKeyCount, runGeminiAgent } from './gemini.js';
 import { aiToolDeclarations, createAiToolRunner } from './aiTools.js';
 import type { Content } from '@google/genai';
-import { startDiscordBot, relayToDiscordBot, getDiscordStatus, refreshDiscordCommands, getBoundAsdfChannelIds } from './discord.js';
 import {
-  DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo,
+  startDiscordBot, relayToDiscordBot, editRelayedOnDiscord, getDiscordStatus, refreshDiscordCommands, getBoundAsdfChannelIds,
+} from './discord.js';
+import {
+  DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo, nextLessonDate, nextWeekday,
   type ScheduleDef, type ScheduleType, type TimetableConfig,
 } from './schedule.js';
 
@@ -91,13 +93,26 @@ export async function notifyImportant(title: string, description: string, color 
 }
 
 // 通常メッセージの Discord 転送: Bot 連携があれば Bot、なければメッセージ用 Webhook
-export async function relayMessage(msg: { channel_id: number; username?: string; sender_username?: string; content: string }) {
+export async function relayMessage(msg: { id?: number; channel_id: number; username?: string; sender_username?: string; content: string }) {
   try {
     const username = msg.sender_username || msg.username || 'unknown';
     if (username.startsWith('[Discord]')) return; // Discord から来たものは戻さない
     if ((await getSetting('notify_messages_enabled', 'on')) !== 'on') return;
 
-    if (await relayToDiscordBot(msg.channel_id, username, msg.content)) return;
+    const sent = await relayToDiscordBot(msg.channel_id, username, msg.content);
+    if (sent.length > 0) {
+      // あとで編集を Discord 側にも反映できるよう、送ったメッセージを覚えておく
+      if (msg.id) {
+        for (const r of sent) {
+          await pool.query(
+            `INSERT INTO discord_message_links (asdf_message_id, discord_channel_id, discord_message_id, direction)
+             VALUES ($1, $2, $3, 'out') ON CONFLICT DO NOTHING`,
+            [msg.id, r.discordChannelId, r.discordMessageId]
+          );
+        }
+      }
+      return;
+    }
 
     const url = await getSetting('discord_message_webhook_url', '');
     if (!url) return;
@@ -110,6 +125,30 @@ export async function relayMessage(msg: { channel_id: number; username?: string;
     await postWebhook(url, { username: `[asdfbase] ${username}`, content: text || undefined, allowed_mentions: { parse: [] } }, files);
   } catch (err: any) {
     console.error('relayMessage error:', err.message);
+  }
+}
+
+// 編集の Discord 反映: Bot で送ったものはそのメッセージを編集。Webhook は編集できないので「(編集済み)」付きで送り直す
+async function relayEdit(msg: { id: number; channel_id: number; content: string }, username: string) {
+  try {
+    if ((await getSetting('notify_messages_enabled', 'on')) !== 'on') return;
+    const links = (await pool.query(
+      `SELECT discord_channel_id, discord_message_id FROM discord_message_links WHERE asdf_message_id = $1 AND direction = 'out'`,
+      [msg.id]
+    )).rows.map(r => ({ discordChannelId: r.discord_channel_id, discordMessageId: r.discord_message_id }));
+    if (links.length > 0) {
+      await editRelayedOnDiscord(links, username, msg.content);
+      return;
+    }
+    // Bot で同期しているチャンネルなのにリンクが無い (古いメッセージ等) なら何もしない
+    if ((await getBoundAsdfChannelIds()).includes(msg.channel_id)) return;
+    const url = await getSetting('discord_message_webhook_url', '');
+    if (!url) return;
+    const text = msg.content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, '').trim();
+    if (!text) return;
+    await postWebhook(url, { username: `[asdfbase] ${username}`, content: `${text} (編集済み)`.slice(0, 2000), allowed_mentions: { parse: [] } });
+  } catch (err: any) {
+    console.error('relayEdit error:', err.message);
   }
 }
 
@@ -169,6 +208,15 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
   } catch (err) {
     return res.status(401).json({ error: '無効または期限切れのトークンです' });
   }
+}
+
+// 自分のクラス (1〜6組)。時間割・提出物・宿題の既定の表示に使う
+export const CLASS_NUMBERS = [1, 2, 3, 4, 5, 6];
+const parseClassNo = (v: any): number | null => (CLASS_NUMBERS.includes(Number(v)) ? Number(v) : null);
+
+async function classOf(userId: number): Promise<number | null> {
+  const r = await pool.query(`SELECT class_no FROM users WHERE id = $1`, [userId]);
+  return parseClassNo(r.rows[0]?.class_no);
 }
 
 app.get('/', (req, res) => {
@@ -248,6 +296,7 @@ async function fetchWeatherOpenMeteo(): Promise<WeatherInfo> {
     '&hourly=temperature_2m,weather_code,precipitation_probability' +
     '&forecast_days=7&timezone=Asia%2FTokyo&wind_speed_unit=ms'
   );
+  if (!data?.current || !Number.isFinite(Number(data.current.temperature_2m))) throw new Error('open-meteo: 現在の気温がありません');
   const code = Number(data.current.weather_code);
   const d = data.daily || {};
   const daily: WeatherDay[] = (d.time || []).map((date: string, i: number) => ({
@@ -337,13 +386,26 @@ async function fetchWeatherJma(): Promise<WeatherInfo> {
   };
 }
 
+// 正常: 10分キャッシュ / 気象庁の予備データ: 3分で open-meteo を再挑戦 / 全滅: 次のリクエストで再取得
+const WEATHER_TTL_MS = 10 * 60 * 1000;
+const WEATHER_FALLBACK_TTL_MS = 3 * 60 * 1000;
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
 let weatherInFlight: Promise<WeatherInfo> | null = null;
 async function getWeather(): Promise<WeatherInfo> {
-  if (weatherCache && Date.now() - weatherCache.updatedAt < 10 * 60 * 1000) return weatherCache;
+  const ttl = weatherCache?.source === 'jma' ? WEATHER_FALLBACK_TTL_MS : WEATHER_TTL_MS;
+  if (weatherCache && Date.now() - weatherCache.updatedAt < ttl) return weatherCache;
   if (weatherInFlight) return weatherInFlight;
   weatherInFlight = (async () => {
     try {
-      weatherCache = await fetchWeatherOpenMeteo();
+      try {
+        weatherCache = await fetchWeatherOpenMeteo();
+      } catch (first: any) {
+        // 一時的なタイムアウトが多いので少し待って1回だけやり直す
+        console.warn('open-meteo failed, retrying:', first.message);
+        await sleep(1500);
+        weatherCache = await fetchWeatherOpenMeteo();
+      }
     } catch (err: any) {
       console.warn('open-meteo failed, falling back to JMA:', err.message);
       try {
@@ -449,6 +511,7 @@ app.post('/api/auth/login', async (req, res) => {
         status: user.status,
         custom_status: user.custom_status,
         avatar_url: user.avatar_url,
+        class_no: user.class_no,
       },
     });
   } catch (err) {
@@ -461,7 +524,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, role, status, custom_status, avatar_url, created_at FROM users WHERE id = $1`,
+      `SELECT id, username, role, status, custom_status, avatar_url, class_no, created_at FROM users WHERE id = $1`,
       [req.user!.id]
     );
     if (result.rows.length === 0) {
@@ -642,7 +705,7 @@ app.get('/api/messages/since', authMiddleware, async (req, res) => {
   }
 });
 
-// Unread counts per channel based on client's last-read message ids
+// 未読数: 既読位置はサーバー (全端末共通) と端末の記録の新しい方を使う
 app.post('/api/channels/unread-counts', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const lastRead: Record<string, number> = req.body?.lastRead || {};
@@ -658,13 +721,21 @@ app.post('/api/channels/unread-counts', authMiddleware, async (req: AuthRequest,
     }
     // unread: 自分以外の未読 / mentions: そのうち自分宛て (@名前・@everyone・自分への返信)
     const result = await pool.query(
-      `SELECT m.channel_id,
+      `WITH r AS (
+         SELECT ch, MAX(lr) AS last_read FROM (
+           SELECT unnest($1::int[]) AS ch, unnest($2::int[]) AS lr
+           UNION ALL
+           SELECT channel_id, last_read_id FROM channel_reads WHERE user_id = $3
+         ) x GROUP BY ch
+       )
+       SELECT m.channel_id,
               MAX(m.id) AS last_message_id,
+              MAX(r.last_read) AS last_read,
               COUNT(*) FILTER (WHERE r.last_read IS NOT NULL AND m.id > r.last_read AND m.user_id IS DISTINCT FROM $3) AS unread,
               COUNT(*) FILTER (WHERE r.last_read IS NOT NULL AND m.id > r.last_read AND m.user_id IS DISTINCT FROM $3
                 AND (POSITION($4 IN m.content) > 0 OR POSITION('@everyone' IN m.content) > 0 OR p.user_id = $3)) AS mentions
        FROM messages m
-       LEFT JOIN (SELECT unnest($1::int[]) AS ch, unnest($2::int[]) AS last_read) r ON r.ch = m.channel_id
+       LEFT JOIN r ON r.ch = m.channel_id
        LEFT JOIN messages p ON p.id = m.reply_to_id
        GROUP BY m.channel_id`,
       [channelIds, lastReadIds, req.user!.id, `@${req.user!.username}`]
@@ -672,12 +743,55 @@ app.post('/api/channels/unread-counts', authMiddleware, async (req: AuthRequest,
     res.json(result.rows.map(r => ({
       channelId: r.channel_id,
       lastMessageId: Number(r.last_message_id),
+      lastReadId: r.last_read == null ? null : Number(r.last_read),
       unread: Number(r.unread),
       mentions: Number(r.mentions),
     })));
   } catch (err) {
     console.error('Unread counts error:', err);
     res.status(500).json({ error: '未読数取得エラー' });
+  }
+});
+
+// 既読位置を保存し、同じユーザーの他の端末にも知らせる (戻ることはない)
+app.post('/api/channels/:channelId/read', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId, 10);
+    const messageId = Number(req.body?.messageId);
+    if (!Number.isFinite(channelId) || !Number.isFinite(messageId) || messageId <= 0) {
+      return res.status(400).json({ error: '既読位置が正しくありません' });
+    }
+    const r = await pool.query(
+      `INSERT INTO channel_reads (user_id, channel_id, last_read_id) VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, channel_id) DO UPDATE SET last_read_id = GREATEST(channel_reads.last_read_id, EXCLUDED.last_read_id)
+       RETURNING last_read_id`,
+      [req.user!.id, channelId, messageId]
+    );
+    const lastReadId = Number(r.rows[0].last_read_id);
+    publish({ type: 'READ_STATE_UPDATED', payload: { channelId, lastReadId } }, { targetUserId: req.user!.id, excludeConnId: getConnId(req) || undefined });
+    res.json({ channelId, lastReadId });
+  } catch (err: any) {
+    if (err.code === '23503') return res.status(404).json({ error: 'チャンネルがありません' });
+    res.status(500).json({ error: '既読の保存に失敗しました' });
+  }
+});
+
+// メッセージリンク用: 指定メッセージの前後をまとめて返す
+app.get('/api/messages/:messageId/context', authMiddleware, async (req, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId, 10);
+    const half = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 25, 5), 100);
+    const target = (await pool.query(`SELECT id, channel_id FROM messages WHERE id = $1`, [messageId])).rows[0];
+    if (!target) return res.status(404).json({ error: 'メッセージが見つかりません (削除された可能性があります)' });
+    const base = `SELECT m.*, u.username as sender_username FROM messages m LEFT JOIN users u ON m.user_id = u.id WHERE m.channel_id = $1`;
+    const before = (await pool.query(`${base} AND m.id < $2 ORDER BY m.id DESC LIMIT $3`, [target.channel_id, messageId, half + 1])).rows;
+    const after = (await pool.query(`${base} AND m.id >= $2 ORDER BY m.id ASC LIMIT $3`, [target.channel_id, messageId, half + 2])).rows;
+    const hasOlder = before.length > half;
+    const hasNewer = after.length > half + 1;
+    const rows = [...before.slice(0, half).reverse(), ...after.slice(0, half + 1)];
+    res.json({ channelId: target.channel_id, messageId, hasOlder, hasNewer, messages: await attachReplies(rows) });
+  } catch (err) {
+    res.status(500).json({ error: 'メッセージ取得エラー' });
   }
 });
 
@@ -730,13 +844,22 @@ app.put('/api/messages/:messageId', authMiddleware, async (req: AuthRequest, res
       return res.status(403).json({ error: '編集権限がありません' });
     }
 
+    if (typeof content !== 'string' || !content.trim()) {
+      return res.status(400).json({ error: '本文が空です' });
+    }
+    if (content === msg.content) {
+      const [same] = await attachReplies([{ ...msg, sender_username: req.user!.username }]);
+      return res.json(same);
+    }
+
     const updated = await pool.query(
-      `UPDATE messages SET content = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      `UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`,
       [content, messageId]
     );
 
     const [updatedMessage] = await attachReplies([{ ...updated.rows[0], sender_username: req.user!.username }]);
     broadcast({ type: 'MESSAGE_UPDATED', payload: updatedMessage });
+    relayEdit(updatedMessage, req.user!.username);
     logAudit(req.user!, 'message_edit', 'message', messageId, {
       message: 'メッセージ編集',
       channel_id: msg.channel_id,
@@ -804,7 +927,8 @@ async function replyAsGemini(channelId: number, trigger: { id: number; content: 
       systemInstruction: [
         `あなたはチャット「asdfbase」の #${channel?.name || ''} に参加している Gemini です。現在は ${jstNowLabel()} (日本時間) です。`,
         `会話の流れを踏まえ、最後に @gemini で呼びかけた ${asker} に答えてください。`,
-        '時間割・提出物・予定・メモ・過去のチャット・天気などが関係する質問では、推測せずツールで確認してから答えてください。',
+        '時間割・提出物・宿題・予定・メモ・過去のチャット・天気などが関係する質問では、推測せずツールで確認してから答えてください。',
+        'サイトの外の知識や最新の情報は web_search で調べ、参考にした URL を添えてください。検索結果が外国語でも、答えは必ず日本語にしてください。',
         '前置きは省き、チャットらしく簡潔に日本語で答えてください。',
       ].join('\n'),
     });
@@ -961,16 +1085,18 @@ app.get('/api/assignments', authMiddleware, async (req: AuthRequest, res) => {
 app.post('/api/assignments', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { title, subject, description, deadline, resubmitDeadline } = req.body;
+    // classNo: null = 全クラス共通、省略 = 登録した人のクラス
+    const classNo = req.body.classNo === null ? null : parseClassNo(req.body.classNo) ?? (await classOf(req.user!.id));
     const result = await pool.query(
-      `INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [title, subject, description, deadline, resubmitDeadline || null]
+      `INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline, class_no) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [title, subject, description, deadline, resubmitDeadline || null, classNo]
     );
     const created = { ...result.rows[0], my_status: 'unstarted' };
     broadcast({ type: 'ASSIGNMENT_CREATED', payload: created });
-    logAudit(req.user!, 'assignment_create', 'assignment', created.id, { message: `提出物「${title}」を登録`, subject, deadline });
+    logAudit(req.user!, 'assignment_create', 'assignment', created.id, { message: `提出物「${title}」を登録`, subject, deadline, class_no: classNo });
     notifyImportant(
-      `📝 新しい提出物: ${title}`,
+      `📝 新しい提出物${classNo ? ` (${classNo}組)` : ''}: ${title}`,
       `教科: ${subject || '-'}\n締切: ${deadline ? new Date(deadline).toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' }) : '-'}` +
       `${resubmitDeadline ? `\n再提出締切: ${new Date(resubmitDeadline).toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' })}` : ''}` +
       `${description ? `\n\n${description}` : ''}\n(登録: ${req.user!.username})`
@@ -986,11 +1112,12 @@ app.put('/api/assignments/:id', authMiddleware, async (req: AuthRequest, res) =>
     const id = parseInt(req.params.id, 10);
     const { title, subject, description, deadline, resubmitDeadline } = req.body;
     const before = (await pool.query(`SELECT * FROM assignments WHERE id = $1`, [id])).rows[0];
+    const classNo = req.body.classNo === undefined ? before?.class_no ?? null : req.body.classNo === null ? null : parseClassNo(req.body.classNo);
     const result = await pool.query(
       `UPDATE assignments 
-       SET title = $1, subject = $2, description = $3, deadline = $4, resubmit_deadline = $5 
-       WHERE id = $6 RETURNING *`,
-      [title, subject, description, deadline, resubmitDeadline || null, id]
+       SET title = $1, subject = $2, description = $3, deadline = $4, resubmit_deadline = $5, class_no = $6
+       WHERE id = $7 RETURNING *`,
+      [title, subject, description, deadline, resubmitDeadline || null, classNo, id]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: '提出物が見つかりません' });
@@ -1022,6 +1149,7 @@ app.delete('/api/assignments/:id', authMiddleware, async (req: AuthRequest, res)
       logAudit(req.user!, 'assignment_delete', 'assignment', id, {
         message: `提出物「${d.title}」を削除`,
         title: d.title, subject: d.subject, description: d.description, deadline: d.deadline, resubmit_deadline: d.resubmit_deadline,
+        class_no: d.class_no,
       }, true);
     }
     res.json({ success: true, id });
@@ -1063,15 +1191,18 @@ app.put('/api/assignments/:id/progress', authMiddleware, async (req: AuthRequest
       [assignmentId, userId, status]
     );
 
-    // 全員合格チェック
-    const usersCountRes = await pool.query(`SELECT COUNT(*) FROM users`);
-    const passedCountRes = await pool.query(
-      `SELECT COUNT(*) FROM assignment_progress WHERE assignment_id = $1 AND status = 'passed'`,
-      [assignmentId]
-    );
-
-    const totalUsers = parseInt(usersCountRes.rows[0].count, 10);
-    const passedUsers = parseInt(passedCountRes.rows[0].count, 10);
+    // 全員合格チェック (クラス指定の提出物はそのクラスの人数。そのクラスに誰も設定していなければ全員)
+    const target = (await pool.query(`SELECT class_no FROM assignments WHERE id = $1`, [assignmentId])).rows[0];
+    const classUsers = target?.class_no
+      ? parseInt((await pool.query(`SELECT COUNT(*) FROM users WHERE class_no = $1`, [target.class_no])).rows[0].count, 10)
+      : 0;
+    const byClass = classUsers > 0;
+    const totalUsers = byClass ? classUsers : parseInt((await pool.query(`SELECT COUNT(*) FROM users`)).rows[0].count, 10);
+    const passedUsers = parseInt((await pool.query(
+      `SELECT COUNT(*) FROM assignment_progress p JOIN users u ON u.id = p.user_id
+       WHERE p.assignment_id = $1 AND p.status = 'passed' AND ($2::int IS NULL OR u.class_no = $2)`,
+      [assignmentId, byClass ? target.class_no : null]
+    )).rows[0].count, 10);
 
     let isArchived = false;
     if (totalUsers > 0 && passedUsers >= totalUsers) {
@@ -1087,6 +1218,149 @@ app.put('/api/assignments/:id/progress', authMiddleware, async (req: AuthRequest
     res.json({ success: true, status, isArchived });
   } catch (err) {
     res.status(500).json({ error: '進捗更新エラー' });
+  }
+});
+
+// ---------------- 宿題 (次の授業までにやってくる簡単なもの) ----------------
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function formatHomework(r: any) {
+  return {
+    ...r,
+    due_date: r.due_date instanceof Date
+      ? `${r.due_date.getFullYear()}-${String(r.due_date.getMonth() + 1).padStart(2, '0')}-${String(r.due_date.getDate()).padStart(2, '0')}`
+      : String(r.due_date).slice(0, 10),
+    done_count: Number(r.done_count || 0),
+    my_done: Boolean(r.my_done),
+  };
+}
+
+// 指定クラスでその教科の次の授業日。時間割に無ければ次の平日
+async function homeworkDueDate(classNo: number | null, subject: string) {
+  const today = nowInTokyo().date;
+  const rows = (await pool.query(
+    `SELECT day_of_week, period, subject FROM timetables WHERE schedule_type = 'normal' AND class_no = $1`,
+    [classNo ?? 1]
+  )).rows;
+  const config = await getTimetableConfig();
+  const next = nextLessonDate(rows, subject, today, config.dayPeriodCounts);
+  return { date: next || nextWeekday(today), fromTimetable: Boolean(next) };
+}
+
+app.get('/api/homework/next-lesson', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const classNo = parseClassNo(req.query.classNo) ?? (await classOf(req.user!.id));
+    res.json(await homeworkDueDate(classNo, String(req.query.subject || '')));
+  } catch (err) {
+    res.status(500).json({ error: '次の授業日の取得に失敗しました' });
+  }
+});
+
+// 期限が30日以上前のものは返さない (古いものは定期的に削除)
+app.get('/api/homework', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT h.*, (SELECT COUNT(*) FROM homework_done d WHERE d.homework_id = h.id) AS done_count,
+              EXISTS (SELECT 1 FROM homework_done d WHERE d.homework_id = h.id AND d.user_id = $1) AS my_done
+       FROM homework h WHERE h.due_date >= (NOW() AT TIME ZONE 'Asia/Tokyo')::date - 30
+       ORDER BY h.due_date ASC, h.id ASC`,
+      [req.user!.id]
+    );
+    res.json(result.rows.map(formatHomework));
+  } catch (err) {
+    res.status(500).json({ error: '宿題の取得に失敗しました' });
+  }
+});
+
+function parseHomeworkBody(body: any) {
+  const subject = String(body?.subject || '').trim().slice(0, 50);
+  const content = String(body?.content || '').trim().slice(0, 2000);
+  if (!subject) return { error: '教科を選んでください' };
+  if (!content) return { error: '内容を入力してください' };
+  if (body?.dueDate && !YMD_RE.test(String(body.dueDate))) return { error: '期限の日付が正しくありません' };
+  return { subject, content, dueDate: body?.dueDate ? String(body.dueDate) : null };
+}
+
+app.post('/api/homework', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const hw = parseHomeworkBody(req.body);
+    if ('error' in hw) return res.status(400).json({ error: hw.error });
+    const classNo = req.body.classNo === null ? null : parseClassNo(req.body.classNo) ?? (await classOf(req.user!.id));
+    const due = hw.dueDate || (await homeworkDueDate(classNo, hw.subject)).date;
+    const r = await pool.query(
+      `INSERT INTO homework (class_no, subject, content, due_date, user_id, username) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [classNo, hw.subject, hw.content, due, req.user!.id, req.user!.username]
+    );
+    const created = formatHomework({ ...r.rows[0], done_count: 0, my_done: false });
+    broadcast({ type: 'HOMEWORK_CREATED', payload: { ...created, my_done: false } });
+    logAudit(req.user!, 'homework_create', 'homework', created.id, {
+      message: `宿題「${hw.subject}: ${hw.content.slice(0, 40)}」を登録 (${created.due_date}まで)`, class_no: classNo,
+    });
+    res.json(created);
+  } catch (err) {
+    console.error('Homework create error:', err);
+    res.status(500).json({ error: '宿題の登録に失敗しました' });
+  }
+});
+
+app.put('/api/homework/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const hw = parseHomeworkBody(req.body);
+    if ('error' in hw) return res.status(400).json({ error: hw.error });
+    const before = (await pool.query(`SELECT * FROM homework WHERE id = $1`, [id])).rows[0];
+    if (!before) return res.status(404).json({ error: '宿題が見つかりません' });
+    const classNo = req.body.classNo === undefined ? before.class_no : req.body.classNo === null ? null : parseClassNo(req.body.classNo);
+    const r = await pool.query(
+      `UPDATE homework SET subject = $1, content = $2, due_date = COALESCE($3::date, due_date), class_no = $4 WHERE id = $5 RETURNING *,
+         (SELECT COUNT(*) FROM homework_done d WHERE d.homework_id = homework.id) AS done_count`,
+      [hw.subject, hw.content, hw.dueDate, classNo, id]
+    );
+    const updated = formatHomework(r.rows[0]);
+    // my_done は人によって違うので配信には含めない
+    const { my_done: _ignored, ...shared } = updated;
+    broadcast({ type: 'HOMEWORK_UPDATED', payload: shared });
+    logAudit(req.user!, 'homework_update', 'homework', id, { message: `宿題「${hw.subject}: ${hw.content.slice(0, 40)}」を編集` });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: '宿題の更新に失敗しました' });
+  }
+});
+
+app.delete('/api/homework/:id', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const d = (await pool.query(`DELETE FROM homework WHERE id = $1 RETURNING *`, [id])).rows[0];
+    broadcast({ type: 'HOMEWORK_DELETED', payload: { id } });
+    if (d) {
+      const f = formatHomework(d);
+      logAudit(req.user!, 'homework_delete', 'homework', id, {
+        message: `宿題「${f.subject}: ${String(f.content).slice(0, 40)}」を削除`,
+        class_no: f.class_no, subject: f.subject, content: f.content, due_date: f.due_date, user_id: f.user_id, username: f.username,
+      }, true);
+    }
+    res.json({ success: true, id });
+  } catch (err) {
+    res.status(500).json({ error: '宿題の削除に失敗しました' });
+  }
+});
+
+// 自分の「やった」チェック
+app.put('/api/homework/:id/done', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const done = Boolean(req.body?.done);
+    if (done) {
+      await pool.query(`INSERT INTO homework_done (homework_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [id, req.user!.id]);
+    } else {
+      await pool.query(`DELETE FROM homework_done WHERE homework_id = $1 AND user_id = $2`, [id, req.user!.id]);
+    }
+    const doneCount = parseInt((await pool.query(`SELECT COUNT(*) FROM homework_done WHERE homework_id = $1`, [id])).rows[0].count, 10);
+    broadcast({ type: 'HOMEWORK_PROGRESS', payload: { id, userId: req.user!.id, done, doneCount } });
+    res.json({ id, done, doneCount });
+  } catch (err: any) {
+    if (err.code === '23503') return res.status(404).json({ error: '宿題が見つかりません' });
+    res.status(500).json({ error: '保存に失敗しました' });
   }
 });
 
@@ -1310,6 +1584,8 @@ app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
     });
 
     const allowWrite = req.body.allowActions !== false;
+    // 「Web検索」ボタン: 最初に必ず検索させる (押していない時は AI が必要に応じて判断)
+    const forceWebSearch = req.body.webSearch === true;
     const runTool = createAiToolRunner({
       pool, baseUrl: `http://127.0.0.1:${PORT}`, authHeader: String(req.headers.authorization),
       userId: req.user!.id, username: req.user!.username, allowWrite,
@@ -1318,6 +1594,7 @@ app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
       history,
       tools: aiToolDeclarations(allowWrite),
       runTool,
+      forceFirstTool: forceWebSearch ? 'web_search' : undefined,
       systemInstruction: systemInstruction || aiSystemInstruction(req.user!.username, mergedContext, allowWrite),
     });
     if (steps.some(st => st.write && st.ok)) {
@@ -1340,8 +1617,10 @@ function aiSystemInstruction(username: string, context: object, allowWrite: bool
     `現在は ${jstNowLabel()} (日本時間)、話している相手は ${username} です。「明日」「来週の金曜」などはこの日時を基準に YYYY-MM-DD に直してください。`,
     '時間割・提出物・予定・メモ・チャット・テストの点数・天気などサイト内の情報が関係する質問では、推測せず必ずツールで最新の情報を確認してから答えてください。必要なら複数のツールを組み合わせてください。',
     '「#3」「メモ3」はメモ番号、「#general」はチャンネル名を指します。',
+    'サイトの外の知識・ニュース・最新の情報は web_search で調べ (必要なら read_webpage で本文も読み)、答えの最後に参考にしたページの URL を挙げてください。日本に関する話題は日本語の検索語で調べてください。',
+    '検索結果やページが英語など外国語でも、答えは必ず自然な日本語にしてください (固有名詞・URL はそのままで構いません)。',
     allowWrite
-      ? '提出物の登録・進捗変更、予定の追加、メモへの追記は、ユーザーがはっきり頼んだときだけ実行してください。内容が曖昧なら実行せずに確認してください。削除や上書きはできません。実行したら何をしたかを一言で伝えてください。'
+      ? '提出物・宿題の登録、提出物の進捗変更、予定の追加、メモへの追記は、ユーザーがはっきり頼んだときだけ実行してください。内容が曖昧なら実行せずに確認してください。削除や上書きはできません。実行したら何をしたかを一言で伝えてください。'
       : 'この会話では情報の確認だけができ、登録や変更はできません。',
     '前置きや締めの挨拶は省き、要点だけを日本語で簡潔に答えてください。表や箇条書き (Markdown) を使ってかまいません。',
     `補助情報 (画面の状態, JSON): ${JSON.stringify(context).slice(0, 8000)}`,
@@ -1381,12 +1660,13 @@ app.post('/api/ai/memo-assist', authMiddleware, async (req: AuthRequest, res) =>
 });
 
 // Timetables API
-app.get('/api/timetables', authMiddleware, async (req, res) => {
+// 教科はクラスごとに1つ。短縮・S短は時刻が変わるだけで教科は同じ (schedule_type は常に normal)
+app.get('/api/timetables', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const scheduleType = (req.query.scheduleType as string) || 'normal';
+    const classNo = parseClassNo(req.query.classNo) ?? (await classOf(req.user!.id)) ?? 1;
     const result = await pool.query(
-      `SELECT * FROM timetables WHERE schedule_type = $1 ORDER BY day_of_week ASC, period ASC`,
-      [scheduleType]
+      `SELECT * FROM timetables WHERE schedule_type = 'normal' AND class_no = $1 ORDER BY day_of_week ASC, period ASC`,
+      [classNo]
     );
     res.json(result.rows);
   } catch (err) {
@@ -1467,15 +1747,16 @@ app.put('/api/timetables/config', authMiddleware, async (req: AuthRequest, res) 
 // コマの登録/変更: 同じ曜日・時限は上書き (持ち物・メモは保持)
 app.post('/api/timetables', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { dayOfWeek, period, subject, scheduleType, items, note } = req.body;
+    const { dayOfWeek, period, subject, items, note } = req.body;
     if (dayOfWeek === undefined || !period || !subject) {
       return res.status(400).json({ error: '曜日、時限、教科名は必須です' });
     }
 
-    const type = scheduleType || 'normal';
+    const type = 'normal';
+    const classNo = parseClassNo(req.body.classNo) ?? (await classOf(req.user!.id)) ?? 1;
     const existing = await pool.query(
-      `SELECT * FROM timetables WHERE day_of_week = $1 AND period = $2 AND schedule_type = $3 ORDER BY id ASC`,
-      [dayOfWeek, period, type]
+      `SELECT * FROM timetables WHERE day_of_week = $1 AND period = $2 AND schedule_type = $3 AND class_no = $4 ORDER BY id ASC`,
+      [dayOfWeek, period, type, classNo]
     );
     let row;
     if (existing.rows.length > 0) {
@@ -1490,15 +1771,14 @@ app.post('/api/timetables', authMiddleware, async (req: AuthRequest, res) => {
       )).rows[0];
     } else {
       row = (await pool.query(
-        `INSERT INTO timetables (day_of_week, period, subject, schedule_type, items, note)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [dayOfWeek, period, subject, type, items || '', note || '']
+        `INSERT INTO timetables (day_of_week, period, subject, schedule_type, items, note, class_no)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [dayOfWeek, period, subject, type, items || '', note || '', classNo]
       )).rows[0];
     }
-    broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: type } });
+    broadcast({ type: 'TIMETABLE_UPDATED', payload: { classNo } });
     logAudit(req.user!, 'timetable_set', 'timetable', row.id, {
-      message: `時間割 ${['', '月', '火', '水', '木', '金', '土'][dayOfWeek] || dayOfWeek}曜${period}限 を「${subject}」に設定`,
-      scheduleType: type,
+      message: `${classNo}組の時間割 ${['', '月', '火', '水', '木', '金', '土'][dayOfWeek] || dayOfWeek}曜${period}限 を「${subject}」に設定`,
       before: existing.rows[0]?.subject || null,
     });
     res.json(row);
@@ -1519,9 +1799,9 @@ app.put('/api/timetables/:id', authMiddleware, async (req: AuthRequest, res) => 
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'コマが見つかりません' });
     const row = result.rows[0];
-    broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: row.schedule_type } });
+    broadcast({ type: 'TIMETABLE_UPDATED', payload: { classNo: row.class_no } });
     logAudit(req.user!, 'timetable_detail', 'timetable', id, {
-      message: `時間割 ${['', '月', '火', '水', '木', '金', '土'][row.day_of_week] || row.day_of_week}曜${row.period}限 (${row.subject}) の詳細を更新`,
+      message: `${row.class_no}組の時間割 ${['', '月', '火', '水', '木', '金', '土'][row.day_of_week] || row.day_of_week}曜${row.period}限 (${row.subject}) の詳細を更新`,
       items: row.items,
       note: row.note,
     });
@@ -1536,10 +1816,10 @@ app.delete('/api/timetables/:id', authMiddleware, async (req: AuthRequest, res) 
     const id = parseInt(req.params.id, 10);
     const deleted = await pool.query(`DELETE FROM timetables WHERE id = $1 RETURNING *`, [id]);
     const d = deleted.rows[0];
-    broadcast({ type: 'TIMETABLE_UPDATED', payload: { scheduleType: d?.schedule_type || 'normal' } });
+    broadcast({ type: 'TIMETABLE_UPDATED', payload: { classNo: d?.class_no ?? null } });
     if (d) {
       logAudit(req.user!, 'timetable_delete', 'timetable', id, {
-        message: `時間割 ${['', '月', '火', '水', '木', '金', '土'][d.day_of_week] || d.day_of_week}曜${d.period}限 (${d.subject}) を削除`,
+        message: `${d.class_no}組の時間割 ${['', '月', '火', '水', '木', '金', '土'][d.day_of_week] || d.day_of_week}曜${d.period}限 (${d.subject}) を削除`,
       });
     }
     res.json({ success: true });
@@ -1780,29 +2060,61 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
 });
 
 // Audit Logs & Users List
+// action: 種類の前方一致 / user: ユーザーID または 'system' (操作者なし)
+function auditWhere(query: { action?: any; user?: any; beforeId?: any }) {
+  const params: any[] = [];
+  const where: string[] = [];
+  const beforeId = parseInt(String(query.beforeId || ''), 10) || 0;
+  if (beforeId) {
+    params.push(beforeId);
+    where.push(`id < $${params.length}`);
+  }
+  if (query.action) {
+    params.push(`${String(query.action)}%`);
+    where.push(`action LIKE $${params.length}`);
+  }
+  if (query.user === 'system') {
+    where.push('user_id IS NULL');
+  } else if (query.user && Number.isFinite(Number(query.user))) {
+    params.push(Number(query.user));
+    where.push(`user_id = $${params.length}`);
+  }
+  return { params, sql: where.length ? `WHERE ${where.join(' AND ')}` : '' };
+}
+
 app.get('/api/audit-logs', authMiddleware, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string, 10) || 100, 500);
-    const beforeId = parseInt(req.query.beforeId as string, 10) || 0;
-    const action = (req.query.action as string) || '';
-    const params: any[] = [];
-    const where: string[] = [];
-    if (beforeId) {
-      params.push(beforeId);
-      where.push(`id < $${params.length}`);
-    }
-    if (action) {
-      params.push(`${action}%`);
-      where.push(`action LIKE $${params.length}`);
-    }
+    const { params, sql } = auditWhere(req.query);
     params.push(limit);
-    const result = await pool.query(
-      `SELECT * FROM audit_logs ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY id DESC LIMIT $${params.length}`,
-      params
-    );
+    const result = await pool.query(`SELECT * FROM audit_logs ${sql} ORDER BY id DESC LIMIT $${params.length}`, params);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: '監査ログ取得エラー' });
+  }
+});
+
+// 表示中の条件 (種類・ユーザー) の直近のログを AI が要約
+app.post('/api/audit-logs/summarize', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { params, sql } = auditWhere({ action: req.body?.action, user: req.body?.user });
+    params.push(200);
+    const rows = (await pool.query(`SELECT * FROM audit_logs ${sql} ORDER BY id DESC LIMIT $${params.length}`, params)).rows;
+    if (rows.length === 0) return res.status(400).json({ error: '要約するログがありません' });
+    const lines = rows.reverse().map(r => {
+      const d = typeof r.details === 'string' ? (() => { try { return JSON.parse(r.details); } catch { return {}; } })() : (r.details || {});
+      const at = new Date(r.created_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      return `${at} ${r.username || 'system'}: ${String(d.message || `${r.action} (${r.target_type})`).slice(0, 160)}${r.restored ? ' [復元済み]' : ''}`;
+    });
+    const summary = await askGemini(
+      `asdfbase の監査ログ (古い順, ${rows.length}件) です。\n${lines.join('\n')}\n\n` +
+      '誰がいつ何をしたかの傾向、目立つ操作 (削除・設定変更・ログイン失敗など)、注意した方がよい点を日本語でまとめてください。',
+      '前置きは省き、Markdown の見出しと箇条書きで簡潔に答えてください。推測で事実を作らないでください。'
+    );
+    res.json({ summary, count: rows.length });
+  } catch (err) {
+    console.error('Audit summarize error:', err);
+    res.status(500).json({ error: '監査ログの要約に失敗しました' });
   }
 });
 
@@ -1854,10 +2166,17 @@ app.post('/api/audit-logs/:id/restore', authMiddleware, async (req: AuthRequest,
     } else if (log.target_type === 'assignment' && log.details) {
       const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
       const r = await pool.query(
-        `INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [details.title, details.subject, details.description, details.deadline || new Date(), details.resubmit_deadline || null]
+        `INSERT INTO assignments (title, subject, description, deadline, resubmit_deadline, class_no) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [details.title, details.subject, details.description, details.deadline || new Date(), details.resubmit_deadline || null, details.class_no ?? null]
       );
       broadcast({ type: 'ASSIGNMENT_CREATED', payload: { ...r.rows[0], my_status: 'unstarted' } });
+    } else if (log.target_type === 'homework' && log.details) {
+      const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
+      const r = await pool.query(
+        `INSERT INTO homework (class_no, subject, content, due_date, user_id, username) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [details.class_no ?? null, details.subject, details.content, details.due_date, details.user_id ?? null, details.username ?? null]
+      );
+      broadcast({ type: 'HOMEWORK_CREATED', payload: formatHomework({ ...r.rows[0], done_count: 0, my_done: false }) });
     } else if (log.target_type === 'message' && log.details) {
       const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
       const r = await pool.query(
@@ -2015,11 +2334,24 @@ app.post('/api/auth/change-password', authMiddleware, async (req: AuthRequest, r
 app.get('/api/users', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, role, status, custom_status, avatar_url, last_active_at FROM users ORDER BY username ASC`
+      `SELECT id, username, role, status, custom_status, avatar_url, class_no, last_active_at FROM users ORDER BY username ASC`
     );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'ユーザー一覧取得エラー' });
+  }
+});
+
+app.put('/api/users/me/settings', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.body?.classNo === undefined) return res.status(400).json({ error: '変更する項目がありません' });
+    const classNo = req.body.classNo === null ? null : parseClassNo(req.body.classNo);
+    if (req.body.classNo !== null && classNo === null) return res.status(400).json({ error: 'クラスは 1〜6 組から選んでください' });
+    await pool.query(`UPDATE users SET class_no = $1 WHERE id = $2`, [classNo, req.user!.id]);
+    broadcast({ type: 'USER_UPDATED', payload: { id: req.user!.id, class_no: classNo } });
+    res.json({ class_no: classNo });
+  } catch (err) {
+    res.status(500).json({ error: '設定の保存に失敗しました' });
   }
 });
 
@@ -2599,6 +2931,7 @@ const DEFAULT_RETENTION_DAYS = 30;
 const RETENTION_CHOICES = [0, 7, 14, 30, 60, 90];
 const NOTE_HISTORY_KEEP = 30;
 const AUDIT_LOG_DAYS = 180;
+const HOMEWORK_KEEP_DAYS = 60;
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 // メッセージが Discord に残る (Bot同期 or メッセージ Webhook) チャンネル
@@ -2682,6 +3015,7 @@ async function runRetention() {
       [NOTE_HISTORY_KEEP]
     );
     await pool.query(`DELETE FROM audit_logs WHERE created_at < NOW() - make_interval(days => $1)`, [AUDIT_LOG_DAYS]);
+    await pool.query(`DELETE FROM homework WHERE due_date < (NOW() AT TIME ZONE 'Asia/Tokyo')::date - $1::int`, [HOMEWORK_KEEP_DAYS]);
     await setSetting('chat_retention_last', JSON.stringify({ at: new Date().toISOString(), messages: deletedMessages, files: deletedFiles }));
     if (deletedMessages > 0) console.log(`[retention] deleted ${deletedMessages} messages, ${deletedFiles} files`);
   } finally {
@@ -2700,10 +3034,6 @@ server.listen(PORT, async () => {
     await initDb();
     // 再起動直後は全員オフライン扱いにし、接続/アクセスで復帰させる
     await pool.query(`UPDATE users SET status = 'offline'`);
-    await pool.query(`
-      ALTER TABLE timetables ADD COLUMN IF NOT EXISTS items TEXT DEFAULT '';
-      ALTER TABLE timetables ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
-    `).catch(err => console.warn('Timetable migration warning:', err.message));
     await ensureNoteSlots();
   } catch (err) {
     console.error('DB Init failed:', err);
@@ -2713,16 +3043,49 @@ server.listen(PORT, async () => {
       getSetting,
       setSetting,
       listAsdfChannels: async () => (await pool.query(`SELECT id, name, type FROM channels ORDER BY position ASC, id ASC`)).rows,
-      ingest: async (asdfChannelId, username, content) => {
+      ingest: async (asdfChannelId, username, content, meta) => {
         const result = await pool.query(
-          `INSERT INTO messages (channel_id, user_id, username, content) VALUES ($1, NULL, $2, $3) RETURNING *`,
-          [asdfChannelId, username, content]
+          `INSERT INTO messages (channel_id, user_id, username, content, author_avatar) VALUES ($1, NULL, $2, $3, $4) RETURNING *`,
+          [asdfChannelId, username, content, meta.avatarUrl]
         );
-        broadcast({ type: 'NEW_MESSAGE', payload: { ...result.rows[0], sender_username: username } });
+        const saved = result.rows[0];
+        if (meta.discordMessageId) {
+          await pool.query(
+            `INSERT INTO discord_message_links (asdf_message_id, discord_channel_id, discord_message_id, direction)
+             VALUES ($1, $2, $3, 'in') ON CONFLICT DO NOTHING`,
+            [saved.id, meta.discordChannelId, meta.discordMessageId]
+          );
+        }
+        broadcast({ type: 'NEW_MESSAGE', payload: { ...saved, sender_username: username } });
+      },
+      ingestEdit: async (discordMessageId, content) => {
+        const rows = (await pool.query(
+          `UPDATE messages m SET content = $1, updated_at = NOW(), edited_at = NOW()
+           FROM discord_message_links l
+           WHERE l.discord_message_id = $2 AND l.direction = 'in' AND l.asdf_message_id = m.id AND m.content IS DISTINCT FROM $1
+           RETURNING m.*`,
+          [content, discordMessageId]
+        )).rows;
+        for (const r of rows) {
+          const [updated] = await attachReplies([{ ...r, sender_username: r.username }]);
+          broadcast({ type: 'MESSAGE_UPDATED', payload: updated });
+        }
       },
       saveImage: async (buf) => {
         const filename = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.webp`;
         await sharp(buf, { animated: false }).resize({ width: 1600, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(UPLOAD_DIR, filename));
+        return `/uploads/${filename}`;
+      },
+      saveAvatar: async (key, url) => {
+        // ブラウザから Discord の CDN を直接読まないよう、サーバーに保存してから使う
+        const filename = `discord-avatar-${key.replace(/[^A-Za-z0-9_-]/g, '')}.webp`;
+        const file = path.join(UPLOAD_DIR, filename);
+        if (!fs.existsSync(file)) {
+          const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const buf = Buffer.from(await res.arrayBuffer());
+          await sharp(buf, { animated: false }).resize({ width: 96, height: 96, fit: 'cover' }).webp({ quality: 80 }).toFile(file);
+        }
         return `/uploads/${filename}`;
       },
       uploadDir: UPLOAD_DIR,

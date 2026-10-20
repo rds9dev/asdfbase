@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Bot, Check, Copy, FileText, Image as ImageIcon, Plus, Search, Send, Sparkles, Trash2, Wrench, X } from 'lucide-react';
+import { Bot, Check, Copy, FileText, Globe, Image as ImageIcon, Plus, Search, Send, Sparkles, Trash2, Wrench, X } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
 
 interface AiStep {
@@ -83,6 +83,8 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [images, setImages] = useState<PendingImage[]>([]);
+  // 「Web検索」ボタン: 押した時はこの質問で必ず検索する (押さなくても AI が必要と判断すれば検索する)
+  const [forceWebSearch, setForceWebSearch] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   // 少しずつ表示中のメッセージ
   const [reveal, setReveal] = useState<{ id: number; shown: number } | null>(null);
@@ -138,6 +140,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
     const text = (preset ?? input).trim();
     if ((!text && images.length === 0) || loading) return;
     const sentImages = images;
+    const webSearch = forceWebSearch;
     const userMsg: AiMessage = {
       id: Date.now(), role: 'user', content: text || 'この画像について教えて', timestamp: timeNow(),
       thumbs: sentImages.length ? sentImages.map(im => im.thumb) : undefined,
@@ -146,6 +149,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
     setMessages(next);
     setInput('');
     setImages([]);
+    setForceWebSearch(false);
     if (inputRef.current) inputRef.current.style.height = 'auto';
     setLoading(true);
     try {
@@ -156,6 +160,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
           messages: next.filter(m => !m.error).slice(-30).map(m => ({ role: m.role, content: m.content })),
           contextData: buildContext(),
           images: sentImages.map(im => ({ mimeType: im.mimeType, data: im.data })),
+          webSearch,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -272,7 +277,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
                                 : 'border-stone-700 bg-stone-900 text-stone-400'
                           }`}
                         >
-                          {!st.ok ? <X className="w-3 h-3" /> : st.write ? <Check className="w-3 h-3" /> : st.name.startsWith('search') ? <Search className="w-3 h-3" /> : <Wrench className="w-3 h-3" />}
+                          {!st.ok ? <X className="w-3 h-3" /> : st.write ? <Check className="w-3 h-3" /> : st.name === 'web_search' || st.name === 'read_webpage' ? <Globe className="w-3 h-3" /> : st.name.startsWith('search') ? <Search className="w-3 h-3" /> : <Wrench className="w-3 h-3" />}
                           {st.label}
                         </span>
                       ))}
@@ -339,6 +344,17 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
                 <button onClick={() => fileRef.current?.click()} disabled={images.length >= 4} className="btn-chip disabled:opacity-40">
                   <ImageIcon className="w-3 h-3 text-amber-400" /> 画像を添付
                 </button>
+                <button
+                  onClick={() => {
+                    setForceWebSearch(v => !v);
+                    inputRef.current?.focus();
+                  }}
+                  aria-pressed={forceWebSearch}
+                  title="オンにすると、次の質問で必ずインターネットを検索してから答えます (オフでも必要なら AI が自分で検索します)"
+                  className={`btn-chip ${forceWebSearch ? '!bg-sky-500/20 !border-sky-400/60 !text-sky-200 font-bold' : ''}`}
+                >
+                  <Globe className={`w-3 h-3 ${forceWebSearch ? 'text-sky-300' : 'text-amber-400'}`} /> Web検索{forceWebSearch ? ' ON' : ''}
+                </button>
                 <input
                   ref={fileRef}
                   type="file"
@@ -390,7 +406,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
                       send();
                     }
                   }}
-                  placeholder="質問や頼みごとを入力 (Shift+Enter で改行・Ctrl+V で画像)"
+                  placeholder={forceWebSearch ? 'Web で調べたいことを入力' : '質問や頼みごとを入力 (Shift+Enter で改行・Ctrl+V で画像)'}
                   className="flex-1 bg-transparent text-sm text-stone-100 placeholder-stone-600 focus:outline-none resize-none leading-relaxed max-h-[180px] py-0.5"
                 />
                 <button

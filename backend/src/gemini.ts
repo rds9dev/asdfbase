@@ -1,4 +1,4 @@
-import { GoogleGenAI, type Content, type FunctionDeclaration, type GenerateContentResponse } from '@google/genai';
+import { GoogleGenAI, FunctionCallingConfigMode, type Content, type FunctionDeclaration, type GenerateContentResponse } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -108,6 +108,8 @@ export interface AgentInput {
   tools: FunctionDeclaration[];
   runTool: (name: string, args: any) => Promise<{ step: AgentStep; response: Record<string, unknown> }>;
   maxSteps?: number;
+  // 最初の1回だけ必ずこのツールを呼ばせる (例: 「Web検索」ボタンが押された時の web_search)
+  forceFirstTool?: string;
 }
 
 // 一度成功したキーとモデルは、同じ会話の続きでも使い続ける (途中でモデルが変わると関数呼び出しの文脈が崩れるため)
@@ -153,7 +155,11 @@ export async function runGeminiAgent(input: AgentInput): Promise<{ text: string;
 
   for (let round = 0; round <= maxSteps; round++) {
     // 上限に達したらツールなしで答えさせる
-    const roundConfig = round === maxSteps ? { systemInstruction: input.systemInstruction } : config;
+    const roundConfig = round === maxSteps
+      ? { systemInstruction: input.systemInstruction }
+      : round === 0 && input.forceFirstTool && input.tools.some(t => t.name === input.forceFirstTool)
+        ? { ...config, toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.ANY, allowedFunctionNames: [input.forceFirstTool] } } }
+        : config;
     const response = await generateWithFallback(contents, roundConfig, pinned);
     const calls = response.functionCalls || [];
     if (calls.length === 0) {
