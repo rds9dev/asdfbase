@@ -762,7 +762,9 @@ export default function App() {
       clearTimeout(timer);
       let ok = false;
       try {
-        const res = await fetch(`${getApiBaseUrl()}/api/weather`, { cache: 'no-store' });
+        const headers: Record<string, string> = {};
+        if (tokenRef.current) headers['Authorization'] = `Bearer ${tokenRef.current}`;
+        const res = await fetch(`${getApiBaseUrl()}/api/weather`, { cache: 'no-store', headers });
         if (res.ok) {
           const data = await res.json();
           if (data && typeof data.temp === 'number' && data.source !== 'fallback') {

@@ -395,7 +395,7 @@ async function getWeather() {
     });
     return weatherInFlight;
 }
-app.get('/api/weather', authMiddleware, async (req, res) => {
+app.get('/api/weather', async (req, res) => {
     res.json(await getWeather());
 });
 // Register
