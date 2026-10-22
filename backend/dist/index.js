@@ -11,6 +11,7 @@ exports.notifyImportant = notifyImportant;
 exports.relayMessage = relayMessage;
 exports.logAudit = logAudit;
 exports.authMiddleware = authMiddleware;
+exports.adminOnly = adminOnly;
 const express_1 = __importDefault(require("express"));
 const http_1 = __importDefault(require("http"));
 const ws_1 = require("ws");
@@ -184,11 +185,17 @@ const upload = (0, multer_1.default)({
     limits: { fileSize: 15 * 1024 * 1024 },
 });
 function authMiddleware(req, res, next) {
+    let token = '';
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
+    }
+    else if (req.query.token && typeof req.query.token === 'string') {
+        token = req.query.token;
+    }
+    if (!token) {
         return res.status(401).json({ error: '認証トークンがありません' });
     }
-    const token = authHeader.split(' ')[1];
     try {
         const decoded = jsonwebtoken_1.default.verify(token, JWT_SECRET);
         req.user = decoded;
@@ -197,6 +204,12 @@ function authMiddleware(req, res, next) {
     catch (err) {
         return res.status(401).json({ error: '無効または期限切れのトークンです' });
     }
+}
+function adminOnly(req, res, next) {
+    if (!req.user || req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'この操作には管理者権限が必要です' });
+    }
+    next();
 }
 // 自分のクラス (1〜6組)。時間割・提出物・宿題の既定の表示に使う
 exports.CLASS_NUMBERS = [1, 2, 3, 4, 5, 6];
@@ -382,7 +395,7 @@ async function getWeather() {
     });
     return weatherInFlight;
 }
-app.get('/api/weather', async (req, res) => {
+app.get('/api/weather', authMiddleware, async (req, res) => {
     res.json(await getWeather());
 });
 // Register
@@ -503,13 +516,17 @@ app.get('/api/channels', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'チャンネル取得エラー' });
     }
 });
-app.post('/api/channels', authMiddleware, async (req, res) => {
+app.post('/api/channels', authMiddleware, adminOnly, async (req, res) => {
     try {
         const { name, type } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ error: 'チャンネル名を入力してください' });
         }
         const cleanName = name.trim().toLowerCase().replace(/\s+/g, '-');
+        const existing = await db_js_1.pool.query(`SELECT id FROM channels WHERE name = $1`, [cleanName]);
+        if (existing.rows.length > 0) {
+            return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
+        }
         const chType = type === 'voice' ? 'voice' : 'text';
         const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
         const nextPos = parseInt(maxPosRes.rows[0].max_pos, 10) + 1;
@@ -525,7 +542,34 @@ app.post('/api/channels', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'チャンネル作成に失敗しました' });
     }
 });
-app.put('/api/channels/reorder', authMiddleware, async (req, res) => {
+app.put('/api/channels/:id', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const { name } = req.body;
+        if (!name || !name.trim()) {
+            return res.status(400).json({ error: 'チャンネル名を入力してください' });
+        }
+        const cleanName = name.trim().toLowerCase().replace(/\s+/g, '-');
+        const existing = await db_js_1.pool.query(`SELECT id FROM channels WHERE name = $1 AND id != $2`, [cleanName, id]);
+        if (existing.rows.length > 0) {
+            return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
+        }
+        const result = await db_js_1.pool.query(`UPDATE channels SET name = $1 WHERE id = $2 RETURNING *`, [cleanName, id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'チャンネルが見つかりません' });
+        }
+        const updatedChannel = result.rows[0];
+        broadcast({ type: 'CHANNEL_UPDATED', payload: updatedChannel });
+        logAudit(req.user, 'channel_update', 'channel', id, { message: `チャンネル #${cleanName} に名前変更` });
+        (0, discord_js_1.refreshDiscordCommands)();
+        res.json(updatedChannel);
+    }
+    catch (err) {
+        console.error('Channel update error:', err);
+        res.status(500).json({ error: 'チャンネル更新に失敗しました' });
+    }
+});
+app.put('/api/channels/reorder', authMiddleware, adminOnly, async (req, res) => {
     try {
         const { channelIds } = req.body;
         if (!Array.isArray(channelIds)) {
@@ -543,7 +587,7 @@ app.put('/api/channels/reorder', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'チャンネル順序の変更に失敗しました' });
     }
 });
-app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
+app.delete('/api/channels/:id', authMiddleware, adminOnly, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
         const countRes = await db_js_1.pool.query(`SELECT COUNT(*) FROM channels`);
@@ -1422,14 +1466,16 @@ app.post('/api/ai/chat', authMiddleware, async (req, res) => {
             return { role: m.role === 'model' ? 'model' : 'user', parts };
         });
         const allowWrite = req.body.allowActions !== false;
+        const modelMode = req.body.modelMode === 'thinking' ? 'thinking' : 'fast';
         // 「Web検索」ボタン: 最初に必ず検索させる (押していない時は AI が必要に応じて判断)
         const forceWebSearch = req.body.webSearch === true;
         const runTool = (0, aiTools_js_1.createAiToolRunner)({
             pool: db_js_1.pool, baseUrl: `http://127.0.0.1:${PORT}`, authHeader: String(req.headers.authorization),
             userId: req.user.id, username: req.user.username, allowWrite,
         });
-        const { text, steps } = await (0, gemini_js_1.runGeminiAgent)({
+        const { text, steps, modelUsed } = await (0, gemini_js_1.runGeminiAgent)({
             history,
+            mode: modelMode,
             tools: (0, aiTools_js_1.aiToolDeclarations)(allowWrite),
             runTool,
             forceFirstTool: forceWebSearch ? 'web_search' : undefined,
@@ -1438,11 +1484,123 @@ app.post('/api/ai/chat', authMiddleware, async (req, res) => {
         if (steps.some(st => st.write && st.ok)) {
             logAudit(req.user, 'ai_action', 'ai', null, { message: `AI が操作を実行: ${steps.filter(st => st.write && st.ok).map(st => st.label).join(' / ')}` });
         }
-        res.json({ reply: text, steps, keyCount: (0, gemini_js_1.getAvailableKeyCount)(), resolvedReferences: Object.keys(dynamicReferences) });
+        res.json({ reply: text, steps, modelUsed, keyCount: (0, gemini_js_1.getAvailableKeyCount)(), resolvedReferences: Object.keys(dynamicReferences) });
     }
     catch (err) {
         console.error('AI chat error:', err);
         res.status(500).json({ error: `AI応答エラー: ${err.message || '不明なエラー'}` });
+    }
+});
+// AI利用枠・統計取得 (5枠ローテーション & PTリセット)
+app.get('/api/ai/usage', authMiddleware, (_req, res) => {
+    res.json((0, gemini_js_1.getAiUsageStats)());
+});
+// Discord GIF・画像プロキシ (Chromebook i-FILTER 回避)
+app.get('/api/proxy/media', async (req, res) => {
+    try {
+        const token = req.query.token || (req.headers.authorization || '').replace('Bearer ', '');
+        if (!verifyToken(token)) {
+            return res.status(401).json({ error: '認証が必要です' });
+        }
+        const rawUrl = req.query.url;
+        if (!rawUrl)
+            return res.status(400).json({ error: 'url パラメータが必要です' });
+        let targetUrl;
+        try {
+            targetUrl = new URL(rawUrl);
+        }
+        catch {
+            return res.status(400).json({ error: '無効なURL形式です' });
+        }
+        const allowedHosts = [
+            'cdn.discordapp.com',
+            'media.discordapp.net',
+            'images-ext-1.discordapp.net',
+            'images-ext-2.discordapp.net',
+            'tenor.com',
+            'c.tenor.com',
+            'media.tenor.com',
+            'giphy.com',
+            'media.giphy.com',
+            'i.giphy.com',
+        ];
+        const host = targetUrl.hostname.toLowerCase();
+        const isAllowed = allowedHosts.some(h => host === h || host.endsWith('.' + h));
+        if (!isAllowed) {
+            return res.status(403).json({ error: '許可されていないホストです' });
+        }
+        const fetchRes = await fetch(targetUrl.href, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            },
+            signal: AbortSignal.timeout(15000),
+        });
+        if (!fetchRes.ok) {
+            return res.status(fetchRes.status).json({ error: `メディア取得エラー: ${fetchRes.status}` });
+        }
+        const contentType = fetchRes.headers.get('content-type') || 'application/octet-stream';
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+        const arrayBuffer = await fetchRes.arrayBuffer();
+        res.send(Buffer.from(arrayBuffer));
+    }
+    catch (err) {
+        console.error('Media proxy error:', err.message);
+        res.status(502).json({ error: `プロキシ通信エラー: ${err.message}` });
+    }
+});
+// お知らせ API (admin限定作成・全ユーザー取得)
+app.get('/api/announcements', authMiddleware, async (_req, res) => {
+    try {
+        const result = await db_js_1.pool.query(`SELECT * FROM announcements ORDER BY id DESC LIMIT 50`);
+        res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'お知らせ取得エラー' });
+    }
+});
+app.post('/api/announcements', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const { title, content, notifyDiscord = true } = req.body || {};
+        if (!title || !title.trim()) {
+            return res.status(400).json({ error: 'タイトルを入力してください' });
+        }
+        const cleanTitle = title.trim().slice(0, 200);
+        const cleanContent = String(content || '').trim().slice(0, 5000);
+        const result = await db_js_1.pool.query(`INSERT INTO announcements (user_id, username, title, content) VALUES ($1, $2, $3, $4) RETURNING *`, [req.user.id, req.user.username, cleanTitle, cleanContent]);
+        const saved = result.rows[0];
+        broadcast({ type: 'ANNOUNCEMENT_CREATED', payload: saved });
+        logAudit(req.user, 'announcement_create', 'announcement', saved.id, { message: `お知らせ「${cleanTitle}」を作成` });
+        if (notifyDiscord) {
+            notifyImportant(`📢 【お知らせ】${cleanTitle}`, `${cleanContent}\n\n*(投稿者: ${req.user.username})*`, 0x3b82f6);
+        }
+        res.json(saved);
+    }
+    catch (err) {
+        console.error('Create announcement error:', err);
+        res.status(500).json({ error: 'お知らせ作成に失敗しました' });
+    }
+});
+app.delete('/api/announcements/:id', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        await db_js_1.pool.query(`DELETE FROM announcements WHERE id = $1`, [id]);
+        broadcast({ type: 'ANNOUNCEMENT_DELETED', payload: { id } });
+        logAudit(req.user, 'announcement_delete', 'announcement', id, { message: `お知らせ ID ${id} を削除` });
+        res.json({ success: true, id });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'お知らせ削除に失敗しました' });
+    }
+});
+// Discord サーバー状態 & プレゼンス取得
+app.get('/api/discord/guild-status', authMiddleware, async (_req, res) => {
+    try {
+        const status = await (0, discord_js_1.getDiscordGuildStatus)();
+        res.json(status);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'Discord状態取得エラー' });
     }
 });
 function jstNowLabel() {
@@ -2047,7 +2205,7 @@ app.get('/api/settings/integrations', authMiddleware, async (req, res) => {
         res.status(500).json({ error: '連携設定取得エラー' });
     }
 });
-app.post('/api/settings/integrations', authMiddleware, async (req, res) => {
+app.post('/api/settings/integrations', authMiddleware, adminOnly, async (req, res) => {
     try {
         const { importantWebhookUrl, messageWebhookUrl, importantEnabled, messagesEnabled, chatRetentionDays } = req.body || {};
         const isWebhook = (u) => typeof u === 'string' && (u === '' || /^https:\/\/(discord|discordapp)\.com\/api\/webhooks\//.test(u));
@@ -2066,8 +2224,6 @@ app.post('/api/settings/integrations', authMiddleware, async (req, res) => {
         if (messagesEnabled !== undefined)
             await setSetting('notify_messages_enabled', messagesEnabled ? 'on' : 'off');
         if (chatRetentionDays !== undefined) {
-            if (req.user.role !== 'admin')
-                return res.status(403).json({ error: '自動削除の設定は管理者だけが変更できます' });
             const days = Number(chatRetentionDays);
             if (!RETENTION_CHOICES.includes(days))
                 return res.status(400).json({ error: '保存期間の値が正しくありません' });
@@ -2084,7 +2240,7 @@ app.post('/api/settings/integrations', authMiddleware, async (req, res) => {
         res.status(500).json({ error: '連携設定保存エラー' });
     }
 });
-app.post('/api/settings/integrations/test', authMiddleware, async (req, res) => {
+app.post('/api/settings/integrations/test', authMiddleware, adminOnly, async (req, res) => {
     try {
         const { kind } = req.body || {};
         const url = kind === 'message' ? await getSetting('discord_message_webhook_url', '') : await getDiscordWebhookUrl();

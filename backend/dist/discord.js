@@ -7,6 +7,7 @@ exports.getBoundAsdfChannelIds = getBoundAsdfChannelIds;
 exports.isDiscordBotConfigured = isDiscordBotConfigured;
 exports.getDiscordStatus = getDiscordStatus;
 exports.refreshDiscordCommands = refreshDiscordCommands;
+exports.getDiscordGuildStatus = getDiscordGuildStatus;
 exports.getDiscordVoiceStatus = getDiscordVoiceStatus;
 exports.relayToDiscordBot = relayToDiscordBot;
 exports.relayReactionToDiscord = relayReactionToDiscord;
@@ -215,6 +216,78 @@ function formatEmbeds(embeds) {
         }
     }
     return parts;
+}
+async function getDiscordGuildStatus() {
+    if (!client || !connected || allowedGuildIds.length === 0) {
+        return {
+            enabled: Boolean(client),
+            connected,
+            guildId: null,
+            guildName: null,
+            memberCount: 0,
+            onlineCount: 0,
+            members: [],
+            voiceChannels: [],
+        };
+    }
+    const gid = allowedGuildIds[0];
+    const guild = client.guilds.cache.get(gid);
+    if (!guild) {
+        return {
+            enabled: true,
+            connected: false,
+            guildId: gid,
+            guildName: null,
+            memberCount: 0,
+            onlineCount: 0,
+            members: [],
+            voiceChannels: [],
+        };
+    }
+    // メンバーの取得
+    let members = [];
+    try {
+        const fetched = await guild.members.fetch({ time: 5000 }).catch(() => guild.members.cache);
+        members = Array.from(fetched.values()).map(m => {
+            const presence = m.presence;
+            const status = presence?.status || 'offline';
+            const acts = presence?.activities || [];
+            const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2);
+            const activityText = gameAct ? `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}` : null;
+            return {
+                id: m.id,
+                username: m.user.username,
+                displayName: m.displayName || m.user.globalName || m.user.username,
+                avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
+                status: status,
+                activity: activityText,
+                roles: m.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).slice(0, 5),
+            };
+        });
+    }
+    catch (_) {
+        // フォールバック: キャッシュから
+        members = Array.from(guild.members.cache.values()).map(m => ({
+            id: m.id,
+            username: m.user.username,
+            displayName: m.displayName || m.user.username,
+            avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
+            status: (m.presence?.status || 'offline'),
+            activity: null,
+            roles: [],
+        }));
+    }
+    const onlineMembers = members.filter(m => m.status !== 'offline');
+    return {
+        enabled: true,
+        connected: true,
+        guildId: guild.id,
+        guildName: guild.name,
+        memberCount: guild.memberCount || members.length,
+        onlineCount: onlineMembers.length,
+        members: members.slice(0, 50),
+        voiceChannels: getDiscordVoiceStatus(),
+    };
 }
 function getDiscordVoiceStatus() {
     if (!client || !connected)
@@ -477,31 +550,32 @@ async function editRelayedOnDiscord(links, username, content) {
     }
     return edited;
 }
-function createClient(withMessageContent) {
+function createClient(_withMessageContent) {
+    // 特権インテント (GuildMembers, GuildPresences, MessageContent) を全て有効化
     const intents = [
         discord_js_1.GatewayIntentBits.Guilds,
+        discord_js_1.GatewayIntentBits.GuildMembers,
+        discord_js_1.GatewayIntentBits.GuildPresences,
         discord_js_1.GatewayIntentBits.GuildMessages,
         discord_js_1.GatewayIntentBits.GuildMessageTyping,
         discord_js_1.GatewayIntentBits.GuildMessageReactions,
         discord_js_1.GatewayIntentBits.GuildVoiceStates,
+        discord_js_1.GatewayIntentBits.MessageContent,
     ];
-    if (withMessageContent)
-        intents.push(discord_js_1.GatewayIntentBits.MessageContent);
     return new discord_js_1.Client({
         intents,
         // キャッシュしていないメッセージの編集・リアクションも受け取る
-        partials: [discord_js_1.Partials.Message, discord_js_1.Partials.Channel, discord_js_1.Partials.Reaction],
-        // VPS のメモリ節約のためキャッシュを最小限に
+        partials: [discord_js_1.Partials.Message, discord_js_1.Partials.Channel, discord_js_1.Partials.Reaction, discord_js_1.Partials.GuildMember, discord_js_1.Partials.User],
         makeCache: discord_js_1.Options.cacheWithLimits({
             ...discord_js_1.Options.DefaultMakeCacheSettings,
             MessageManager: 0,
-            PresenceManager: 0,
+            PresenceManager: 200,
             ReactionManager: 0,
-            GuildMemberManager: 100,
+            GuildMemberManager: 200,
             UserManager: 200,
             GuildEmojiManager: 0,
             GuildStickerManager: 0,
-            VoiceStateManager: 0,
+            VoiceStateManager: 50,
         }),
     });
 }

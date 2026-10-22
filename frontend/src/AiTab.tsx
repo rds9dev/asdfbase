@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Bot, Check, Copy, FileText, Globe, Image as ImageIcon, Plus, Search, Send, Sparkles, Trash2, Wrench, X } from 'lucide-react';
+import { Bot, Check, Copy, Globe, Image as ImageIcon, Plus, Search, Send, Sparkles, Trash2, Wrench, X, Zap, Brain, Activity, Info } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
 
 interface AiStep {
@@ -83,6 +83,10 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [images, setImages] = useState<PendingImage[]>([]);
+  // モデル切り替え: 高速 (gemini-3.5-flash-lite) / 思考 (gemini-3.8-flash)
+  const [modelMode, setModelMode] = useState<'fast' | 'thinking'>('fast');
+  const [usageStats, setUsageStats] = useState<any>(null);
+  const [showUsageModal, setShowUsageModal] = useState(false);
   // 「Web検索」ボタン: 押した時はこの質問で必ず検索する (押さなくても AI が必要と判断すれば検索する)
   const [forceWebSearch, setForceWebSearch] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -90,6 +94,21 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const [reveal, setReveal] = useState<{ id: number; shown: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // 利用枠統計の取得
+  const fetchUsage = async () => {
+    try {
+      const res = await safeFetch('/api/ai/usage', { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) {
+        const data = await res.json();
+        setUsageStats(data);
+      }
+    } catch (_) {}
+  };
+
+  useEffect(() => {
+    if (active) fetchUsage();
+  }, [active]);
 
   useEffect(() => {
     try {
@@ -161,6 +180,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
           contextData: buildContext(),
           images: sentImages.map(im => ({ mimeType: im.mimeType, data: im.data })),
           webSearch,
+          modelMode,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -172,6 +192,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
       if (reply.steps?.some(st => st.write && st.ok)) toast('AI が操作を実行しました', { kind: 'success' });
       setMessages(prev => [...prev, reply]);
       setReveal({ id: reply.id, shown: 0 });
+      fetchUsage();
     } catch (err: any) {
       setMessages(prev => [...prev, { id: Date.now() + 1, role: 'model', content: err.message || 'AI の応答に失敗しました', timestamp: timeNow(), error: true }]);
     } finally {
@@ -193,31 +214,128 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
     toast('会話履歴を削除しました', { kind: 'success' });
   };
 
-  const quoteMemo = () => {
-    if (!memo.content.trim()) {
-      toast('選択中のメモが空です', { kind: 'error' });
-      return;
-    }
-    setInput(prev => `【#${memo.slot} ${memo.title || 'メモ'}】\n${memo.content}\n\n${prev}`);
-    inputRef.current?.focus();
-  };
-
   return (
     <div className="flex-1 min-h-0 flex flex-col bg-[#0C0D10]/50">
       <div className="h-12 shrink-0 border-b border-stone-800/80 px-3 sm:px-4 flex items-center justify-between gap-2 text-xs bg-[#111214]">
-        <div className="flex items-center gap-2 font-bold text-white">
-          <Bot className="w-4 h-4 text-amber-400" />
-          <span>AI</span>
+        <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-1.5 font-bold text-white">
+            <Bot className="w-4 h-4 text-amber-400" />
+            <span className="hidden sm:inline">AI</span>
+          </div>
+
+          {/* モデル切り替え */}
+          <div className="flex items-center p-0.5 rounded-lg bg-stone-900 border border-stone-800 text-[11px]">
+            <button
+              onClick={() => setModelMode('fast')}
+              title="gemini-3.5-flash-lite (RPM:30, TPM:10M, RPD:1500)"
+              className={`flex items-center gap-1 px-2 py-1 rounded-md transition ${
+                modelMode === 'fast'
+                  ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30'
+                  : 'text-stone-400 hover:text-white'
+              }`}
+            >
+              <Zap className="w-3 h-3 text-amber-400" />
+              <span>高速</span>
+            </button>
+            <button
+              onClick={() => setModelMode('thinking')}
+              title="gemini-3.8-flash (RPM:15, TPM:3M, RPD:1500)"
+              className={`flex items-center gap-1 px-2 py-1 rounded-md transition ${
+                modelMode === 'thinking'
+                  ? 'bg-sky-500/20 text-sky-300 font-bold border border-sky-500/30'
+                  : 'text-stone-400 hover:text-white'
+              }`}
+            >
+              <Brain className="w-3 h-3 text-sky-400" />
+              <span>思考</span>
+            </button>
+          </div>
         </div>
-        <button
-          onClick={clearHistory}
-          disabled={messages.length === 0}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-stone-800 bg-stone-900 text-stone-300 hover:text-red-300 hover:border-red-900/70 hover:bg-red-950/30 disabled:opacity-40"
-        >
-          <Trash2 className="w-3.5 h-3.5" />
-          <span>履歴を削除</span>
-        </button>
+
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          {/* 利用枠インジケーター */}
+          {usageStats && (
+            <button
+              onClick={() => setShowUsageModal(true)}
+              title="クリックして5枠ローテーションとリセット時刻の詳細を表示"
+              className="flex items-center gap-1.5 px-2 py-1 rounded-lg border border-stone-800 bg-stone-900/80 text-[11px] text-stone-300 hover:border-stone-700 hover:bg-stone-800/60"
+            >
+              <Activity className="w-3 h-3 text-emerald-400" />
+              <span className="font-mono text-emerald-400 font-bold">
+                本日 {usageStats.dailySummary?.[modelMode]?.used ?? 0}
+              </span>
+              <span className="text-stone-500 hidden sm:inline">
+                / {usageStats.dailySummary?.[modelMode]?.max ?? 7500}回
+              </span>
+              <span className="text-[10px] text-stone-500 hidden md:inline">
+                (残 {usageStats.dailySummary?.[modelMode]?.remaining ?? 0})
+              </span>
+            </button>
+          )}
+
+          <button
+            onClick={clearHistory}
+            disabled={messages.length === 0}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-stone-800 bg-stone-900 text-stone-300 hover:text-red-300 hover:border-red-900/70 hover:bg-red-950/30 disabled:opacity-40"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">履歴を削除</span>
+          </button>
+        </div>
       </div>
+
+      {/* 利用状況詳細モーダル */}
+      {showUsageModal && usageStats && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 anim-fade" onClick={() => setShowUsageModal(false)}>
+          <div className="w-full max-w-lg bg-[#111214] border border-stone-800 rounded-2xl p-4 sm:p-5 space-y-4 anim-pop text-xs text-stone-300" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between pb-2 border-b border-stone-800">
+              <div className="flex items-center gap-2 text-white font-bold text-sm">
+                <Activity className="w-4 h-4 text-emerald-400" />
+                <span>AI 枠ローテーション & 利用量</span>
+              </div>
+              <button onClick={() => setShowUsageModal(false)} className="text-stone-500 hover:text-white p-1 rounded-lg">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2 bg-stone-900/50 border border-stone-800/80 rounded-xl p-3">
+              <div className="text-white font-bold flex items-center justify-between">
+                <span>次回リセット (PT 0:00 / 米国太平洋時間)</span>
+                <span className="text-amber-400 font-mono text-[11px]">{usageStats.resetTime?.label}</span>
+              </div>
+              <div className="text-[11px] text-stone-500">
+                5つのAPIキー枠を自動でローテーションして負荷分散しています。モデルごとに制限枠は独立してカウントされます。
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="text-stone-400 font-bold">5つのAPIスロット別利用状況</div>
+              <div className="space-y-1.5 max-h-60 overflow-y-auto pr-1">
+                {usageStats.slots?.map((s: any) => (
+                  <div key={s.slot} className="bg-stone-900/60 border border-stone-800 rounded-lg p-2.5 flex items-center justify-between">
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-white">スロット #{s.slot}</span>
+                        <span className={`px-1.5 py-0.2 rounded text-[10px] ${s.hasKey ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'}`}>
+                          {s.hasKey ? '有効' : '未設定'}
+                        </span>
+                        <span className="text-stone-500 font-mono text-[10px]">{s.keyMasked}</span>
+                      </div>
+                      <div className="text-[10px] text-stone-400 flex gap-3">
+                        <span>高速 RPD: <b className="text-stone-200">{s.fast.rpd}</b> / {s.fast.rpdLimit}</span>
+                        <span>思考 RPD: <b className="text-stone-200">{s.thinking.rpd}</b> / {s.thinking.rpdLimit}</span>
+                      </div>
+                    </div>
+                    <div className="text-right text-[10px] text-stone-500">
+                      <div>直近1分: {modelMode === 'fast' ? s.fast.rpm : s.thinking.rpm} req/m</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4">
         <div className="max-w-4xl mx-auto space-y-4">
@@ -338,9 +456,6 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
           {(
             <>
               <div className="flex items-center gap-2 text-[11px] text-stone-500">
-                <button onClick={quoteMemo} className="btn-chip">
-                  <FileText className="w-3 h-3 text-amber-400" /> メモ #{memo.slot} を引用
-                </button>
                 <button onClick={() => fileRef.current?.click()} disabled={images.length >= 4} className="btn-chip disabled:opacity-40">
                   <ImageIcon className="w-3 h-3 text-amber-400" /> 画像を添付
                 </button>

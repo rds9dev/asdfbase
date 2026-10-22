@@ -1,6 +1,12 @@
 // ヘルプ: すべての機能の説明 (目次つき)
 import React, { useRef, useState } from 'react';
-import { BookOpen, ChevronDown } from 'lucide-react';
+import { BookOpen, ChevronDown, Sparkles, Bot, Send, X } from 'lucide-react';
+
+interface HelpTabProps {
+  onAskAi?: (initialPrompt?: string) => void;
+  safeFetch?: (input: string, init?: RequestInit) => Promise<Response>;
+  token?: string;
+}
 
 interface Section {
   id: string;
@@ -256,7 +262,7 @@ const SECTIONS: Section[] = [
   },
 ];
 
-export default function HelpTab() {
+export default function HelpTab({ onAskAi }: HelpTabProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [tocOpen, setTocOpen] = useState(false);
 
@@ -265,6 +271,12 @@ export default function HelpTab() {
     const container = scrollRef.current;
     if (el && container) container.scrollTo({ top: el.offsetTop - 12, behavior: 'smooth' });
     setTocOpen(false);
+  };
+
+  const handleAsk = () => {
+    if (onAskAi) {
+      onAskAi('asdfbaseの使い方について質問があります：');
+    }
   };
 
   const toc = (
@@ -290,7 +302,17 @@ export default function HelpTab() {
       </aside>
       <div ref={scrollRef} className="relative flex-1 min-w-0 overflow-y-auto p-3 sm:p-6">
         <div className="max-w-3xl mx-auto space-y-6">
-          <h2 className="text-xl sm:text-2xl font-bold text-white">ヘルプ</h2>
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-xl sm:text-2xl font-bold text-white">ヘルプ</h2>
+            <button
+              onClick={handleAsk}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500/20 to-amber-600/20 border border-amber-500/40 text-amber-300 font-bold hover:bg-amber-500/30 transition shadow-sm text-xs sm:text-sm"
+              title="asdfbase の使い方を AI に直接質問します"
+            >
+              <Sparkles className="w-4 h-4 text-amber-400" />
+              <span>AI に質問</span>
+            </button>
+          </div>
           <div className="md:hidden bg-[#111214] border border-stone-800 rounded-xl text-xs">
             <button onClick={() => setTocOpen(v => !v)} className="w-full flex items-center justify-between px-3 py-2.5 text-white font-bold">
               <span className="flex items-center gap-1.5"><BookOpen className="w-4 h-4 text-amber-400" /> 目次</span>

@@ -275,6 +275,104 @@ function formatEmbeds(embeds: any[]): string[] {
   return parts;
 }
 
+export interface DiscordMemberInfo {
+  id: string;
+  username: string;
+  displayName: string;
+  avatarUrl: string | null;
+  status: 'online' | 'idle' | 'dnd' | 'offline';
+  activity: string | null;
+  roles: string[];
+}
+
+export interface DiscordGuildStatus {
+  enabled: boolean;
+  connected: boolean;
+  guildId: string | null;
+  guildName: string | null;
+  memberCount: number;
+  onlineCount: number;
+  members: DiscordMemberInfo[];
+  voiceChannels: DiscordVoiceChannelInfo[];
+}
+
+export async function getDiscordGuildStatus(): Promise<DiscordGuildStatus> {
+  if (!client || !connected || allowedGuildIds.length === 0) {
+    return {
+      enabled: Boolean(client),
+      connected,
+      guildId: null,
+      guildName: null,
+      memberCount: 0,
+      onlineCount: 0,
+      members: [],
+      voiceChannels: [],
+    };
+  }
+
+  const gid = allowedGuildIds[0];
+  const guild = client.guilds.cache.get(gid);
+  if (!guild) {
+    return {
+      enabled: true,
+      connected: false,
+      guildId: gid,
+      guildName: null,
+      memberCount: 0,
+      onlineCount: 0,
+      members: [],
+      voiceChannels: [],
+    };
+  }
+
+  // メンバーの取得
+  let members: DiscordMemberInfo[] = [];
+  try {
+    const fetched = await guild.members.fetch({ time: 5000 }).catch(() => guild.members.cache);
+    members = Array.from(fetched.values()).map(m => {
+      const presence = m.presence;
+      const status = presence?.status || 'offline';
+      const acts = presence?.activities || [];
+      const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2);
+      const activityText = gameAct ? `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}` : null;
+
+      return {
+        id: m.id,
+        username: m.user.username,
+        displayName: m.displayName || m.user.globalName || m.user.username,
+        avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
+        status: status as any,
+        activity: activityText,
+        roles: m.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).slice(0, 5),
+      };
+    });
+  } catch (_) {
+    // フォールバック: キャッシュから
+    members = Array.from(guild.members.cache.values()).map(m => ({
+      id: m.id,
+      username: m.user.username,
+      displayName: m.displayName || m.user.username,
+      avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
+      status: (m.presence?.status || 'offline') as any,
+      activity: null,
+      roles: [],
+    }));
+  }
+
+  const onlineMembers = members.filter(m => m.status !== 'offline');
+
+  return {
+    enabled: true,
+    connected: true,
+    guildId: guild.id,
+    guildName: guild.name,
+    memberCount: guild.memberCount || members.length,
+    onlineCount: onlineMembers.length,
+    members: members.slice(0, 50),
+    voiceChannels: getDiscordVoiceStatus(),
+  };
+}
+
 export function getDiscordVoiceStatus(): DiscordVoiceChannelInfo[] {
   if (!client || !connected) return [];
   const result: DiscordVoiceChannelInfo[] = [];
@@ -522,30 +620,32 @@ export async function editRelayedOnDiscord(links: RelayedMessage[], username: st
   return edited;
 }
 
-function createClient(withMessageContent: boolean) {
+function createClient(_withMessageContent: boolean) {
+  // 特権インテント (GuildMembers, GuildPresences, MessageContent) を全て有効化
   const intents = [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageTyping,
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent,
   ];
-  if (withMessageContent) intents.push(GatewayIntentBits.MessageContent);
   return new Client({
     intents,
     // キャッシュしていないメッセージの編集・リアクションも受け取る
-    partials: [Partials.Message, Partials.Channel, Partials.Reaction],
-    // VPS のメモリ節約のためキャッシュを最小限に
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.GuildMember, Partials.User],
     makeCache: Options.cacheWithLimits({
       ...Options.DefaultMakeCacheSettings,
       MessageManager: 0,
-      PresenceManager: 0,
+      PresenceManager: 200,
       ReactionManager: 0,
-      GuildMemberManager: 100,
+      GuildMemberManager: 200,
       UserManager: 200,
       GuildEmojiManager: 0,
       GuildStickerManager: 0,
-      VoiceStateManager: 0,
+      VoiceStateManager: 50,
     }),
   });
 }

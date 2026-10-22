@@ -11,18 +11,51 @@ interface RenderOptions {
   onChannelClick: (id: number) => void;
   // このサイトのメッセージリンク (…/#msg-123) はタブを開かずにその場でジャンプ
   onMessageLink?: (id: number) => void;
+  // メモリンク (…/#memo-3) ジャンプ
+  onMemoLink?: (slot: number) => void;
+  token?: string;
 }
 
-// URL がこのサイトのメッセージリンクならメッセージ ID を返す
+// URL がメッセージリンクならメッセージ ID を返す
 export function messageLinkId(url: string): number | null {
   try {
-    const u = new URL(url);
-    if (u.origin !== window.location.origin) return null;
+    const u = new URL(url, window.location.origin);
     const m = u.hash.match(/^#msg-(\d+)$/);
     return m ? Number(m[1]) : null;
   } catch {
-    return null;
+    const m = String(url).match(/#msg-(\d+)/);
+    return m ? Number(m[1]) : null;
   }
+}
+
+// URL がメモリンクならメモのスロット番号を返す
+export function memoSlotId(url: string): number | null {
+  try {
+    const u = new URL(url, window.location.origin);
+    const m = u.hash.match(/^#memo-(\d+)$/);
+    return m ? Number(m[1]) : null;
+  } catch {
+    const m = String(url).match(/#memo-(\d+)/);
+    return m ? Number(m[1]) : null;
+  }
+}
+
+// Discord CDN や GIF の URL をプロキシ経由に変換 (i-FILTER 対策)
+export function toProxiedMediaUrl(url: string, token = ''): string {
+  if (!url) return '';
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    if (
+      host.includes('discordapp.com') ||
+      host.includes('discordapp.net') ||
+      host.includes('tenor.com') ||
+      host.includes('giphy.com')
+    ) {
+      return `/api/proxy/media?url=${encodeURIComponent(url)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+    }
+  } catch (_) {}
+  return url;
 }
 
 // Discord から来たメッセージの名前の後ろに付けるバッジ
@@ -82,6 +115,15 @@ export function renderMessageText(content: string, opts: RenderOptions): React.R
         out.push(
           <button key={i++} type="button" onClick={() => opts.onMessageLink!(linkedId)} className="mention-pill channel-pill" title="このメッセージへ移動">
             ↪ メッセージへ移動
+          </button>
+        );
+        continue;
+      }
+      const linkedMemoSlot = opts.onMemoLink ? memoSlotId(token) : null;
+      if (linkedMemoSlot !== null) {
+        out.push(
+          <button key={i++} type="button" onClick={() => opts.onMemoLink!(linkedMemoSlot)} className="mention-pill channel-pill" title={`メモ #${linkedMemoSlot} を開く`}>
+            📝 メモ #{linkedMemoSlot}
           </button>
         );
         continue;

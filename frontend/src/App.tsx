@@ -97,7 +97,7 @@ import {
   computeSchoolStatus, daySlots, periodCountFor, closingFor,
   type ScheduleType, type ScheduleDef, type TimetableConfig, type TimetableItem,
 } from './schedule';
-import { renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates, DiscordBadge, splitSenderName } from './chatText';
+import { renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates, DiscordBadge, splitSenderName, memoSlotId, toProxiedMediaUrl } from './chatText';
 import { ReactionBar } from './Reactions';
 import HomeworkTab, { type Homework } from './HomeworkTab';
 import { drawStroke, drawText, playTimelapse, timelapsePlan } from './boardTimelapse';
@@ -255,8 +255,8 @@ interface MemoSlot {
   updated_at: string;
 }
 
-// スマホの下部タブバーに直接出すタブ (残りは「メニュー」から)
-const MOBILE_MAIN_TABS: TabId[] = ['chat', 'memo', 'assignments', 'homework', 'ai'];
+// スマホの下部タブバーに直接出す主要4タブ (残りは「メニュー」に整理)
+const MOBILE_MAIN_TABS: TabId[] = ['chat', 'memo', 'ai', 'homework'];
 
 // ボードの描画領域 (全員共通の座標)。横長の画面に合わせて横を広めに取る
 const BOARD_WIDTH = 2200;
@@ -354,6 +354,23 @@ export default function App() {
   const [isCheckingAuth, setIsCheckingAuth] = useState(Boolean(localStorage.getItem('asdf_token')));
   const [isNewChannelModalOpen, setIsNewChannelModalOpen] = useState(false);
   const [newChannelName, setNewChannelName] = useState('');
+  const [editingChannel, setEditingChannel] = useState<{ id: number; name: string } | null>(null);
+  const [editChannelNameInput, setEditChannelNameInput] = useState('');
+
+  // お知らせ & 通知ポップオーバー
+  const [announcements, setAnnouncements] = useState<any[]>([]);
+  const [isNotifyPopoverOpen, setIsNotifyPopoverOpen] = useState(false);
+  const [isNewAnnouncementModalOpen, setIsNewAnnouncementModalOpen] = useState(false);
+  const [newAnnouncementTitle, setNewAnnouncementTitle] = useState('');
+  const [newAnnouncementContent, setNewAnnouncementContent] = useState('');
+  const [newAnnouncementDiscord, setNewAnnouncementDiscord] = useState(true);
+  const [lastReadAnnouncementTime, setLastReadAnnouncementTime] = useState<number>(() => {
+    return Number(localStorage.getItem('asdf_last_read_announcement') || '0');
+  });
+
+  // モバイル メニューシート & スラッシュコマンド補完
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [activeSlashIndex, setActiveSlashIndex] = useState(0);
 
   // Settings State (Account, Notifications, Webhook, Audit Logs, Appearance)
   const [settingsSection, setSettingsSection] = useState<'account' | 'notifications' | 'webhook' | 'audit' | 'appearance' | 'connection'>('account');
@@ -560,10 +577,9 @@ export default function App() {
   hasNewerRef.current = hasNewerMessages;
   const [isLoadingNewer, setIsLoadingNewer] = useState(false);
   const pendingJumpRef = useRef<{ channelId: number; context: any } | null>(null);
-  // スマホ: メッセージ長押しの操作メニュー / 下部の「メニュー」
+  // スマホ: メッセージ長押しの操作メニュー
   const [msgActionSheet, setMsgActionSheet] = useState<Message | null>(null);
   const msgLongPressRef = useRef<{ timer: any; x: number; y: number } | null>(null);
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const unreadMessageRef = useRef<HTMLDivElement | null>(null);
 
@@ -1132,10 +1148,20 @@ export default function App() {
         setClipboardUpdatedBy(msg.payload.updated_by);
       } else if (msg.type === 'CHANNEL_CREATED') {
         setChannels(prev => prev.some(c => c.id === msg.payload.id) ? prev : [...prev, msg.payload]);
+      } else if (msg.type === 'CHANNEL_UPDATED') {
+        setChannels(prev => prev.map(c => c.id === msg.payload.id ? { ...c, ...msg.payload } : c));
       } else if (msg.type === 'CHANNELS_REORDERED') {
         setChannels(msg.payload);
       } else if (msg.type === 'CHANNEL_DELETED') {
         setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
+      } else if (msg.type === 'ANNOUNCEMENT_CREATED') {
+        setAnnouncements(prev => [msg.payload, ...prev.filter(a => a.id !== msg.payload.id)]);
+        if (notifyPrefsRef.current.important) {
+          if (notifyPrefsRef.current.sound) playNotificationSound();
+          showBrowserNotification(`お知らせ: ${msg.payload.title}`, msg.payload.content || '');
+        }
+      } else if (msg.type === 'ANNOUNCEMENT_DELETED') {
+        setAnnouncements(prev => prev.filter(a => a.id !== msg.payload.id));
       } else if (msg.type === 'ASSIGNMENT_UPDATED') {
         setAssignments(prev => prev.map(a => a.id === msg.payload.id ? { ...a, ...msg.payload } : a));
       } else if (msg.type === 'ASSIGNMENT_CREATED') {
@@ -1549,10 +1575,20 @@ export default function App() {
     if (!token || !isLoggedIn) return;
     const handleHash = () => {
       const m = window.location.hash.match(/^#msg-(\d+)$/);
-      if (!m) return;
-      // 同じリンクを何度も処理しないよう、URL からは消しておく
-      history.replaceState(null, '', window.location.pathname + window.location.search);
-      openMessageLinkRef.current(Number(m[1]));
+      if (m) {
+        // 同じリンクを何度も処理しないよう、URL からは消しておく
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        openMessageLinkRef.current(Number(m[1]));
+        return;
+      }
+      const memoMatch = window.location.hash.match(/^#memo-(\d+)$/);
+      if (memoMatch) {
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        setActiveTab('memo');
+        setSelectedSlotIndex(Number(memoMatch[1]));
+        toast(`メモ #${memoMatch[1]} を開きました`, { kind: 'success' });
+        return;
+      }
     };
     handleHash();
     window.addEventListener('hashchange', handleHash);
@@ -1793,6 +1829,54 @@ export default function App() {
     setReplyToMessage(null);
     lastTypingSentRef.current = 0;
 
+    // 時短 /コマンドの処理
+    if (content.startsWith('/') && !content.startsWith('//')) {
+      const parts = content.slice(1).split(/\s+/);
+      const cmd = parts[0]?.toLowerCase();
+      const rest = parts.slice(1).join(' ').trim();
+
+      if (cmd === 'ai') {
+        setActiveTab('ai');
+        toast('AI タブへ移動しました', { kind: 'success' });
+        return;
+      } else if (cmd === 'timetable' || cmd === 'tt') {
+        handleFetchTimetables();
+        setIsTimetableModalOpen(true);
+        return;
+      } else if (cmd === 'hw' || cmd === 'homework') {
+        setActiveTab('homework');
+        return;
+      } else if (cmd === 'tasks' || cmd === 'assignments') {
+        setActiveTab('assignments');
+        return;
+      } else if (cmd === 'memo') {
+        const slotNum = parseInt(rest, 10);
+        if (slotNum >= 1) setSelectedSlotIndex(slotNum);
+        setActiveTab('memo');
+        return;
+      } else if (cmd === 'board') {
+        setActiveTab('board');
+        return;
+      } else if (cmd === 'help') {
+        setActiveTab('help');
+        return;
+      } else if (cmd === 'clear') {
+        toast('入力をクリアしました', { kind: 'success' });
+        return;
+      } else if (cmd === 'status') {
+        if (rest === 'online' || rest === 'away') {
+          realtimeRef.current?.send({ type: 'SET_STATUS', status: rest }).catch(() => {});
+          toast(`ステータスを設定しました: ${rest}`, { kind: 'success' });
+        } else {
+          toast('/status <online|away> を指定してください', { kind: 'error' });
+        }
+        return;
+      } else {
+        toast(`未知のコマンド: /${cmd}`, { kind: 'error' });
+        return;
+      }
+    }
+
     const me = currentUserRef.current;
     const newNonce = () => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const makeOptimistic = (body: string, clientNonce: string, withReply: boolean): Message => ({
@@ -1876,13 +1960,20 @@ export default function App() {
     setTimeout(() => chatInputRef.current?.focus(), 0);
   };
 
-  const jumpToMessage = (id: number, behavior: ScrollBehavior = 'smooth', highlight = true) => {
+  const jumpToMessage = (id: number, behavior: ScrollBehavior = 'smooth', highlight = true, retryCount = 0) => {
     const el = document.getElementById(`msg-${id}`);
-    if (!el) return;
+    if (!el) {
+      if (retryCount < 20) {
+        setTimeout(() => jumpToMessage(id, behavior, highlight, retryCount + 1), 80);
+      }
+      return;
+    }
     el.scrollIntoView({ behavior, block: 'center' });
     if (!highlight) return;
+    el.classList.remove('msg-highlight');
+    void el.offsetWidth;
     el.classList.add('msg-highlight');
-    setTimeout(() => el.classList.remove('msg-highlight'), 2400);
+    setTimeout(() => el.classList.remove('msg-highlight'), 3000);
   };
 
   const handleRetryMessage = (m: Message) => {
@@ -2305,6 +2396,92 @@ export default function App() {
     if (!periodDraft) return;
     if (await saveTimetableConfig({ schedules: { [scheduleType]: periodDraft } }, `${SCHEDULE_LABELS[scheduleType]} の時刻を保存しました`)) {
       setIsEditingPeriods(false);
+    }
+  };
+
+  // お知らせ機能 (Admin作成 & 取得)
+  const fetchAnnouncements = async () => {
+    if (!token) return;
+    try {
+      const res = await safeFetch('/api/announcements', { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) {
+        const data = await res.json();
+        setAnnouncements(data);
+      }
+    } catch (_) {}
+  };
+
+  useEffect(() => {
+    if (token) fetchAnnouncements();
+  }, [token]);
+
+  const handleCreateAnnouncement = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newAnnouncementTitle.trim() || !token) return;
+    try {
+      const res = await safeFetch('/api/announcements', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          title: newAnnouncementTitle.trim(),
+          content: newAnnouncementContent.trim(),
+          notifyDiscord: newAnnouncementDiscord,
+        }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error || 'お知らせの作成に失敗しました');
+      }
+      const saved = await res.json();
+      setAnnouncements(prev => [saved, ...prev]);
+      setNewAnnouncementTitle('');
+      setNewAnnouncementContent('');
+      setIsNewAnnouncementModalOpen(false);
+      toast('お知らせを投稿しました', { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  const handleDeleteAnnouncement = async (id: number) => {
+    if (!token) return;
+    const ok = await confirmDialog({
+      title: 'お知らせを削除しますか？',
+      message: 'このお知らせを削除すると全員の一覧から消えます。',
+      confirmLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await safeFetch(`/api/announcements/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setAnnouncements(prev => prev.filter(a => a.id !== id));
+        toast('お知らせを削除しました', { kind: 'success' });
+      }
+    } catch (_) {}
+  };
+
+  // チャンネル名変更 (admin限定)
+  const handleEditChannelName = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingChannel || !editChannelNameInput.trim() || !token) return;
+    try {
+      const res = await safeFetch(`/api/channels/${editingChannel.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ name: editChannelNameInput.trim() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'チャンネル名の変更に失敗しました');
+      setChannels(prev => prev.map(c => c.id === data.id ? { ...c, name: data.name } : c));
+      setEditingChannel(null);
+      setEditChannelNameInput('');
+      toast(`チャンネル名を #${data.name} に変更しました`, { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
     }
   };
 
@@ -3223,11 +3400,14 @@ export default function App() {
   const channelByName = new Map(channels.filter(c => c.type !== 'voice').map(c => [c.name, c.id]));
   const typingHere = Object.entries(typingUsers).filter(([, v]) => v.channelId === activeChannelId).map(([, v]) => v.username);
   // 今日・明日が期限で、まだやっていない自分のクラスの宿題
-  const urgentHomework = homework.filter(h => {
+  const urgentHomeworkList = homework.filter(h => {
     if (h.my_done || (currentUser.class_no && h.class_no != null && h.class_no !== currentUser.class_no)) return false;
     const d = new Date(`${h.due_date}T00:00:00`).getTime() - new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
     return d <= 86400000;
-  }).length;
+  });
+  const urgentHomework = urgentHomeworkList.length;
+  const unreadAnnouncements = announcements.filter(a => new Date(a.created_at).getTime() > lastReadAnnouncementTime).length;
+  const totalNotifications = urgentHomework + unreadAnnouncements;
   const nameOfUser = (id: number) => userById.get(id)?.username;
   const activeChannelName = channels.find(c => c.id === activeChannelId)?.name || 'chat';
 
@@ -3245,6 +3425,21 @@ export default function App() {
     const pool = channels.filter(c => c.type !== 'voice').map(c => ({ key: `c${c.id}`, label: c.name, insert: `#${c.name}` }));
     return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
   })();
+
+  const slashCandidates = chatInput.startsWith('/') && !chatInput.startsWith('//') && !chatInput.includes(' ')
+    ? [
+        { cmd: '/ai', label: '/ai <質問>', desc: 'AIに直接質問します' },
+        { cmd: '/timetable', label: '/timetable', desc: '時間割モーダルを開きます' },
+        { cmd: '/tt', label: '/tt', desc: '時間割モーダルを開きます (短縮)' },
+        { cmd: '/hw', label: '/hw', desc: '宿題タブへ移動します' },
+        { cmd: '/tasks', label: '/tasks', desc: '提出物タブへ移動します' },
+        { cmd: '/memo', label: '/memo <1-10>', desc: '指定のメモスロットを開きます' },
+        { cmd: '/board', label: '/board', desc: 'ホワイトボードを開きます' },
+        { cmd: '/status', label: '/status <online|busy|away>', desc: 'ステータスを変更します' },
+        { cmd: '/clear', label: '/clear', desc: '入力欄をクリアします' },
+        { cmd: '/help', label: '/help', desc: 'ヘルプを開きます' },
+      ].filter(c => c.cmd.startsWith(chatInput.toLowerCase()))
+    : [];
 
   const updateCompletion = (value: string, caret: number) => {
     const tok = findCompletionToken(value, caret);
@@ -3326,6 +3521,125 @@ export default function App() {
 
         {/* Right Header Block: ホバーで概要、クリックで詳細 */}
         <div className="flex items-center gap-1 sm:gap-2 font-mono text-[11px] sm:text-xs shrink-0">
+          {/* 通知ボタン (放課後などの左隣) */}
+          <div className="relative">
+            <button
+              onClick={() => {
+                setIsNotifyPopoverOpen(v => !v);
+                setLastReadAnnouncementTime(Date.now());
+                localStorage.setItem('asdf_last_read_announcement', String(Date.now()));
+              }}
+              title="通知とお知らせ"
+              className={`${headerChip} relative text-stone-300 bg-stone-900/60 border-stone-800/70 hover:bg-stone-800/80 hover:border-stone-600 ${
+                totalNotifications > 0 ? '!border-amber-500/50 !bg-amber-500/10 text-amber-300' : ''
+              }`}
+            >
+              <Bell className={`w-3.5 h-3.5 ${totalNotifications > 0 ? 'text-amber-400' : 'text-stone-400'}`} />
+              <span className="hidden sm:inline">通知</span>
+              {totalNotifications > 0 && (
+                <span className="anim-badge min-w-[16px] h-[16px] px-1 rounded-full bg-amber-500 text-black text-[9px] font-bold leading-[16px] text-center">
+                  {totalNotifications}
+                </span>
+              )}
+            </button>
+
+            {/* 通知ポップオーバー */}
+            {isNotifyPopoverOpen && (
+              <div
+                className="absolute right-0 top-full mt-2 w-80 sm:w-96 bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl z-50 p-3 space-y-3 anim-pop text-xs text-stone-300 max-h-[80vh] overflow-y-auto"
+                onClick={e => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between pb-2 border-b border-stone-800">
+                  <div className="flex items-center gap-2 font-bold text-white text-sm">
+                    <Bell className="w-4 h-4 text-amber-400" />
+                    <span>通知とお知らせ</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {currentUser?.role === 'admin' && (
+                      <button
+                        onClick={() => {
+                          setIsNotifyPopoverOpen(false);
+                          setIsNewAnnouncementModalOpen(true);
+                        }}
+                        className="px-2 py-1 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-bold hover:bg-amber-500/30"
+                      >
+                        + お知らせ作成
+                      </button>
+                    )}
+                    <button onClick={() => setIsNotifyPopoverOpen(false)} className="p-1 text-stone-500 hover:text-white rounded-lg">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* システム通知: 宿題期限 */}
+                <div className="space-y-1.5">
+                  <div className="text-[10px] uppercase font-bold text-amber-400 flex items-center gap-1">
+                    <BookOpenCheck className="w-3 h-3" />
+                    <span>宿題・提出物リマインド</span>
+                  </div>
+                  {urgentHomeworkList.length === 0 ? (
+                    <div className="text-stone-500 text-[11px] py-1">直近締切の宿題はありません 👍</div>
+                  ) : (
+                    <div className="space-y-1">
+                      {urgentHomeworkList.map(h => (
+                        <div
+                          key={h.id}
+                          onClick={() => {
+                            setActiveTab('homework');
+                            setIsNotifyPopoverOpen(false);
+                          }}
+                          className="p-2 rounded-xl bg-amber-500/10 border border-amber-500/20 hover:bg-amber-500/20 cursor-pointer transition flex items-center justify-between"
+                        >
+                          <div>
+                            <div className="font-bold text-amber-200">[{h.subject}] {h.content}</div>
+                            <div className="text-[10px] text-amber-400/80">期限: {h.due_date}</div>
+                          </div>
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500 text-black font-bold">宿題へ</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* adminからのお知らせ */}
+                <div className="space-y-1.5 pt-2 border-t border-stone-800/80">
+                  <div className="text-[10px] uppercase font-bold text-sky-400 flex items-center gap-1">
+                    <Sparkles className="w-3 h-3" />
+                    <span>お知らせ</span>
+                  </div>
+                  {announcements.length === 0 ? (
+                    <div className="text-stone-500 text-[11px] py-1">お知らせはありません</div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {announcements.map(a => (
+                        <div key={a.id} className="p-2.5 rounded-xl bg-stone-900/70 border border-stone-800 space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className="font-bold text-white text-[12px]">{a.title}</span>
+                            {currentUser?.role === 'admin' && (
+                              <button
+                                onClick={() => handleDeleteAnnouncement(a.id)}
+                                className="text-stone-500 hover:text-red-400 p-0.5"
+                                title="削除"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+                          <div className="text-stone-300 text-[11px] whitespace-pre-wrap leading-relaxed">{a.content}</div>
+                          <div className="text-[10px] text-stone-500 flex items-center justify-between pt-1">
+                            <span>投稿者: {a.username}</span>
+                            <span>{new Date(a.created_at).toLocaleDateString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
           <HoverCard
             title="時間割"
             onClick={() => {
@@ -3533,6 +3847,18 @@ export default function App() {
 
                           {/* チャンネル並び替え (↑ / ↓) */}
                           <div className="opacity-0 group-hover:opacity-100 flex items-center transition">
+                            {currentUser?.role === 'admin' && (
+                              <button
+                                onClick={() => {
+                                  setEditingChannel({ id: ch.id, name: ch.name });
+                                  setEditChannelNameInput(ch.name);
+                                }}
+                                className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
+                                title="チャンネル名を変更"
+                              >
+                                <Edit3 className="w-3 h-3" />
+                              </button>
+                            )}
                             {idx > 0 && (
                               <button
                                 onClick={e => handleMoveChannel(e, idx, 'up')}
@@ -3867,7 +4193,7 @@ export default function App() {
                                 }`}>
                                   {IMAGE_MESSAGE_RE.test(m.content.trim()) ? (
                                     <img
-                                      src={m.content.trim().match(IMAGE_MESSAGE_RE)?.[1]}
+                                      src={toProxiedMediaUrl(m.content.trim().match(IMAGE_MESSAGE_RE)?.[1] || '', token)}
                                       alt="attachment"
                                       loading="lazy"
                                       onLoad={() => {
@@ -3877,7 +4203,7 @@ export default function App() {
                                           if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 600) scheduleScrollToBottom(false);
                                         }
                                       }}
-                                      onClick={() => setLightbox({ src: m.content.trim().match(IMAGE_MESSAGE_RE)?.[1] || '', zoom: 1 })}
+                                      onClick={() => setLightbox({ src: toProxiedMediaUrl(m.content.trim().match(IMAGE_MESSAGE_RE)?.[1] || '', token), zoom: 1 })}
                                       className="max-h-72 max-w-full rounded-lg object-contain my-1 border border-stone-800 cursor-zoom-in hover:opacity-90 transition"
                                     />
                                   ) : m.content === VIDEO_NOTICE ? (
@@ -3896,6 +4222,11 @@ export default function App() {
                                         me: currentUser.username,
                                         onChannelClick: id => setActiveChannelId(id),
                                         onMessageLink: id => openMessageLink(id),
+                                        onMemoLink: slot => {
+                                          setActiveTab('memo');
+                                          setSelectedSlotIndex(slot);
+                                        },
+                                        token,
                                       })}
                                     </span>
                                   )}
@@ -4054,6 +4385,34 @@ export default function App() {
                   </div>
                 )}
 
+                {/* スラッシュコマンド補完 */}
+                {!completion && slashCandidates.length > 0 && (
+                  <div className="absolute bottom-full left-2 sm:left-4 mb-1 w-[calc(100%-1rem)] sm:w-80 bg-[#111214] border border-amber-500/40 rounded-xl shadow-2xl p-1.5 text-xs z-30 anim-pop-down">
+                    <div className="flex items-center justify-between px-2 py-1 text-[10px] text-stone-500 border-b border-stone-800/80 mb-1">
+                      <span className="font-bold text-amber-400">/ コマンド (時短ショートカット)</span>
+                      <span><kbd className="kbd">Tab</kbd> / <kbd className="kbd">Enter</kbd> 決定</span>
+                    </div>
+                    {slashCandidates.map((item, i) => (
+                      <button
+                        key={item.cmd}
+                        type="button"
+                        onMouseDown={e => e.preventDefault()}
+                        onMouseEnter={() => setActiveSlashIndex(i)}
+                        onClick={() => {
+                          setChatInput(`${item.cmd} `);
+                          chatInputRef.current?.focus();
+                        }}
+                        className={`w-full px-2 py-1.5 rounded-lg flex items-center justify-between text-left transition ${
+                          i === activeSlashIndex % slashCandidates.length ? 'bg-amber-500/15 text-white' : 'text-stone-300 hover:bg-stone-800/50'
+                        }`}
+                      >
+                        <span className="font-mono font-bold text-amber-300">{item.cmd}</span>
+                        <span className="text-[10px] text-stone-400">{item.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
                 <form
                   onSubmit={handleSendMessage}
                   onDragOver={e => {
@@ -4167,6 +4526,24 @@ export default function App() {
                             e.preventDefault();
                             applyCompletion(completionItems[completion!.index % completionItems.length]);
                             return;
+                          }
+                          const slashOpen = !completion && slashCandidates.length > 0;
+                          if (slashOpen && (e.key === 'Tab' || e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+                            e.preventDefault();
+                            const dir = e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey) ? -1 : 1;
+                            const len = slashCandidates.length;
+                            setActiveSlashIndex(idx => (((idx % len) + dir) % len + len) % len);
+                            return;
+                          }
+                          if (slashOpen && e.key === 'Enter') {
+                            const chosen = slashCandidates[activeSlashIndex % slashCandidates.length];
+                            if (chosen && chatInput === chosen.cmd) {
+                              // そのまま送信・実行へ流す
+                            } else if (chosen) {
+                              e.preventDefault();
+                              setChatInput(`${chosen.cmd} `);
+                              return;
+                            }
                           }
                           if (e.key === 'Tab') {
                             e.preventDefault();
@@ -4473,6 +4850,21 @@ export default function App() {
                       <Undo2 className="w-3 h-3" /> 校正前に戻す
                     </button>
                   )}
+
+                  <button
+                    onClick={() => {
+                      const url = `${window.location.origin}/#memo-${selectedSlotIndex}`;
+                      navigator.clipboard.writeText(url).then(
+                        () => toast(`メモ #${selectedSlotIndex} のリンクをコピーしました`, { kind: 'success' }),
+                        () => toast('コピーできませんでした', { kind: 'error' })
+                      );
+                    }}
+                    title="このメモの共有リンクをコピー"
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-stone-800 bg-[#16181D] text-stone-300 hover:text-white hover:border-stone-600 text-xs"
+                  >
+                    <Link className="w-3.5 h-3.5 text-amber-400" />
+                    <span className="hidden sm:inline">リンク</span>
+                  </button>
 
                   <button
                     onClick={() => handleSaveMemo()}
@@ -5084,7 +5476,12 @@ export default function App() {
         {/* TAB 8: ヘルプ */}
         {activeTab === 'help' && (
           <div className="flex-1 min-h-0 flex anim-tab">
-            <HelpTab />
+            <HelpTab
+              onAskAi={q => {
+                setActiveTab('ai');
+                toast(q || 'AI タブを開きました', { kind: 'success' });
+              }}
+            />
           </div>
         )}
 
@@ -5616,29 +6013,41 @@ export default function App() {
                         { key: 'messageWebhookUrl', kind: 'message', title: 'メッセージ用 Webhook', desc: 'Bot の同期が設定されていないチャンネルのメッセージ・画像をこの Webhook に送ります (任意)。' },
                       ] as const).map(w => (
                         <div key={w.key} className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
-                          <div className="text-white font-bold text-sm">{w.title}</div>
+                          <div className="flex items-center justify-between">
+                            <div className="text-white font-bold text-sm">{w.title}</div>
+                            {currentUser?.role !== 'admin' && (
+                              <span className="text-[10px] bg-amber-500/15 border border-amber-500/30 text-amber-300 px-2 py-0.5 rounded-full font-bold">
+                                管理者専用
+                              </span>
+                            )}
+                          </div>
                           <p className="text-stone-400 leading-relaxed">{w.desc}</p>
                           <input
                             type="url"
+                            disabled={currentUser?.role !== 'admin'}
                             placeholder="https://discord.com/api/webhooks/..."
                             value={integrations[w.key] || ''}
                             onChange={e => setIntegrations((prev: any) => ({ ...prev, [w.key]: e.target.value }))}
-                            className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                            className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60 disabled:opacity-50"
                           />
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => saveIntegrations({ [w.key]: (integrations[w.key] || '').trim() })}
-                              className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition"
-                            >
-                              保存
-                            </button>
-                            <button
-                              onClick={() => testIntegration(w.kind)}
-                              className="px-4 py-2 bg-stone-800 hover:bg-stone-700 text-stone-200 font-bold rounded-xl transition"
-                            >
-                              テスト送信
-                            </button>
-                          </div>
+                          {currentUser?.role === 'admin' ? (
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => saveIntegrations({ [w.key]: (integrations[w.key] || '').trim() })}
+                                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition"
+                              >
+                                保存
+                              </button>
+                              <button
+                                onClick={() => testIntegration(w.kind)}
+                                className="px-4 py-2 bg-stone-800 hover:bg-stone-700 text-stone-200 font-bold rounded-xl transition"
+                              >
+                                テスト送信
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-stone-500">※ Webhook の登録・変更・テストは管理者のみ可能です。</div>
+                          )}
                         </div>
                       ))}
                     </>
@@ -6082,6 +6491,88 @@ export default function App() {
                 className="w-full py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition"
               >
                 作成
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* チャンネル名変更モーダル */}
+      {editingChannel && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
+          <div className="w-full max-w-sm bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl font-mono text-xs space-y-4 anim-pop">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-white text-sm">チャンネル名を変更</span>
+              <button onClick={() => setEditingChannel(null)} className="text-stone-500 hover:text-white">&times;</button>
+            </div>
+            <form onSubmit={handleEditChannelName} className="space-y-3">
+              <div>
+                <label className="block text-stone-400 mb-1">新しいチャンネル名</label>
+                <input
+                  type="text"
+                  required
+                  value={editChannelNameInput}
+                  onChange={e => setEditChannelNameInput(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                />
+              </div>
+              <button
+                type="submit"
+                className="w-full py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition"
+              >
+                変更を保存
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* お知らせ作成モーダル (admin限定) */}
+      {isNewAnnouncementModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
+          <div className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-white text-sm flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-amber-400" /> 全体へのお知らせを作成
+              </span>
+              <button onClick={() => setIsNewAnnouncementModalOpen(false)} className="text-stone-500 hover:text-white">&times;</button>
+            </div>
+            <form onSubmit={handleCreateAnnouncement} className="space-y-3">
+              <div>
+                <label className="block text-stone-400 mb-1 font-bold">タイトル</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="例: 今週末のサーバーメンテナンスについて"
+                  value={newAnnouncementTitle}
+                  onChange={e => setNewAnnouncementTitle(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                />
+              </div>
+              <div>
+                <label className="block text-stone-400 mb-1 font-bold">内容</label>
+                <textarea
+                  rows={4}
+                  placeholder="お知らせの本文を入力してください"
+                  value={newAnnouncementContent}
+                  onChange={e => setNewAnnouncementContent(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500 resize-none leading-relaxed"
+                />
+              </div>
+              <label className="flex items-center gap-2 text-stone-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={newAnnouncementDiscord}
+                  onChange={e => setNewAnnouncementDiscord(e.target.checked)}
+                  className="rounded border-stone-700 bg-stone-900 text-amber-500"
+                />
+                <span>Discord の重要通知 Webhook にも同時に送信する</span>
+              </label>
+              <button
+                type="submit"
+                className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl transition shadow-lg text-sm"
+              >
+                お知らせを配信
               </button>
             </form>
           </div>

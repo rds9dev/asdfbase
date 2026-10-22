@@ -210,6 +210,14 @@ export async function initDb() {
         user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         PRIMARY KEY (homework_id, user_id)
       );
+      CREATE TABLE IF NOT EXISTS announcements (
+        id SERIAL PRIMARY KEY,
+        user_id INT REFERENCES users(id) ON DELETE SET NULL,
+        username VARCHAR(50),
+        title VARCHAR(200) NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
     `).catch(err => console.warn('Migration class/edit/discord/homework warning:', err.message));
 
     // 以前の編集 (updated_at だけ更新されていたもの) にも「編集済み」を付ける (初回のみ)
