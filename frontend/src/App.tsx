@@ -440,10 +440,14 @@ export default function App() {
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
 
   // アカウント同期設定のサーバー保存 (デバウンス)
+  // ※ 接続設定 (方式・ポーリング間隔・プロキシ/直結経路) は端末ごとに異なる環境用のためアカウント同期せず端末ローカルに保持
   const prefSyncTimerRef = useRef<any>(null);
   const pendingPrefsRef = useRef<Record<string, any>>({});
   const syncPreferencesToServer = (patch: Record<string, any>) => {
-    pendingPrefsRef.current = { ...pendingPrefsRef.current, ...patch };
+    // 接続設定関連のキーは絶対にアカウント同期に含めない
+    const { rtTransport, rtPollInterval, connRoute, connectionRoute, ...allowedPatch } = patch;
+    if (Object.keys(allowedPatch).length === 0) return;
+    pendingPrefsRef.current = { ...pendingPrefsRef.current, ...allowedPatch };
     clearTimeout(prefSyncTimerRef.current);
     prefSyncTimerRef.current = setTimeout(() => {
       const tk = tokenRef.current;
@@ -6639,6 +6643,11 @@ export default function App() {
               {/* 接続設定: リアルタイム方式 / ポーリング間隔 / プロキシ経由 or 直結 */}
               {settingsSection === 'connection' && (
                 <div className="space-y-4 text-xs">
+                  <div className="p-3 rounded-xl bg-stone-900 border border-stone-800 text-stone-400 flex items-center gap-2">
+                    <Shield className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span>接続設定（通信方式・ポーリング間隔・プロキシ/直結）は端末ごとのネットワーク環境に合わせてこの端末にのみ保存され、別端末とは同期されません。</span>
+                  </div>
+
                   {/* 現在の状態 */}
                   <div className="bg-[#111214] border border-stone-800/80 rounded-2xl p-5 space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">

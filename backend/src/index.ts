@@ -2951,8 +2951,10 @@ app.get('/api/users/me/preferences', authMiddleware, async (req: AuthRequest, re
 
 app.put('/api/users/me/preferences', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const patch = req.body?.preferences !== undefined ? req.body.preferences : req.body;
-    if (!patch || typeof patch !== 'object') return res.status(400).json({ error: '設定データが不正です' });
+    const rawPatch = req.body?.preferences !== undefined ? req.body.preferences : req.body;
+    if (!rawPatch || typeof rawPatch !== 'object') return res.status(400).json({ error: '設定データが不正です' });
+    // 接続設定 (方式・ポーリング間隔・プロキシ/直結経路) は端末固有のため同期から除外
+    const { rtTransport, rtPollInterval, connRoute, connectionRoute, ...patch } = rawPatch;
     const cur = (await pool.query(`SELECT preferences FROM users WHERE id = $1`, [req.user!.id])).rows[0]?.preferences || {};
     const nextPrefs = { ...cur, ...patch };
     await pool.query(`UPDATE users SET preferences = $1 WHERE id = $2`, [JSON.stringify(nextPrefs), req.user!.id]);
