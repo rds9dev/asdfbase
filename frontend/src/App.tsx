@@ -382,6 +382,7 @@ export default function App() {
   const [isCheckingAuth, setIsCheckingAuth] = useState(Boolean(localStorage.getItem('asdf_token')));
   const [isNewChannelModalOpen, setIsNewChannelModalOpen] = useState(false);
   const [newChannelName, setNewChannelName] = useState('');
+  const [newChannelServerId, setNewChannelServerId] = useState<string>('');
   const [editingChannel, setEditingChannel] = useState<{ id: number; name: string } | null>(null);
   const [editChannelNameInput, setEditChannelNameInput] = useState('');
 
@@ -2180,17 +2181,21 @@ export default function App() {
   };
 
   // Reorder Channels (Up / Down)
-  const handleMoveChannel = async (e: React.MouseEvent, index: number, direction: 'up' | 'down') => {
+  const handleMoveChannel = async (e: React.MouseEvent, index: number, direction: 'up' | 'down', visibleList?: ChannelItem[]) => {
     e.stopPropagation();
-    // index は表示中 (テキストチャンネルのみ) の並び
-    const textChannels = channels.filter(c => c.type !== 'voice');
+    const textChannels = visibleList || channels.filter(c => c.type !== 'voice');
     const targetIndex = direction === 'up' ? index - 1 : index + 1;
     if (targetIndex < 0 || targetIndex >= textChannels.length) return;
 
-    const reordered = [...textChannels];
-    const [moved] = reordered.splice(index, 1);
-    reordered.splice(targetIndex, 0, moved);
-    const newChannels = [...reordered, ...channels.filter(c => c.type === 'voice')];
+    const chA = textChannels[index];
+    const chB = textChannels[targetIndex];
+    const idxA = channels.findIndex(c => c.id === chA.id);
+    const idxB = channels.findIndex(c => c.id === chB.id);
+    if (idxA < 0 || idxB < 0) return;
+
+    const newChannels = [...channels];
+    newChannels[idxA] = chB;
+    newChannels[idxB] = chA;
     setChannels(newChannels);
 
     try {
@@ -2287,6 +2292,13 @@ export default function App() {
   const handleCreateChannel = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newChannelName.trim() || !token) return;
+    const cleanName = newChannelName.trim().toLowerCase();
+    const fallbackServerId = selectedServerId !== 'all'
+      ? selectedServerId
+      : (discordServers[0]?.id || '1524703392927191100');
+    const targetServerId = cleanName === 'general'
+      ? null
+      : (newChannelServerId || fallbackServerId);
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/channels`, {
         method: 'POST',
@@ -2297,12 +2309,13 @@ export default function App() {
         body: JSON.stringify({
           name: newChannelName,
           type: 'text',
-          server_id: selectedServerId !== 'all' ? selectedServerId : null,
+          server_id: targetServerId,
         })
       });
       if (res.ok) {
         const created = await res.json();
         setChannels(prev => prev.some(c => c.id === created.id) ? prev : [...prev, created]);
+        if (created.server_id) setSelectedServerId(created.server_id);
         setActiveChannelId(created.id);
         setIsNewChannelModalOpen(false);
         setNewChannelName('');
@@ -3777,6 +3790,29 @@ export default function App() {
     }
   };
 
+  // general 以外のチャンネルは必ず Discord サーバーに振り分ける
+  const resolveChannelServerId = (ch: ChannelItem): string => {
+    const chName = String(ch.name || '').toLowerCase();
+    if (chName === 'general') return 'all';
+    if (ch.server_id) return ch.server_id;
+    const b = discordBindings.find((x: any) => Number(x.asdfChannelId) === ch.id && x.guildId);
+    if (b?.guildId) return b.guildId;
+    if (/rds9|bot/i.test(chName)) {
+      const rds9Srv = discordServers.find(s => s.id === '1550475182643347466' || /rds9/i.test(s.name || ''));
+      return rds9Srv?.id || '1550475182643347466';
+    }
+    return discordServers[0]?.id || '1524703392927191100';
+  };
+
+  useEffect(() => {
+    const activeCh = channels.find(c => c.id === activeChannelId);
+    if (!activeCh) return;
+    const srvId = resolveChannelServerId(activeCh);
+    if (srvId !== selectedServerId) {
+      setSelectedServerId(srvId);
+    }
+  }, [activeChannelId, channels]);
+
   // 画面を離れる時は保存待ちのメモをすぐ保存
   useEffect(() => {
     const onHide = () => {
@@ -4361,49 +4397,75 @@ export default function App() {
 
             {/* Channels Sidebar (左にサーバーレール + チャンネル一覧) */}
             {!isChannelsCollapsed && (
-              <aside className="absolute md:static inset-y-0 left-0 z-40 w-72 md:w-64 border-r border-stone-800 bg-[#0C0D10] flex flex-row shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
+              <aside className="absolute md:static inset-y-0 left-0 z-40 w-80 md:w-72 lg:w-80 border-r border-stone-800 bg-[#0C0D10] flex flex-row shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
                 {/* 左端: Discord風 サーバーレール (プロキシ/ローカルキャッシュアイコン表示 & オンライン/VCバッジ) */}
-                <div className="w-14 border-r border-stone-800/80 bg-[#08090B] flex flex-col items-center py-2.5 gap-2 overflow-y-auto shrink-0 select-none">
-                  <button
-                    type="button"
-                    onClick={() => setSelectedServerId('all')}
-                    title="すべてのチャンネル (asdfbase)"
-                    className={`relative w-10 h-10 rounded-2xl flex items-center justify-center font-['Space_Grotesk'] font-black text-sm transition ${
-                      selectedServerId === 'all'
-                        ? 'bg-amber-500 text-black rounded-xl shadow-[0_0_12px_rgba(245,158,11,0.35)]'
-                        : 'bg-[#14161C] text-stone-300 hover:bg-stone-800 hover:text-white hover:rounded-xl border border-stone-800'
-                    }`}
-                  >
-                    {selectedServerId === 'all' && <span className="absolute -left-2 w-1 h-6 rounded-r bg-amber-400" />}
-                    <span>a.</span>
-                  </button>
+                <div className="w-12 border-r border-stone-800/80 bg-[#08090B] flex flex-col items-center py-2.5 gap-2 overflow-y-auto shrink-0 select-none">
+                  {(() => {
+                    const homeChs = channels.filter(c => c.type !== 'voice' && resolveChannelServerId(c) === 'all');
+                    const homeUnread = homeChs.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (unreadCounts[c.id] || 0)), 0);
+                    const homeMentions = homeChs.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (mentionCounts[c.id] || 0)), 0);
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedServerId('all');
+                          if (homeChs.length > 0 && !homeChs.some(c => c.id === activeChannelId)) {
+                            setActiveChannelId(homeChs[0].id);
+                          }
+                        }}
+                        title="asdfbase ホーム (#general)"
+                        className={`relative w-9 h-9 rounded-2xl flex items-center justify-center font-['Space_Grotesk'] font-black text-sm transition ${
+                          selectedServerId === 'all'
+                            ? 'bg-amber-500 text-black rounded-xl shadow-[0_0_12px_rgba(245,158,11,0.35)]'
+                            : 'bg-[#14161C] text-stone-300 hover:bg-stone-800 hover:text-white hover:rounded-xl border border-stone-800'
+                        }`}
+                      >
+                        {selectedServerId === 'all' ? (
+                          <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-amber-400" />
+                        ) : homeUnread > 0 ? (
+                          <span className="absolute -left-1.5 w-1 h-2.5 rounded-r bg-white" />
+                        ) : null}
+                        <span>a.</span>
+                        {homeMentions > 0 && (
+                          <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center border border-[#08090B]">
+                            {homeMentions > 99 ? '99+' : homeMentions}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })()}
 
                   <div className="w-6 h-px bg-stone-800 my-0.5 shrink-0" />
 
                   {discordServers.map((srv: any) => {
                     const isSelected = selectedServerId === srv.id;
-                    const vcCount = Array.isArray(srv.vcs) ? srv.vcs.reduce((s: number, v: any) => s + (v.members?.length || 0), 0) : 0;
+                    const vcsList = Array.isArray(srv.voiceChannels) ? srv.voiceChannels : Array.isArray(srv.vcs) ? srv.vcs : [];
+                    const vcCount = vcsList.reduce((s: number, v: any) => s + (v.members?.length || 0), 0);
+                    const srvChannels = channels.filter(c => c.type !== 'voice' && resolveChannelServerId(c) === srv.id);
+                    const srvUnread = srvChannels.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (unreadCounts[c.id] || 0)), 0);
+                    const srvMentions = srvChannels.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (mentionCounts[c.id] || 0)), 0);
                     return (
                       <button
                         key={srv.id}
                         type="button"
                         onClick={() => {
                           setSelectedServerId(srv.id);
-                          const srvChannels = channels.filter(
-                            c => c.type !== 'voice' && (c.server_id === srv.id || bindingByAsdfId.get(c.id)?.guildId === srv.id)
-                          );
                           if (srvChannels.length > 0 && !srvChannels.some(c => c.id === activeChannelId)) {
                             setActiveChannelId(srvChannels[0].id);
                           }
                         }}
                         title={`${srv.name} (${srv.onlineCount || 0}人オンライン / 全${srv.memberCount || 0}人${vcCount > 0 ? ` / VC ${vcCount}人` : ''})`}
-                        className={`relative w-10 h-10 rounded-2xl flex items-center justify-center transition group ${
+                        className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group ${
                           isSelected
                             ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
                             : 'bg-[#14161C] hover:bg-stone-800 hover:rounded-xl border border-stone-800/80'
                         }`}
                       >
-                        {isSelected && <span className="absolute -left-2 w-1 h-6 rounded-r bg-indigo-400" />}
+                        {isSelected ? (
+                          <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-indigo-400" />
+                        ) : srvUnread > 0 ? (
+                          <span className="absolute -left-1.5 w-1 h-2.5 rounded-r bg-white" />
+                        ) : null}
                         {srv.iconUrl ? (
                           <img
                             src={toProxiedMediaUrl(srv.iconUrl, token)}
@@ -4415,20 +4477,24 @@ export default function App() {
                             {String(srv.name || 'DC').slice(0, 2)}
                           </span>
                         )}
-                        {srv.onlineCount > 0 && (
-                          <span
-                            className="absolute -bottom-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-emerald-500 text-black text-[9px] font-extrabold leading-4 text-center border border-[#08090B]"
-                            title={`オンライン ${srv.onlineCount}人`}
-                          >
-                            {srv.onlineCount > 99 ? '99+' : srv.onlineCount}
+                        {srvMentions > 0 ? (
+                          <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center border border-[#08090B]">
+                            {srvMentions > 99 ? '99+' : srvMentions}
                           </span>
-                        )}
-                        {vcCount > 0 && (
+                        ) : vcCount > 0 ? (
                           <span
                             className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-indigo-500 text-white text-[9px] font-bold leading-4 text-center border border-[#08090B]"
                             title={`VC参加中 ${vcCount}人`}
                           >
                             🔊
+                          </span>
+                        ) : null}
+                        {srv.onlineCount > 0 && (
+                          <span
+                            className="absolute -bottom-1 -right-1 min-w-[15px] h-3.5 px-1 rounded-full bg-emerald-500 text-black text-[8px] font-extrabold leading-[14px] text-center border border-[#08090B]"
+                            title={`オンライン ${srv.onlineCount}人`}
+                          >
+                            {srv.onlineCount > 99 ? '99+' : srv.onlineCount}
                           </span>
                         )}
                       </button>
@@ -4443,7 +4509,7 @@ export default function App() {
                       setShowDiscordServerModal(true);
                     }}
                     title="Discord サーバー・簡単チャンネル紐付け・履歴取得"
-                    className="relative w-10 h-10 rounded-2xl bg-[#14161C] border border-dashed border-stone-700 hover:border-indigo-400 text-stone-400 hover:text-indigo-300 flex items-center justify-center transition mt-auto"
+                    className="relative w-9 h-9 rounded-2xl bg-[#14161C] border border-dashed border-stone-700 hover:border-indigo-400 text-stone-400 hover:text-indigo-300 flex items-center justify-center transition mt-auto"
                   >
                     <Server className="w-4 h-4" />
                     {currentUser?.role === 'admin' && pendingLinkRequests.length > 0 && (
@@ -4458,7 +4524,7 @@ export default function App() {
                 <div className="flex-1 min-w-0 min-h-0 flex flex-col p-2 sm:p-2.5">
                   <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-stone-400 px-1.5 mb-1.5 font-bold shrink-0 gap-1">
                     <span className="truncate text-stone-200">
-                      {selectedServer ? selectedServer.name : 'チャンネル'}
+                      {selectedServer ? selectedServer.name : 'asdfbase'}
                     </span>
                     <div className="flex items-center gap-0.5 shrink-0">
                       <button
@@ -4496,7 +4562,14 @@ export default function App() {
                       {currentUser?.role === 'admin' && (
                         <button
                           type="button"
-                          onClick={() => setIsNewChannelModalOpen(true)}
+                          onClick={() => {
+                            setNewChannelServerId(
+                              selectedServerId !== 'all'
+                                ? selectedServerId
+                                : (discordServers[0]?.id || '1524703392927191100')
+                            );
+                            setIsNewChannelModalOpen(true);
+                          }}
                           className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800"
                           title="チャンネルを作成"
                         >
@@ -4507,75 +4580,91 @@ export default function App() {
                   </div>
 
                   {/* 選択中のDiscordサーバーの人数・オンライン・VC・喋ってる人サマリー */}
-                  {selectedServer && (
-                    <div className="mb-2 p-2 rounded-xl bg-[#12141B] border border-indigo-500/25 text-[11px] space-y-1.5 shrink-0">
-                      <div className="flex items-center justify-between text-stone-300">
-                        <span className="flex items-center gap-1">
-                          <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                          <b className="text-emerald-300">{selectedServer.onlineCount || 0}</b> オンライン
-                        </span>
-                        <span className="text-stone-400">全 <b>{selectedServer.memberCount || 0}</b> 人</span>
-                      </div>
-                      {Array.isArray(selectedServer.vcs) && selectedServer.vcs.length > 0 && (
-                        <div className="space-y-1 pt-1 border-t border-stone-800/80">
-                          {selectedServer.vcs.map((vc: any) => (
-                            <div key={vc.channelId} className="space-y-0.5">
-                              <div className="text-[10px] font-bold text-indigo-300 flex items-center gap-1">
-                                <Volume2 className="w-3 h-3 animate-pulse" /> {vc.channelName} ({vc.members?.length || 0})
-                              </div>
-                              <div className="flex flex-wrap gap-1">
-                                {(vc.members || []).map((m: any) => (
-                                  <span
-                                    key={m.id}
-                                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] border ${
-                                      m.speaking
-                                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold'
-                                        : 'bg-stone-900 border-stone-800 text-stone-300'
-                                    }`}
-                                    title={`${m.name}${m.speaking ? ' (発話中/マイクON)' : ' (ミュート)'}${m.streaming ? ' [画面共有中]' : ''}`}
-                                  >
-                                    {m.avatarUrl ? (
-                                      <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
-                                    ) : (
-                                      <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
-                                    )}
-                                    <span className="max-w-[68px] truncate">{m.name}</span>
-                                    {m.speaking ? <Mic className="w-2.5 h-2.5 text-emerald-400" /> : <MicOff className="w-2.5 h-2.5 text-stone-500" />}
-                                  </span>
-                                ))}
-                              </div>
-                            </div>
-                          ))}
+                  {selectedServer && (() => {
+                    const vcsList = Array.isArray(selectedServer.voiceChannels)
+                      ? selectedServer.voiceChannels.filter((v: any) => (v.members?.length || 0) > 0)
+                      : Array.isArray(selectedServer.vcs)
+                        ? selectedServer.vcs.filter((v: any) => (v.members?.length || 0) > 0)
+                        : [];
+                    const membersList = Array.isArray(selectedServer.members)
+                      ? selectedServer.members
+                      : Array.isArray(selectedServer.onlineMembers)
+                        ? selectedServer.onlineMembers
+                        : [];
+                    return (
+                      <div className="mb-2 p-2 rounded-xl bg-[#12141B] border border-indigo-500/25 text-[11px] space-y-1.5 shrink-0">
+                        <div className="flex items-center justify-between text-stone-300">
+                          <span className="flex items-center gap-1">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                            <b className="text-emerald-300">{selectedServer.onlineCount || 0}</b> オンライン
+                          </span>
+                          <span className="text-stone-400">全 <b>{selectedServer.memberCount || 0}</b> 人</span>
                         </div>
-                      )}
-                      {Array.isArray(selectedServer.onlineMembers) && selectedServer.onlineMembers.length > 0 && (
-                        <div className="pt-1 border-t border-stone-800/80">
-                          <div className="text-[10px] text-stone-500 mb-1">オンラインメンバー</div>
-                          <div className="flex flex-wrap gap-1 max-h-16 overflow-y-auto">
-                            {selectedServer.onlineMembers.slice(0, 24).map((m: any) => (
-                              <span
-                                key={m.id}
-                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-stone-900/90 border border-stone-800 text-[10px] text-stone-300"
-                                title={`${m.name} (${m.status})${m.inVc ? ` · VC: ${m.vcChannelName}` : ''}`}
-                              >
-                                <span className={`w-1.5 h-1.5 rounded-full ${m.status === 'online' ? 'bg-emerald-400' : m.status === 'idle' ? 'bg-amber-400' : 'bg-red-400'}`} />
-                                <span className="max-w-[65px] truncate">{m.name}</span>
-                              </span>
+                        {vcsList.length > 0 && (
+                          <div className="space-y-1 pt-1 border-t border-stone-800/80">
+                            {vcsList.map((vc: any) => (
+                              <div key={vc.id || vc.channelId} className="space-y-0.5">
+                                <div className="text-[10px] font-bold text-indigo-300 flex items-center gap-1">
+                                  <Volume2 className="w-3 h-3 animate-pulse" /> {vc.name || vc.channelName} ({vc.members?.length || 0})
+                                </div>
+                                <div className="flex flex-wrap gap-1">
+                                  {(vc.members || []).map((m: any) => {
+                                    const mName = m.displayName || m.name || m.username;
+                                    const isMuted = m.selfMute || m.serverMute || m.muted;
+                                    return (
+                                      <span
+                                        key={m.id}
+                                        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] border ${
+                                          m.speaking
+                                            ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold'
+                                            : 'bg-stone-900 border-stone-800 text-stone-300'
+                                        }`}
+                                        title={`${mName}${m.speaking ? ' (発話中/マイクON)' : isMuted ? ' (ミュート)' : ''}${m.streaming ? ' [画面共有中]' : ''}`}
+                                      >
+                                        {m.avatarUrl ? (
+                                          <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
+                                        ) : (
+                                          <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
+                                        )}
+                                        <span className="max-w-[80px] truncate">{mName}</span>
+                                        {m.speaking ? <Mic className="w-2.5 h-2.5 text-emerald-400" /> : isMuted ? <MicOff className="w-2.5 h-2.5 text-stone-500" /> : null}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              </div>
                             ))}
                           </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                        )}
+                        {membersList.length > 0 && (
+                          <div className="pt-1 border-t border-stone-800/80">
+                            <div className="flex flex-wrap gap-1 max-h-14 overflow-y-auto">
+                              {membersList.slice(0, 18).map((m: any) => {
+                                const mName = m.displayName || m.name || m.username;
+                                return (
+                                  <span
+                                    key={m.id}
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-stone-900/90 border border-stone-800 text-[10px] text-stone-300"
+                                    title={`${mName} (${m.status})`}
+                                  >
+                                    <span className={`w-1.5 h-1.5 rounded-full ${m.status === 'online' ? 'bg-emerald-400' : m.status === 'idle' ? 'bg-amber-400' : 'bg-red-400'}`} />
+                                    <span className="max-w-[72px] truncate">{mName}</span>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
                   {/* チャンネル一覧: 収まらない時はこの中だけスクロール */}
                   <div className="flex-1 min-h-0 overflow-y-auto space-y-0.5 pr-0.5">
                     {channels
                       .filter(ch => {
                         if (ch.type === 'voice') return false;
-                        if (selectedServerId === 'all') return true;
-                        const b = bindingByAsdfId.get(ch.id);
-                        return ch.server_id === selectedServerId || b?.guildId === selectedServerId;
+                        return resolveChannelServerId(ch) === selectedServerId;
                       })
                       .map((ch, idx, textChannels) => {
                       const isActiveCh = activeChannelId === ch.id;
@@ -4602,10 +4691,10 @@ export default function App() {
                         ) : null}
                         <button
                           onClick={() => setActiveChannelId(ch.id)}
-                          className="flex items-center gap-1.5 flex-1 text-left truncate min-w-0"
+                          className="flex items-center gap-1.5 flex-1 text-left min-w-0"
                         >
                           <Hash className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : binding ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
-                          <span className="truncate">{ch.name}</span>
+                          <span className="truncate flex-1">{ch.name}</span>
                           {binding && (
                             <span
                               className="shrink-0 text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono"
@@ -4629,8 +4718,8 @@ export default function App() {
                             </span>
                           )}
 
-                          {/* チャンネル操作 (名前変更 / 権限設定 / 並び替え / 同期解除 / 削除) */}
-                          <div className="opacity-0 group-hover:opacity-100 flex items-center transition">
+                          {/* チャンネル操作: ホバー時のみ表示して通常時はチャンネル名の幅を広く確保 */}
+                          <div className="hidden group-hover:flex items-center">
                             {binding && (
                               <button
                                 type="button"
@@ -4670,7 +4759,7 @@ export default function App() {
                             )}
                             {currentUser?.role === 'admin' && idx > 0 && (
                               <button
-                                onClick={e => handleMoveChannel(e, idx, 'up')}
+                                onClick={e => handleMoveChannel(e, idx, 'up', textChannels)}
                                 className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
                                 title="上へ移動"
                               >
@@ -4679,7 +4768,7 @@ export default function App() {
                             )}
                             {currentUser?.role === 'admin' && idx < textChannels.length - 1 && (
                               <button
-                                onClick={e => handleMoveChannel(e, idx, 'down')}
+                                onClick={e => handleMoveChannel(e, idx, 'down', textChannels)}
                                 className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
                                 title="下へ移動"
                               >
@@ -4691,7 +4780,7 @@ export default function App() {
                           {channels.length > 1 && (currentUser?.role === 'admin' || Boolean(binding) || Boolean(ch.server_id)) && (
                             <button
                               onClick={() => handleDeleteChannel(ch.id)}
-                              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-500"
+                              className="hidden group-hover:inline-flex p-0.5 hover:text-red-400 rounded text-stone-500"
                               title="チャンネル削除"
                             >
                               <Trash2 className="w-3 h-3" />
@@ -4701,7 +4790,7 @@ export default function App() {
                       </div>
                       );
                     })}
-                    {selectedServer && channels.filter(ch => ch.type !== 'voice' && (ch.server_id === selectedServer.id || bindingByAsdfId.get(ch.id)?.guildId === selectedServer.id)).length === 0 && (
+                    {selectedServer && channels.filter(ch => ch.type !== 'voice' && resolveChannelServerId(ch) === selectedServer.id).length === 0 && (
                       <div className="p-3 text-center text-xs text-stone-500 space-y-2 border border-dashed border-stone-800 rounded-xl mt-2">
                         <div>このサーバーに紐付いたチャンネルがまだありません</div>
                         <button
@@ -7544,6 +7633,18 @@ export default function App() {
               <button onClick={() => setIsNewChannelModalOpen(false)} className="text-stone-500 hover:text-white">&times;</button>
             </div>
             <form onSubmit={handleCreateChannel} className="space-y-3">
+              <div>
+                <label className="block text-stone-400 mb-1">所属サーバー</label>
+                <select
+                  value={newChannelServerId || (selectedServerId !== 'all' ? selectedServerId : (discordServers[0]?.id || '1524703392927191100'))}
+                  onChange={e => setNewChannelServerId(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                >
+                  {discordServers.map(srv => (
+                    <option key={srv.id} value={srv.id}>{srv.name}</option>
+                  ))}
+                </select>
+              </div>
               <div>
                 <label className="block text-stone-400 mb-1">チャンネル名</label>
                 <input

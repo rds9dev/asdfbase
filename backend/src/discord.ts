@@ -64,6 +64,7 @@ export interface DiscordDeps {
   getSetting: (key: string, fallback?: string) => Promise<string>;
   setSetting: (key: string, value: string) => Promise<void>;
   listAsdfChannels: () => Promise<{ id: number; name: string; type: string; server_id?: string | null }[]>;
+  assignChannelServer?: (asdfChannelId: number, guildId: string) => Promise<void>;
   // Discord から来たメッセージを asdfbase に保存・配信
   ingest: (asdfChannelId: number, username: string, content: string, meta: DiscordIngestMeta) => Promise<void>;
   // 既にその Discord メッセージIDが取り込み済みか確認 (ダウンタイム履歴同期用)
@@ -166,9 +167,12 @@ export async function addDiscordBinding(discordChannelId: string, asdfChannelId:
   const bindings = await getBindings();
   const ch = client?.channels.cache.get(discordChannelId) as any;
   const resolvedGuildId = guildId || ch?.guildId || undefined;
-  const next = bindings.filter(b => !(b.discordChannelId === discordChannelId && b.asdfChannelId === asdfChannelId) && b.discordChannelId !== discordChannelId);
+  const next = bindings.filter(b => b.discordChannelId !== discordChannelId && b.asdfChannelId !== asdfChannelId);
   next.push({ discordChannelId, asdfChannelId, guildId: resolvedGuildId });
   await saveBindings(next);
+  if (resolvedGuildId && deps?.assignChannelServer) {
+    await deps.assignChannelServer(asdfChannelId, resolvedGuildId).catch(() => {});
+  }
   return next;
 }
 
@@ -219,18 +223,21 @@ export async function getDiscordStatus() {
     guildName: guildNames.length > 0 ? guildNames.join(', ') : null,
     intentWarning,
     lastError,
-    bindings: bindings.map(b => {
-      const ch = client?.channels.cache.get(b.discordChannelId) as any;
-      const gId = b.guildId || ch?.guildId || null;
-      const gName = gId ? client?.guilds.cache.get(gId)?.name || null : null;
-      return {
-        ...b,
-        guildId: gId,
-        guildName: gName,
-        discordChannelName: ch?.name || b.discordChannelId,
-        asdfChannelName: channels.find(c => c.id === b.asdfChannelId)?.name || String(b.asdfChannelId),
-      };
-    }),
+    bindings: bindings
+      .filter(b => !connected || !client || client.channels.cache.has(b.discordChannelId))
+      .map(b => {
+        const ch = client?.channels.cache.get(b.discordChannelId) as any;
+        const gId = b.guildId || ch?.guildId || null;
+        const gName = gId ? client?.guilds.cache.get(gId)?.name || null : null;
+        return {
+          ...b,
+          guildId: gId,
+          guildName: gName,
+          discordGuildName: gName,
+          discordChannelName: ch?.name || b.discordChannelId,
+          asdfChannelName: channels.find(c => c.id === b.asdfChannelId)?.name || String(b.asdfChannelId),
+        };
+      }),
   };
 }
 
@@ -290,9 +297,12 @@ async function handleCommand(interaction: ChatInputCommandInteraction) {
       await interaction.reply({ content: 'asdfbase のチャンネルが見つかりません。', ephemeral: true });
       return;
     }
-    const next = bindings.filter(b => b.discordChannelId !== interaction.channelId);
+    const next = bindings.filter(b => b.discordChannelId !== interaction.channelId && b.asdfChannelId !== asdfChannelId);
     next.push({ discordChannelId: interaction.channelId, asdfChannelId, guildId: interaction.guildId || undefined });
     await saveBindings(next);
+    if (interaction.guildId && deps?.assignChannelServer) {
+      await deps.assignChannelServer(asdfChannelId, interaction.guildId).catch(() => {});
+    }
     deps!.audit('discord_setup', {
       message: `Discord #${(interaction.channel as any)?.name || interaction.channelId} ⇔ asdfbase #${target.name} を同期設定`,
       discordUser: interaction.user.tag,

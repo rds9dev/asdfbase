@@ -583,7 +583,12 @@ app.post('/api/channels', authMiddleware, adminOnly, async (req, res) => {
             return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
         }
         const chType = type === 'voice' ? 'voice' : 'text';
-        const cleanServerId = server_id ? String(server_id).trim() : null;
+        const defaultGuildId = /rds9|bot/i.test(cleanName)
+            ? '1550475182643347466'
+            : (process.env.DISCORD_GUILD_ID?.split(',')[0]?.trim() || '1524703392927191100');
+        const cleanServerId = cleanName === 'general'
+            ? null
+            : (server_id ? String(server_id).trim() : defaultGuildId);
         const cleanViewRoles = Array.isArray(view_roles) ? view_roles.map(String) : [];
         const cleanWriteRoles = Array.isArray(write_roles) ? write_roles.map(String) : [];
         const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
@@ -1768,20 +1773,21 @@ app.post('/api/discord/bindings', authMiddleware, async (req, res) => {
             if (existing.rows.length > 0) {
                 targetAsdfChId = existing.rows[0].id;
                 if (cleanGuildId) {
-                    const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 RETURNING *`, [cleanGuildId, targetAsdfChId]);
-                    broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+                    const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 AND LOWER(name) != 'general' RETURNING *`, [cleanGuildId, targetAsdfChId]);
+                    if (upd.rows[0])
+                        broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
                 }
             }
             else {
                 const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
                 const nextPos = parseInt(maxPosRes.rows[0].max_pos, 10) + 1;
-                const created = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id) VALUES ($1, 'text', $2, $3) RETURNING *`, [cleanName, nextPos, cleanGuildId || null]);
+                const created = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id) VALUES ($1, 'text', $2, $3) RETURNING *`, [cleanName, nextPos, cleanName === 'general' ? null : (cleanGuildId || null)]);
                 targetAsdfChId = created.rows[0].id;
                 broadcast({ type: 'CHANNEL_CREATED', payload: created.rows[0] });
             }
         }
         else if (targetAsdfChId && cleanGuildId) {
-            const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = COALESCE(server_id, $1) WHERE id = $2 RETURNING *`, [cleanGuildId, targetAsdfChId]);
+            const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 AND LOWER(name) != 'general' RETURNING *`, [cleanGuildId, targetAsdfChId]);
             if (upd.rows[0])
                 broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
         }
@@ -1833,7 +1839,7 @@ app.post('/api/discord/link-requests/:id/approve', authMiddleware, adminOnly, as
             }
         }
         if (targetAsdfChId && linkReq.guild_id) {
-            const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = COALESCE(server_id, $1) WHERE id = $2 RETURNING *`, [linkReq.guild_id, targetAsdfChId]);
+            const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 AND LOWER(name) != 'general' RETURNING *`, [linkReq.guild_id, targetAsdfChId]);
             if (upd.rows[0])
                 broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
         }
@@ -3507,6 +3513,11 @@ server.listen(PORT, async () => {
             getSetting,
             setSetting,
             listAsdfChannels: async () => (await db_js_1.pool.query(`SELECT id, name, type, server_id FROM channels ORDER BY position ASC, id ASC`)).rows,
+            assignChannelServer: async (asdfChannelId, guildId) => {
+                const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 AND LOWER(name) != 'general' RETURNING *`, [guildId, asdfChannelId]);
+                if (upd.rows[0])
+                    broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+            },
             isDiscordMessageSynced: async (discordMessageId) => {
                 const res = await db_js_1.pool.query(`SELECT 1 FROM discord_message_links WHERE discord_message_id = $1 LIMIT 1`, [discordMessageId]);
                 return res.rows.length > 0;

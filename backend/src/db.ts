@@ -279,6 +279,26 @@ export async function initDb() {
       await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_test_exam_type', 'done') ON CONFLICT DO NOTHING`);
     }
 
+    // general 以外の既存チャンネルを対応する Discord サーバーへ振り分け (初回のみ)
+    const srvMigrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_channel_server_assign_v1'`);
+    if (srvMigrated.rows.length === 0) {
+      await client.query(`UPDATE channels SET server_id = NULL WHERE LOWER(name) = 'general'`);
+      await client.query(`UPDATE channels SET server_id = '1550475182643347466' WHERE server_id IS NULL AND (name ILIKE '%rds9%' OR name ILIKE '%bot%')`);
+      await client.query(`UPDATE channels SET server_id = '1524703392927191100' WHERE server_id IS NULL AND LOWER(name) <> 'general'`);
+      // 削除済み Discord チャンネル (1562072121612697692) の古いバインディングを除去
+      const bRes = await client.query(`SELECT value FROM system_settings WHERE key = 'discord_bindings'`);
+      if (bRes.rows.length > 0 && bRes.rows[0].value) {
+        try {
+          const list = JSON.parse(bRes.rows[0].value);
+          if (Array.isArray(list)) {
+            const cleaned = list.filter((b: any) => b.discordChannelId !== '1562072121612697692');
+            await client.query(`UPDATE system_settings SET value = $1 WHERE key = 'discord_bindings'`, [JSON.stringify(cleaned)]);
+          }
+        } catch (_) {}
+      }
+      await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_channel_server_assign_v1', 'done') ON CONFLICT DO NOTHING`);
+    }
+
     // 初期チャンネルの作成
     const channelRes = await client.query('SELECT COUNT(*) FROM channels');
     if (parseInt(channelRes.rows[0].count, 10) === 0) {
