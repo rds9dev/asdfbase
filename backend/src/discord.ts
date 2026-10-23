@@ -23,6 +23,7 @@ import fs from 'fs';
 export interface DiscordBinding {
   discordChannelId: string;
   asdfChannelId: number;
+  guildId?: string;
 }
 
 export interface DiscordIngestMeta {
@@ -31,6 +32,7 @@ export interface DiscordIngestMeta {
   // 本文 (テキスト部分) のときだけ。あとで Discord 側の編集を反映するのに使う
   discordMessageId: string | null;
   replyToDiscordMsgId?: string | null;
+  createdAt?: string | null;
 }
 
 // asdfbase → Discord に Bot が送ったメッセージ
@@ -39,19 +41,33 @@ export interface RelayedMessage {
   discordMessageId: string;
 }
 
+export interface DiscordVoiceMemberInfo {
+  id: string;
+  name: string;
+  avatarUrl: string | null;
+  muted?: boolean;
+  deafened?: boolean;
+  speaking?: boolean;
+  streaming?: boolean;
+  video?: boolean;
+}
+
 export interface DiscordVoiceChannelInfo {
+  guildId?: string;
   guildName: string;
   channelName: string;
   channelId: string;
-  members: { id: string; name: string; avatarUrl: string | null }[];
+  members: DiscordVoiceMemberInfo[];
 }
 
 export interface DiscordDeps {
   getSetting: (key: string, fallback?: string) => Promise<string>;
   setSetting: (key: string, value: string) => Promise<void>;
-  listAsdfChannels: () => Promise<{ id: number; name: string; type: string }[]>;
+  listAsdfChannels: () => Promise<{ id: number; name: string; type: string; server_id?: string | null }[]>;
   // Discord から来たメッセージを asdfbase に保存・配信
   ingest: (asdfChannelId: number, username: string, content: string, meta: DiscordIngestMeta) => Promise<void>;
+  // 既にその Discord メッセージIDが取り込み済みか確認 (ダウンタイム履歴同期用)
+  isDiscordMessageSynced?: (discordMessageId: string) => Promise<boolean>;
   // Discord 側でメッセージが編集された
   ingestEdit: (discordMessageId: string, content: string) => Promise<void>;
   // Discord 側でメッセージが削除された (取り消し線反映)
@@ -77,18 +93,56 @@ export interface DiscordDeps {
 }
 
 const BINDINGS_KEY = 'discord_bindings';
+const APPROVED_GUILDS_KEY = 'discord_approved_guilds';
 const VIDEO_NOTICE = '(動画が送信されています)';
 
 let client: Client | null = null;
 let deps: DiscordDeps | null = null;
+let envGuildIds: string[] = [];
+let approvedGuildIds: string[] = [];
 let allowedGuildIds: string[] = [];
 let connected = false;
 let lastError = '';
 let intentWarning = '';
 let bindingsCache: DiscordBinding[] | null = null;
 
+function rebuildAllowedGuildIds() {
+  allowedGuildIds = Array.from(new Set([...envGuildIds, ...approvedGuildIds]));
+}
+
 function isGuildAllowed(gid: string | null | undefined): boolean {
   return Boolean(gid && allowedGuildIds.includes(gid));
+}
+
+async function loadApprovedGuilds() {
+  if (!deps) return;
+  try {
+    const raw = await deps.getSetting(APPROVED_GUILDS_KEY, '[]');
+    const parsed = JSON.parse(raw);
+    approvedGuildIds = Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+  } catch {
+    approvedGuildIds = [];
+  }
+  rebuildAllowedGuildIds();
+}
+
+export async function approveDiscordGuild(guildId: string) {
+  if (!deps) return;
+  await loadApprovedGuilds();
+  if (!approvedGuildIds.includes(guildId)) {
+    approvedGuildIds.push(guildId);
+    await deps.setSetting(APPROVED_GUILDS_KEY, JSON.stringify(approvedGuildIds));
+  }
+  rebuildAllowedGuildIds();
+  await refreshDiscordCommands();
+}
+
+export async function removeApprovedDiscordGuild(guildId: string) {
+  if (!deps) return;
+  await loadApprovedGuilds();
+  approvedGuildIds = approvedGuildIds.filter(id => id !== guildId);
+  await deps.setSetting(APPROVED_GUILDS_KEY, JSON.stringify(approvedGuildIds));
+  rebuildAllowedGuildIds();
 }
 
 async function getBindings(): Promise<DiscordBinding[]> {
@@ -108,6 +162,33 @@ async function saveBindings(list: DiscordBinding[]) {
   await deps!.setSetting(BINDINGS_KEY, JSON.stringify(list));
 }
 
+export async function addDiscordBinding(discordChannelId: string, asdfChannelId: number, guildId?: string) {
+  const bindings = await getBindings();
+  const ch = client?.channels.cache.get(discordChannelId) as any;
+  const resolvedGuildId = guildId || ch?.guildId || undefined;
+  const next = bindings.filter(b => !(b.discordChannelId === discordChannelId && b.asdfChannelId === asdfChannelId) && b.discordChannelId !== discordChannelId);
+  next.push({ discordChannelId, asdfChannelId, guildId: resolvedGuildId });
+  await saveBindings(next);
+  return next;
+}
+
+export async function removeDiscordBinding(filter: { discordChannelId?: string; asdfChannelId?: number }): Promise<number> {
+  const bindings = await getBindings();
+  const next = bindings.filter(b => {
+    if (filter.discordChannelId && filter.asdfChannelId) {
+      return !(b.discordChannelId === filter.discordChannelId && b.asdfChannelId === filter.asdfChannelId);
+    }
+    if (filter.discordChannelId) return b.discordChannelId !== filter.discordChannelId;
+    if (filter.asdfChannelId) return b.asdfChannelId !== filter.asdfChannelId;
+    return true;
+  });
+  const removed = bindings.length - next.length;
+  if (removed > 0) {
+    await saveBindings(next);
+  }
+  return removed;
+}
+
 // Bot で Discord に同期している asdfbase チャンネル
 export async function getBoundAsdfChannelIds(): Promise<number[]> {
   if (!client || !deps) return [];
@@ -124,18 +205,28 @@ export async function getDiscordStatus() {
   const guildNames = allowedGuildIds
     .map(gid => client?.guilds.cache.get(gid)?.name)
     .filter(Boolean);
+  const botClientId = client?.user?.id || process.env.DISCORD_CLIENT_ID || null;
+  const inviteUrl = botClientId
+    ? `https://discord.com/api/oauth2/authorize?client_id=${botClientId}&permissions=274878294080&scope=bot%20applications.commands`
+    : null;
   return {
     enabled: Boolean(client),
     connected,
     botTag: client?.user?.tag || null,
+    botClientId,
+    inviteUrl,
     guildId: allowedGuildIds.join(','),
     guildName: guildNames.length > 0 ? guildNames.join(', ') : null,
     intentWarning,
     lastError,
     bindings: bindings.map(b => {
       const ch = client?.channels.cache.get(b.discordChannelId) as any;
+      const gId = b.guildId || ch?.guildId || null;
+      const gName = gId ? client?.guilds.cache.get(gId)?.name || null : null;
       return {
         ...b,
+        guildId: gId,
+        guildName: gName,
         discordChannelName: ch?.name || b.discordChannelId,
         asdfChannelName: channels.find(c => c.id === b.asdfChannelId)?.name || String(b.asdfChannelId),
       };
@@ -200,7 +291,7 @@ async function handleCommand(interaction: ChatInputCommandInteraction) {
       return;
     }
     const next = bindings.filter(b => b.discordChannelId !== interaction.channelId);
-    next.push({ discordChannelId: interaction.channelId, asdfChannelId });
+    next.push({ discordChannelId: interaction.channelId, asdfChannelId, guildId: interaction.guildId || undefined });
     await saveBindings(next);
     deps!.audit('discord_setup', {
       message: `Discord #${(interaction.channel as any)?.name || interaction.channelId} ⇔ asdfbase #${target.name} を同期設定`,
@@ -283,6 +374,28 @@ export interface DiscordMemberInfo {
   status: 'online' | 'idle' | 'dnd' | 'offline';
   activity: string | null;
   roles: string[];
+  isBot?: boolean;
+  inVoice?: boolean;
+  speaking?: boolean;
+}
+
+export interface DiscordTextChannelInfo {
+  id: string;
+  name: string;
+  parentName: string | null;
+  boundAsdfChannelId: number | null;
+}
+
+export interface DiscordServerInfo {
+  id: string;
+  name: string;
+  iconUrl: string | null;
+  approved: boolean;
+  memberCount: number;
+  onlineCount: number;
+  members: DiscordMemberInfo[];
+  voiceChannels: DiscordVoiceChannelInfo[];
+  textChannels: DiscordTextChannelInfo[];
 }
 
 export interface DiscordGuildStatus {
@@ -294,10 +407,172 @@ export interface DiscordGuildStatus {
   onlineCount: number;
   members: DiscordMemberInfo[];
   voiceChannels: DiscordVoiceChannelInfo[];
+  servers?: DiscordServerInfo[];
+}
+
+async function resolveGuildIcon(guild: any): Promise<string | null> {
+  if (!guild?.icon) return null;
+  const rawUrl = guild.iconURL({ extension: 'png', size: 128 });
+  if (!rawUrl) return null;
+  if (deps?.saveAvatar) {
+    const saved = await deps.saveAvatar(`guild-${guild.id}-${guild.icon}`, rawUrl).catch(() => null);
+    if (saved) return saved;
+  }
+  return `/api/proxy/media?url=${encodeURIComponent(rawUrl)}`;
+}
+
+async function resolveMemberAvatar(m: any): Promise<string | null> {
+  try {
+    const hash = m.avatar || m.user?.avatar || 'default';
+    const rawUrl = m.displayAvatarURL({ extension: 'png', size: 64 });
+    if (!rawUrl) return null;
+    if (deps?.saveAvatar) {
+      const saved = await deps.saveAvatar(`member-${m.id}-${hash}`, rawUrl).catch(() => null);
+      if (saved) return saved;
+    }
+    return `/api/proxy/media?url=${encodeURIComponent(rawUrl)}`;
+  } catch {
+    return null;
+  }
+}
+
+export async function getDiscordServers(includeUnapproved = false): Promise<DiscordServerInfo[]> {
+  if (!client || !connected) return [];
+  const bindings = deps ? await getBindings() : [];
+  const servers: DiscordServerInfo[] = [];
+
+  for (const guild of client.guilds.cache.values()) {
+    const approved = isGuildAllowed(guild.id);
+    if (!includeUnapproved && !approved) continue;
+
+    const iconUrl = await resolveGuildIcon(guild);
+
+    // ボイスチャンネル情報
+    const voiceChannels: DiscordVoiceChannelInfo[] = [];
+    const voiceMemberIds = new Set<string>();
+    const speakingMemberIds = new Set<string>();
+
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.isVoiceBased()) {
+        const rawMembers = Array.from(channel.members.values());
+        const vcMembers: DiscordVoiceMemberInfo[] = await Promise.all(
+          rawMembers.map(async m => {
+            const muted = Boolean(m.voice?.mute || m.voice?.selfMute || m.voice?.serverMute);
+            const deafened = Boolean(m.voice?.deaf || m.voice?.selfDeaf || m.voice?.serverDeaf);
+            const speaking = !muted && !deafened;
+            const streaming = Boolean(m.voice?.streaming);
+            const video = Boolean(m.voice?.selfVideo);
+            voiceMemberIds.add(m.id);
+            if (speaking) speakingMemberIds.add(m.id);
+            return {
+              id: m.id,
+              name: m.displayName || m.user.globalName || m.user.username,
+              avatarUrl: await resolveMemberAvatar(m),
+              muted,
+              deafened,
+              speaking,
+              streaming,
+              video,
+            };
+          })
+        );
+        if (vcMembers.length > 0) {
+          voiceChannels.push({
+            guildId: guild.id,
+            guildName: guild.name,
+            channelName: channel.name,
+            channelId: channel.id,
+            members: vcMembers,
+          });
+        }
+      }
+    }
+
+    // テキストチャンネル一覧 (簡単紐付け用)
+    const textChannels: DiscordTextChannelInfo[] = [];
+    for (const channel of guild.channels.cache.values()) {
+      // GuildText (0) or GuildAnnouncement (5)
+      if ((channel as any).type === 0 || (channel as any).type === 5) {
+        const binding = bindings.find(b => b.discordChannelId === channel.id);
+        textChannels.push({
+          id: channel.id,
+          name: channel.name,
+          parentName: (channel as any).parent?.name || null,
+          boundAsdfChannelId: binding ? binding.asdfChannelId : null,
+        });
+      }
+    }
+
+    // メンバー & オンライン状態
+    let memberCollection = guild.members.cache;
+    if (guild.members.cache.size <= 2) {
+      memberCollection = await guild.members.fetch({ time: 3500 }).catch(() => guild.members.cache);
+    }
+
+    const rawMemberList = Array.from(memberCollection.values());
+    let onlineCount = 0;
+    for (const m of rawMemberList) {
+      const st = m.presence?.status || 'offline';
+      if (st !== 'offline' || voiceMemberIds.has(m.id)) onlineCount++;
+    }
+
+    // オンラインまたはVC参加中のメンバーを優先して最大60名取得
+    const sortedRaw = rawMemberList
+      .filter(m => !m.user.bot || voiceMemberIds.has(m.id) || (m.presence?.status && m.presence.status !== 'offline'))
+      .sort((a, b) => {
+        const aVc = voiceMemberIds.has(a.id) ? 0 : 1;
+        const bVc = voiceMemberIds.has(b.id) ? 0 : 1;
+        if (aVc !== bVc) return aVc - bVc;
+        const order: Record<string, number> = { online: 0, idle: 1, dnd: 2, offline: 3 };
+        const aSt = order[a.presence?.status || 'offline'] ?? 3;
+        const bSt = order[b.presence?.status || 'offline'] ?? 3;
+        return aSt - bSt;
+      })
+      .slice(0, 60);
+
+    const members: DiscordMemberInfo[] = await Promise.all(
+      sortedRaw.map(async m => {
+        const presence = m.presence;
+        const status = (presence?.status || (voiceMemberIds.has(m.id) ? 'online' : 'offline')) as DiscordMemberInfo['status'];
+        const acts = presence?.activities || [];
+        const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2 || a.type === 4);
+        const activityText = gameAct
+          ? (gameAct.type === 4 ? (gameAct.state || gameAct.name) : `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}`)
+          : null;
+
+        return {
+          id: m.id,
+          username: m.user.username,
+          displayName: m.displayName || m.user.globalName || m.user.username,
+          avatarUrl: await resolveMemberAvatar(m),
+          status,
+          activity: activityText,
+          roles: m.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).slice(0, 5),
+          isBot: m.user.bot,
+          inVoice: voiceMemberIds.has(m.id),
+          speaking: speakingMemberIds.has(m.id),
+        };
+      })
+    );
+
+    servers.push({
+      id: guild.id,
+      name: guild.name,
+      iconUrl,
+      approved,
+      memberCount: guild.memberCount || rawMemberList.length,
+      onlineCount,
+      members,
+      voiceChannels,
+      textChannels,
+    });
+  }
+
+  return servers;
 }
 
 export async function getDiscordGuildStatus(): Promise<DiscordGuildStatus> {
-  if (!client || !connected || allowedGuildIds.length === 0) {
+  if (!client || !connected) {
     return {
       enabled: Boolean(client),
       connected,
@@ -307,69 +582,23 @@ export async function getDiscordGuildStatus(): Promise<DiscordGuildStatus> {
       onlineCount: 0,
       members: [],
       voiceChannels: [],
+      servers: [],
     };
   }
 
-  const gid = allowedGuildIds[0];
-  const guild = client.guilds.cache.get(gid);
-  if (!guild) {
-    return {
-      enabled: true,
-      connected: false,
-      guildId: gid,
-      guildName: null,
-      memberCount: 0,
-      onlineCount: 0,
-      members: [],
-      voiceChannels: [],
-    };
-  }
-
-  // メンバーの取得
-  let members: DiscordMemberInfo[] = [];
-  try {
-    const fetched = await guild.members.fetch({ time: 5000 }).catch(() => guild.members.cache);
-    members = Array.from(fetched.values()).map(m => {
-      const presence = m.presence;
-      const status = presence?.status || 'offline';
-      const acts = presence?.activities || [];
-      const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2);
-      const activityText = gameAct ? `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}` : null;
-
-      return {
-        id: m.id,
-        username: m.user.username,
-        displayName: m.displayName || m.user.globalName || m.user.username,
-        avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
-        status: status as any,
-        activity: activityText,
-        roles: m.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).slice(0, 5),
-      };
-    });
-  } catch (_) {
-    // フォールバック: キャッシュから
-    members = Array.from(guild.members.cache.values()).map(m => ({
-      id: m.id,
-      username: m.user.username,
-      displayName: m.displayName || m.user.username,
-      avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
-      status: (m.presence?.status || 'offline') as any,
-      activity: null,
-      roles: [],
-    }));
-  }
-
-  const onlineMembers = members.filter(m => m.status !== 'offline');
+  const servers = await getDiscordServers(false);
+  const first = servers[0] || null;
 
   return {
     enabled: true,
     connected: true,
-    guildId: guild.id,
-    guildName: guild.name,
-    memberCount: guild.memberCount || members.length,
-    onlineCount: onlineMembers.length,
-    members: members.slice(0, 50),
+    guildId: first?.id || null,
+    guildName: first?.name || null,
+    memberCount: first?.memberCount || 0,
+    onlineCount: first?.onlineCount || 0,
+    members: first?.members || [],
     voiceChannels: getDiscordVoiceStatus(),
+    servers,
   };
 }
 
@@ -381,13 +610,24 @@ export function getDiscordVoiceStatus(): DiscordVoiceChannelInfo[] {
     if (!guild) continue;
     for (const channel of guild.channels.cache.values()) {
       if (channel.isVoiceBased()) {
-        const members = Array.from(channel.members.values()).map(m => ({
-          id: m.id,
-          name: m.displayName || m.user.globalName || m.user.username,
-          avatarUrl: m.displayAvatarURL({ extension: 'png', size: 64 }),
-        }));
+        const members: DiscordVoiceMemberInfo[] = Array.from(channel.members.values()).map(m => {
+          const muted = Boolean(m.voice?.mute || m.voice?.selfMute || m.voice?.serverMute);
+          const deafened = Boolean(m.voice?.deaf || m.voice?.selfDeaf || m.voice?.serverDeaf);
+          const rawUrl = m.displayAvatarURL({ extension: 'png', size: 64 });
+          return {
+            id: m.id,
+            name: m.displayName || m.user.globalName || m.user.username,
+            avatarUrl: rawUrl ? `/api/proxy/media?url=${encodeURIComponent(rawUrl)}` : null,
+            muted,
+            deafened,
+            speaking: !muted && !deafened,
+            streaming: Boolean(m.voice?.streaming),
+            video: Boolean(m.voice?.selfVideo),
+          };
+        });
         if (members.length > 0) {
           result.push({
+            guildId: guild.id,
             guildName: guild.name,
             channelName: channel.name,
             channelId: channel.id,
@@ -420,12 +660,9 @@ async function avatarFor(msg: DiscordMessage): Promise<string | null> {
   }
 }
 
-async function handleDiscordMessage(msg: DiscordMessage) {
-  if (!isGuildAllowed(msg.guildId)) return;
-  if (msg.author.bot || msg.webhookId) return; // 自分の転送を再取り込みしない
-  const bindings = await getBindings();
-  const targets = bindings.filter(b => b.discordChannelId === msg.channelId);
-  if (targets.length === 0) return;
+async function processDiscordMessage(msg: DiscordMessage, targets: DiscordBinding[], isHistorySync = false): Promise<number> {
+  if (msg.author.bot || msg.webhookId) return 0; // 自分の転送を再取り込みしない
+  if (targets.length === 0) return 0;
 
   const name = `[Discord] ${msg.member?.displayName || msg.author.globalName || msg.author.username}`;
   const avatarUrl = await avatarFor(msg);
@@ -433,12 +670,6 @@ async function handleDiscordMessage(msg: DiscordMessage) {
   const rawText = msg.cleanContent?.trim();
   const text = rawText ? formatDiscordContent(rawText) : '';
   if (text) parts.push(text);
-
-  // @everyone / @here 通知
-  if (msg.mentions.everyone || /@everyone|@here/.test(msg.content)) {
-    const chName = (msg.channel as any)?.name || 'channel';
-    deps?.notifyImportant?.(`📢 Discord #${chName} で全体メンション`, `**${name}**: ${text || '(添付ファイル)'}`);
-  }
 
   for (const att of msg.attachments.values()) {
     if (isVideo(att)) {
@@ -483,20 +714,92 @@ async function handleDiscordMessage(msg: DiscordMessage) {
     }
   }
 
-  if (parts.length === 0) return;
+  if (parts.length === 0) return 0;
 
   const replyToDiscordMsgId = msg.reference?.messageId || null;
+  const createdAt = isHistorySync && msg.createdTimestamp ? new Date(msg.createdTimestamp).toISOString() : null;
+  let count = 0;
 
   for (const t of targets) {
     for (let i = 0; i < parts.length; i++) {
       await deps!.ingest(t.asdfChannelId, name, parts[i], {
         avatarUrl,
         discordChannelId: msg.channelId,
-        discordMessageId: i === 0 && text ? msg.id : null,
+        discordMessageId: i === 0 ? msg.id : null,
         replyToDiscordMsgId: i === 0 ? replyToDiscordMsgId : null,
+        createdAt,
       });
+      count++;
     }
   }
+  return count;
+}
+
+async function handleDiscordMessage(msg: DiscordMessage) {
+  if (!isGuildAllowed(msg.guildId)) return;
+  if (msg.author.bot || msg.webhookId) return;
+  const bindings = await getBindings();
+  const targets = bindings.filter(b => b.discordChannelId === msg.channelId);
+  if (targets.length === 0) return;
+  await processDiscordMessage(msg, targets, false);
+}
+
+// Bot ダウンタイム中などに未取得だった Discord メッセージを遡って同期
+export async function syncDiscordHistory(opts?: {
+  asdfChannelId?: number;
+  discordChannelId?: string;
+  guildId?: string;
+  limit?: number;
+}): Promise<{ syncedMessages: number; checkedChannels: number }> {
+  if (!client || !connected || !deps) return { syncedMessages: 0, checkedChannels: 0 };
+  const allBindings = await getBindings();
+  const filtered = allBindings.filter(b => {
+    if (opts?.asdfChannelId && b.asdfChannelId !== opts.asdfChannelId) return false;
+    if (opts?.discordChannelId && b.discordChannelId !== opts.discordChannelId) return false;
+    if (opts?.guildId && b.guildId && b.guildId !== opts.guildId) return false;
+    return true;
+  });
+
+  // 同じ discordChannelId ごとにまとめる
+  const byDiscordCh = new Map<string, DiscordBinding[]>();
+  for (const b of filtered) {
+    const arr = byDiscordCh.get(b.discordChannelId) || [];
+    arr.push(b);
+    byDiscordCh.set(b.discordChannelId, arr);
+  }
+
+  const fetchLimit = Math.min(Math.max(opts?.limit || 50, 10), 100);
+  let syncedMessages = 0;
+  let checkedChannels = 0;
+
+  for (const [discordChannelId, targets] of byDiscordCh.entries()) {
+    try {
+      const ch = (await client.channels.fetch(discordChannelId).catch(() => null)) as TextBasedChannel | null;
+      if (!ch || !('messages' in ch) || !isGuildAllowed((ch as any).guildId)) continue;
+      checkedChannels++;
+
+      const fetched = await (ch as any).messages.fetch({ limit: fetchLimit }).catch(() => null);
+      if (!fetched) continue;
+
+      const sorted = (Array.from(fetched.values()) as DiscordMessage[]).sort(
+        (a, b) => a.createdTimestamp - b.createdTimestamp
+      );
+
+      for (const msg of sorted) {
+        if (msg.author.bot || msg.webhookId) continue;
+        if (deps.isDiscordMessageSynced) {
+          const already = await deps.isDiscordMessageSynced(msg.id);
+          if (already) continue;
+        }
+        const added = await processDiscordMessage(msg, targets, true);
+        syncedMessages += added;
+      }
+    } catch (err: any) {
+      console.warn(`[discord] syncDiscordHistory failed for ${discordChannelId}:`, err.message);
+    }
+  }
+
+  return { syncedMessages, checkedChannels };
 }
 
 // Discord 側の編集: 本文が変わっていれば asdfbase の該当メッセージも書き換える
@@ -654,9 +957,10 @@ export async function startDiscordBot(d: DiscordDeps) {
   deps = d;
   const token = process.env.DISCORD_BOT_TOKEN || '';
   const rawGuilds = process.env.DISCORD_GUILD_IDS || process.env.DISCORD_GUILD_ID || '';
-  allowedGuildIds = rawGuilds.split(',').map(s => s.trim()).filter(Boolean);
-  if (!token || allowedGuildIds.length === 0) {
-    console.log('[discord] DISCORD_BOT_TOKEN / DISCORD_GUILD_ID(S) not set — bot disabled');
+  envGuildIds = rawGuilds.split(',').map(s => s.trim()).filter(Boolean);
+  await loadApprovedGuilds();
+  if (!token) {
+    console.log('[discord] DISCORD_BOT_TOKEN not set — bot disabled');
     return;
   }
 
@@ -668,7 +972,12 @@ export async function startDiscordBot(d: DiscordDeps) {
       connected = true;
       lastError = '';
       console.log(`[discord] logged in as ${ready.user.tag}`);
-      const missing = allowedGuildIds.filter(gid => !ready.guilds.cache.has(gid));
+      // 環境変数も承認済みサーバーも空の場合は、最初に参加しているサーバーを自動承認
+      if (allowedGuildIds.length === 0 && ready.guilds.cache.size > 0) {
+        const firstId = ready.guilds.cache.first()!.id;
+        await approveDiscordGuild(firstId);
+      }
+      const missing = envGuildIds.filter(gid => !ready.guilds.cache.has(gid));
       if (missing.length > 0) {
         lastError = `許可されたサーバーの一部に Bot が参加していません: ${missing.join(', ')}`;
       }
@@ -676,12 +985,15 @@ export async function startDiscordBot(d: DiscordDeps) {
       if (deps?.onVoiceStatusUpdate) {
         deps.onVoiceStatusUpdate(getDiscordVoiceStatus());
       }
+      // ダウンタイム中の未取得メッセージを自動でバックグラウンド取得
+      syncDiscordHistory({ limit: 50 }).catch(err => console.warn('[discord] startup history sync error:', err.message));
     });
     c.on(Events.ShardDisconnect, () => {
       connected = false;
     });
     c.on(Events.ShardResume, () => {
       connected = true;
+      syncDiscordHistory({ limit: 50 }).catch(() => {});
     });
     c.on(Events.ShardReady, () => {
       connected = true;

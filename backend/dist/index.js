@@ -76,9 +76,22 @@ async function postWebhook(url, body, files = []) {
     if (!res.ok)
         throw new Error(`Discord webhook HTTP ${res.status}`);
 }
-// 重要な通知 (提出物・@everyone・ピン留め等) → 重要通知 Webhook
+// 重要な通知 (提出物・@everyone・ピン留め等) → 重要通知 Webhook (5秒以内の同一通知は重複防止)
+const recentImportantCache = new Map();
 async function notifyImportant(title, description, color = 0xf59e0b) {
     try {
+        const dedupeKey = `${title}::${description}`;
+        const now = Date.now();
+        const prev = recentImportantCache.get(dedupeKey);
+        if (prev && now - prev < 5000)
+            return;
+        recentImportantCache.set(dedupeKey, now);
+        if (recentImportantCache.size > 200) {
+            for (const [k, t] of recentImportantCache.entries()) {
+                if (now - t > 10000)
+                    recentImportantCache.delete(k);
+            }
+        }
         if ((await getSetting('notify_important_enabled', 'on')) !== 'on')
             return;
         const url = await getDiscordWebhookUrl();
@@ -99,9 +112,9 @@ async function relayMessage(msg) {
     try {
         const username = msg.sender_username || msg.username || 'unknown';
         if (username.startsWith('[Discord]'))
-            return; // Discord から来たものは戻さない
+            return false; // Discord から来たものは戻さない
         if ((await getSetting('notify_messages_enabled', 'on')) !== 'on')
-            return;
+            return false;
         let targetDiscordMsgId = null;
         if (msg.reply_to_id) {
             const linkRes = await db_js_1.pool.query(`SELECT discord_message_id FROM discord_message_links WHERE asdf_message_id = $1 LIMIT 1`, [msg.reply_to_id]);
@@ -118,11 +131,11 @@ async function relayMessage(msg) {
              VALUES ($1, $2, $3, 'out') ON CONFLICT DO NOTHING`, [msg.id, r.discordChannelId, r.discordMessageId]);
                 }
             }
-            return;
+            return true;
         }
         const url = await getSetting('discord_message_webhook_url', '');
         if (!url)
-            return;
+            return false;
         const files = [];
         const text = msg.content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, (_m, p) => {
             const f = path_1.default.join(UPLOAD_DIR, path_1.default.basename(p));
@@ -131,9 +144,11 @@ async function relayMessage(msg) {
             return '';
         }).trim();
         await postWebhook(url, { username: `[asdfbase] ${username}`, content: text || undefined, allowed_mentions: { parse: [] } }, files);
+        return true;
     }
     catch (err) {
         console.error('relayMessage error:', err.message);
+        return false;
     }
 }
 // 編集の Discord 反映: Bot で送ったものはそのメッセージを編集。Webhook は編集できないので「(編集済み)」付きで送り直す
@@ -461,6 +476,8 @@ app.post('/api/auth/login', async (req, res) => {
                 id: user.id,
                 username: user.username,
                 role: user.role,
+                custom_roles: user.custom_roles || [],
+                preferences: user.preferences || {},
                 status: user.status,
                 custom_status: user.custom_status,
                 avatar_url: user.avatar_url,
@@ -476,7 +493,7 @@ app.post('/api/auth/login', async (req, res) => {
 // Current User Profile
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
     try {
-        const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, avatar_url, class_no, created_at FROM users WHERE id = $1`, [req.user.id]);
+        const result = await db_js_1.pool.query(`SELECT id, username, role, custom_roles, preferences, status, custom_status, avatar_url, class_no, created_at FROM users WHERE id = $1`, [req.user.id]);
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'ユーザーが見つかりません' });
         }
@@ -506,11 +523,49 @@ app.post('/api/upload', authMiddleware, upload.single('image'), async (req, res)
         res.status(500).json({ error: '画像の圧縮保存に失敗しました' });
     }
 });
+// ロール権限判定ヘルパー
+async function getUserAllRoles(userId, fallbackRole = 'member') {
+    try {
+        const r = await db_js_1.pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [userId]);
+        if (r.rows.length === 0)
+            return { isAdmin: fallbackRole === 'admin', roles: [fallbackRole] };
+        const row = r.rows[0];
+        const custom = Array.isArray(row.custom_roles) ? row.custom_roles.map(String) : [];
+        const base = row.role || fallbackRole;
+        return {
+            isAdmin: base === 'admin',
+            roles: Array.from(new Set([base, ...custom])),
+        };
+    }
+    catch {
+        return { isAdmin: fallbackRole === 'admin', roles: [fallbackRole] };
+    }
+}
+function checkChannelViewPermission(isAdmin, userRoles, channel) {
+    if (isAdmin)
+        return true;
+    const viewRoles = Array.isArray(channel?.view_roles) ? channel.view_roles : [];
+    if (viewRoles.length === 0)
+        return true;
+    return viewRoles.some(r => userRoles.includes(r));
+}
+function checkChannelWritePermission(isAdmin, userRoles, channel) {
+    if (isAdmin)
+        return true;
+    if (!checkChannelViewPermission(isAdmin, userRoles, channel))
+        return false;
+    const writeRoles = Array.isArray(channel?.write_roles) ? channel.write_roles : [];
+    if (writeRoles.length === 0)
+        return true;
+    return writeRoles.some(r => userRoles.includes(r));
+}
 // Channels API
 app.get('/api/channels', authMiddleware, async (req, res) => {
     try {
+        const { isAdmin, roles } = await getUserAllRoles(req.user.id, req.user.role);
         const result = await db_js_1.pool.query(`SELECT * FROM channels ORDER BY position ASC, id ASC`);
-        res.json(result.rows);
+        const visible = result.rows.filter(ch => checkChannelViewPermission(isAdmin, roles, ch));
+        res.json(visible);
     }
     catch (err) {
         res.status(500).json({ error: 'チャンネル取得エラー' });
@@ -518,7 +573,7 @@ app.get('/api/channels', authMiddleware, async (req, res) => {
 });
 app.post('/api/channels', authMiddleware, adminOnly, async (req, res) => {
     try {
-        const { name, type } = req.body;
+        const { name, type, server_id, view_roles, write_roles } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ error: 'チャンネル名を入力してください' });
         }
@@ -528,9 +583,12 @@ app.post('/api/channels', authMiddleware, adminOnly, async (req, res) => {
             return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
         }
         const chType = type === 'voice' ? 'voice' : 'text';
+        const cleanServerId = server_id ? String(server_id).trim() : null;
+        const cleanViewRoles = Array.isArray(view_roles) ? view_roles.map(String) : [];
+        const cleanWriteRoles = Array.isArray(write_roles) ? write_roles.map(String) : [];
         const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
         const nextPos = parseInt(maxPosRes.rows[0].max_pos, 10) + 1;
-        const result = await db_js_1.pool.query(`INSERT INTO channels (name, type, position) VALUES ($1, $2, $3) RETURNING *`, [cleanName, chType, nextPos]);
+        const result = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id, view_roles, write_roles) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [cleanName, chType, nextPos, cleanServerId, JSON.stringify(cleanViewRoles), JSON.stringify(cleanWriteRoles)]);
         const newChannel = result.rows[0];
         broadcast({ type: 'CHANNEL_CREATED', payload: newChannel });
         logAudit(req.user, 'channel_create', 'channel', newChannel.id, { message: `チャンネル #${newChannel.name} を作成` });
@@ -545,22 +603,26 @@ app.post('/api/channels', authMiddleware, adminOnly, async (req, res) => {
 app.put('/api/channels/:id', authMiddleware, adminOnly, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
-        const { name } = req.body;
-        if (!name || !name.trim()) {
-            return res.status(400).json({ error: 'チャンネル名を入力してください' });
-        }
-        const cleanName = name.trim().toLowerCase().replace(/\s+/g, '-');
-        const existing = await db_js_1.pool.query(`SELECT id FROM channels WHERE name = $1 AND id != $2`, [cleanName, id]);
-        if (existing.rows.length > 0) {
-            return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
-        }
-        const result = await db_js_1.pool.query(`UPDATE channels SET name = $1 WHERE id = $2 RETURNING *`, [cleanName, id]);
-        if (result.rows.length === 0) {
+        const { name, server_id, view_roles, write_roles } = req.body;
+        const curRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [id]);
+        if (curRes.rows.length === 0) {
             return res.status(404).json({ error: 'チャンネルが見つかりません' });
         }
+        const cur = curRes.rows[0];
+        const cleanName = name && name.trim() ? name.trim().toLowerCase().replace(/\s+/g, '-') : cur.name;
+        if (cleanName !== cur.name) {
+            const existing = await db_js_1.pool.query(`SELECT id FROM channels WHERE name = $1 AND id != $2`, [cleanName, id]);
+            if (existing.rows.length > 0) {
+                return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
+            }
+        }
+        const nextServerId = server_id !== undefined ? (server_id ? String(server_id).trim() : null) : cur.server_id;
+        const nextViewRoles = Array.isArray(view_roles) ? view_roles.map(String) : (cur.view_roles || []);
+        const nextWriteRoles = Array.isArray(write_roles) ? write_roles.map(String) : (cur.write_roles || []);
+        const result = await db_js_1.pool.query(`UPDATE channels SET name = $1, server_id = $2, view_roles = $3, write_roles = $4 WHERE id = $5 RETURNING *`, [cleanName, nextServerId, JSON.stringify(nextViewRoles), JSON.stringify(nextWriteRoles), id]);
         const updatedChannel = result.rows[0];
         broadcast({ type: 'CHANNEL_UPDATED', payload: updatedChannel });
-        logAudit(req.user, 'channel_update', 'channel', id, { message: `チャンネル #${cleanName} に名前変更` });
+        logAudit(req.user, 'channel_update', 'channel', id, { message: `チャンネル #${cleanName} の設定を更新` });
         (0, discord_js_1.refreshDiscordCommands)();
         res.json(updatedChannel);
     }
@@ -587,15 +649,26 @@ app.put('/api/channels/reorder', authMiddleware, adminOnly, async (req, res) => 
         res.status(500).json({ error: 'チャンネル順序の変更に失敗しました' });
     }
 });
-app.delete('/api/channels/:id', authMiddleware, adminOnly, async (req, res) => {
+app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
+        const chRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [id]);
+        if (chRes.rows.length === 0) {
+            return res.status(404).json({ error: 'チャンネルが見つかりません' });
+        }
+        const boundIds = await (0, discord_js_1.getBoundAsdfChannelIds)();
+        const isSyncedChannel = Boolean(chRes.rows[0].server_id) || boundIds.includes(id);
+        if (req.user.role !== 'admin' && !isSyncedChannel) {
+            return res.status(403).json({ error: '通常チャンネルの削除は管理者のみ可能です' });
+        }
         const countRes = await db_js_1.pool.query(`SELECT COUNT(*) FROM channels`);
         if (parseInt(countRes.rows[0].count, 10) <= 1) {
             return res.status(400).json({ error: '最後のチャンネルは削除できません' });
         }
+        await (0, discord_js_1.removeDiscordBinding)({ asdfChannelId: id }).catch(() => { });
         const delRes = await db_js_1.pool.query(`DELETE FROM channels WHERE id = $1 RETURNING name`, [id]);
         broadcast({ type: 'CHANNEL_DELETED', payload: { id } });
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: await (0, discord_js_1.getDiscordStatus)() });
         logAudit(req.user, 'channel_delete', 'channel', id, { message: `チャンネル #${delRes.rows[0]?.name || id} を削除` });
         (0, discord_js_1.refreshDiscordCommands)();
         res.json({ success: true, id });
@@ -893,12 +966,19 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
         const { content, attachments, replyToId, clientNonce } = req.body;
         const userId = req.user.id;
         const username = req.user.username;
+        const chRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [channelId]);
+        if (chRes.rows.length > 0) {
+            const { isAdmin, roles } = await getUserAllRoles(userId, req.user.role);
+            if (!checkChannelWritePermission(isAdmin, roles, chRes.rows[0])) {
+                return res.status(403).json({ error: 'このチャンネルへの発言権限がありません' });
+            }
+        }
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, userId, username, content, JSON.stringify(attachments || []), replyToId || null]);
         const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: username, client_nonce: clientNonce || null }]);
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
-        relayMessage(savedMessage);
-        if (String(content).includes('@everyone')) {
+        const relayed = await relayMessage(savedMessage);
+        if (String(content).includes('@everyone') && !relayed) {
             notifyImportant(`📢 ${username} から全員への連絡`, String(content));
         }
         replyAsGemini(channelId, savedMessage);
@@ -1467,6 +1547,8 @@ app.post('/api/ai/chat', authMiddleware, async (req, res) => {
         });
         const allowWrite = req.body.allowActions !== false;
         const modelMode = req.body.modelMode === 'thinking' ? 'thinking' : 'fast';
+        const persona = typeof req.body.persona === 'string' ? req.body.persona : 'standard';
+        const customPersona = typeof req.body.customPersona === 'string' ? req.body.customPersona : '';
         // 「Web検索」ボタン: 最初に必ず検索させる (押していない時は AI が必要に応じて判断)
         const forceWebSearch = req.body.webSearch === true;
         const runTool = (0, aiTools_js_1.createAiToolRunner)({
@@ -1479,7 +1561,7 @@ app.post('/api/ai/chat', authMiddleware, async (req, res) => {
             tools: (0, aiTools_js_1.aiToolDeclarations)(allowWrite),
             runTool,
             forceFirstTool: forceWebSearch ? 'web_search' : undefined,
-            systemInstruction: systemInstruction || aiSystemInstruction(req.user.username, mergedContext, allowWrite),
+            systemInstruction: systemInstruction || aiSystemInstruction(req.user.username, mergedContext, allowWrite, persona, customPersona),
         });
         if (steps.some(st => st.write && st.ok)) {
             logAudit(req.user, 'ai_action', 'ai', null, { message: `AI が操作を実行: ${steps.filter(st => st.write && st.ok).map(st => st.label).join(' / ')}` });
@@ -1603,10 +1685,243 @@ app.get('/api/discord/guild-status', authMiddleware, async (_req, res) => {
         res.status(500).json({ error: 'Discord状態取得エラー' });
     }
 });
+// 複数サーバー一覧・オンラインメンバー・VC・連携リクエスト取得
+app.get('/api/discord/servers', authMiddleware, async (_req, res) => {
+    try {
+        const servers = await (0, discord_js_1.getDiscordServers)(true);
+        const status = await (0, discord_js_1.getDiscordStatus)();
+        const reqRes = await db_js_1.pool.query(`SELECT * FROM discord_link_requests ORDER BY id DESC LIMIT 50`);
+        res.json({ servers, status, linkRequests: reqRes.rows });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'Discordサーバー一覧取得エラー' });
+    }
+});
+// サーバー承認 (admin / rds9 専用)
+app.post('/api/discord/guilds/:guildId/approve', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const guildId = String(req.params.guildId || '').trim();
+        if (!guildId)
+            return res.status(400).json({ error: 'guildIdが必要です' });
+        await (0, discord_js_1.approveDiscordGuild)(guildId);
+        logAudit(req.user, 'discord_guild_approve', 'discord', null, { message: `Discordサーバー (${guildId}) を承認` });
+        const servers = await (0, discord_js_1.getDiscordServers)(true);
+        const status = await (0, discord_js_1.getDiscordStatus)();
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: status });
+        res.json({ servers, status });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message || 'サーバー承認エラー' });
+    }
+});
+app.delete('/api/discord/guilds/:guildId/approve', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const guildId = String(req.params.guildId || '').trim();
+        await (0, discord_js_1.removeApprovedDiscordGuild)(guildId);
+        const servers = await (0, discord_js_1.getDiscordServers)(true);
+        const status = await (0, discord_js_1.getDiscordStatus)();
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: status });
+        res.json({ servers, status });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message || 'サーバー承認解除エラー' });
+    }
+});
+// 簡単チャンネル紐付け (admin / rds9 は即時適用、一般メンバーは承認リクエストを作成)
+app.post('/api/discord/bindings', authMiddleware, async (req, res) => {
+    try {
+        const { guildId = '', guildName = '', discordChannelId = '', discordChannelName = '', asdfChannelId, newChannelName = '', } = req.body || {};
+        const cleanDiscordChId = String(discordChannelId).trim();
+        const cleanGuildId = String(guildId).trim();
+        if (!cleanDiscordChId) {
+            return res.status(400).json({ error: 'Discord チャンネルを選択または入力してください' });
+        }
+        const isAdmin = req.user.role === 'admin' || req.user.username === 'rds9';
+        if (!isAdmin) {
+            // 一般ユーザーは rds9 (admin) の承認待ちリクエストとして登録
+            const ins = await db_js_1.pool.query(`INSERT INTO discord_link_requests (requester_id, requester_username, guild_id, guild_name, discord_channel_id, discord_channel_name, asdf_channel_id, new_channel_name, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending') RETURNING *`, [
+                req.user.id,
+                req.user.username,
+                cleanGuildId,
+                String(guildName || '').slice(0, 200),
+                cleanDiscordChId,
+                String(discordChannelName || cleanDiscordChId).slice(0, 200),
+                asdfChannelId ? Number(asdfChannelId) : null,
+                String(newChannelName || '').trim().slice(0, 100),
+            ]);
+            const requestRow = ins.rows[0];
+            broadcast({ type: 'DISCORD_LINK_REQUEST_UPDATED', payload: requestRow });
+            logAudit(req.user, 'discord_link_request', 'discord', requestRow.id, {
+                message: `Discord #${discordChannelName || cleanDiscordChId} の同期申請を作成 (管理者承認待ち)`,
+            });
+            return res.json({ pendingApproval: true, request: requestRow });
+        }
+        // admin / rds9 は即時連携
+        if (cleanGuildId) {
+            await (0, discord_js_1.approveDiscordGuild)(cleanGuildId);
+        }
+        let targetAsdfChId = asdfChannelId ? Number(asdfChannelId) : 0;
+        if (!targetAsdfChId && newChannelName && String(newChannelName).trim()) {
+            const cleanName = String(newChannelName).trim().toLowerCase().replace(/\s+/g, '-');
+            const existing = await db_js_1.pool.query(`SELECT * FROM channels WHERE name = $1`, [cleanName]);
+            if (existing.rows.length > 0) {
+                targetAsdfChId = existing.rows[0].id;
+                if (cleanGuildId) {
+                    const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 RETURNING *`, [cleanGuildId, targetAsdfChId]);
+                    broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+                }
+            }
+            else {
+                const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
+                const nextPos = parseInt(maxPosRes.rows[0].max_pos, 10) + 1;
+                const created = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id) VALUES ($1, 'text', $2, $3) RETURNING *`, [cleanName, nextPos, cleanGuildId || null]);
+                targetAsdfChId = created.rows[0].id;
+                broadcast({ type: 'CHANNEL_CREATED', payload: created.rows[0] });
+            }
+        }
+        else if (targetAsdfChId && cleanGuildId) {
+            const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = COALESCE(server_id, $1) WHERE id = $2 RETURNING *`, [cleanGuildId, targetAsdfChId]);
+            if (upd.rows[0])
+                broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+        }
+        if (!targetAsdfChId) {
+            return res.status(400).json({ error: '連携先の asdfbase チャンネルを指定してください' });
+        }
+        await (0, discord_js_1.addDiscordBinding)(cleanDiscordChId, targetAsdfChId, cleanGuildId || undefined);
+        (0, discord_js_1.refreshDiscordCommands)();
+        const status = await (0, discord_js_1.getDiscordStatus)();
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: status });
+        logAudit(req.user, 'discord_setup_web', 'discord', targetAsdfChId, {
+            message: `Discord #${discordChannelName || cleanDiscordChId} ⇔ asdfbase #${targetAsdfChId} を連携`,
+        });
+        // 初回連携時に直近履歴もバックグラウンドで取得
+        (0, discord_js_1.syncDiscordHistory)({ discordChannelId: cleanDiscordChId, limit: 50 }).catch(() => { });
+        res.json({ pendingApproval: false, status, asdfChannelId: targetAsdfChId });
+    }
+    catch (err) {
+        console.error('Discord binding error:', err);
+        res.status(500).json({ error: err.message || 'Discord連携の設定に失敗しました' });
+    }
+});
+// 連携リクエストの承認・却下 (admin / rds9 限定)
+app.post('/api/discord/link-requests/:id/approve', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const reqRes = await db_js_1.pool.query(`SELECT * FROM discord_link_requests WHERE id = $1`, [id]);
+        if (reqRes.rows.length === 0)
+            return res.status(404).json({ error: '申請が見つかりません' });
+        const linkReq = reqRes.rows[0];
+        if (linkReq.status !== 'pending')
+            return res.status(400).json({ error: '既に処理済みの申請です' });
+        if (linkReq.guild_id) {
+            await (0, discord_js_1.approveDiscordGuild)(linkReq.guild_id);
+        }
+        let targetAsdfChId = linkReq.asdf_channel_id ? Number(linkReq.asdf_channel_id) : 0;
+        if (!targetAsdfChId && linkReq.new_channel_name) {
+            const cleanName = String(linkReq.new_channel_name).trim().toLowerCase().replace(/\s+/g, '-');
+            const existing = await db_js_1.pool.query(`SELECT * FROM channels WHERE name = $1`, [cleanName]);
+            if (existing.rows.length > 0) {
+                targetAsdfChId = existing.rows[0].id;
+            }
+            else {
+                const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
+                const nextPos = parseInt(maxPosRes.rows[0].max_pos, 10) + 1;
+                const created = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id) VALUES ($1, 'text', $2, $3) RETURNING *`, [cleanName, nextPos, linkReq.guild_id || null]);
+                targetAsdfChId = created.rows[0].id;
+                broadcast({ type: 'CHANNEL_CREATED', payload: created.rows[0] });
+            }
+        }
+        if (targetAsdfChId && linkReq.guild_id) {
+            const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = COALESCE(server_id, $1) WHERE id = $2 RETURNING *`, [linkReq.guild_id, targetAsdfChId]);
+            if (upd.rows[0])
+                broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+        }
+        if (!targetAsdfChId)
+            return res.status(400).json({ error: '連携先チャンネルが決定できませんでした' });
+        await (0, discord_js_1.addDiscordBinding)(linkReq.discord_channel_id, targetAsdfChId, linkReq.guild_id || undefined);
+        const updReq = await db_js_1.pool.query(`UPDATE discord_link_requests SET status = 'approved', asdf_channel_id = $1, reviewed_by = $2, updated_at = NOW() WHERE id = $3 RETURNING *`, [targetAsdfChId, req.user.username, id]);
+        const status = await (0, discord_js_1.getDiscordStatus)();
+        broadcast({ type: 'DISCORD_LINK_REQUEST_UPDATED', payload: updReq.rows[0] });
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: status });
+        logAudit(req.user, 'discord_link_approve', 'discord', id, {
+            message: `${linkReq.requester_username} の Discord 連携申請 (#${linkReq.discord_channel_name}) を承認`,
+        });
+        (0, discord_js_1.syncDiscordHistory)({ discordChannelId: linkReq.discord_channel_id, limit: 50 }).catch(() => { });
+        res.json({ request: updReq.rows[0], status });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message || '承認処理に失敗しました' });
+    }
+});
+app.post('/api/discord/link-requests/:id/reject', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const updReq = await db_js_1.pool.query(`UPDATE discord_link_requests SET status = 'rejected', reviewed_by = $1, updated_at = NOW() WHERE id = $2 RETURNING *`, [req.user.username, id]);
+        if (updReq.rows.length === 0)
+            return res.status(404).json({ error: '申請が見つかりません' });
+        broadcast({ type: 'DISCORD_LINK_REQUEST_UPDATED', payload: updReq.rows[0] });
+        res.json({ request: updReq.rows[0] });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message || '却下処理に失敗しました' });
+    }
+});
+// 同期チャンネルの解除 (削除)
+app.delete('/api/discord/bindings', authMiddleware, async (req, res) => {
+    try {
+        const { discordChannelId, asdfChannelId } = req.body || {};
+        const qDiscordId = req.query.discordChannelId || discordChannelId;
+        const qAsdfId = req.query.asdfChannelId ? Number(req.query.asdfChannelId) : (asdfChannelId ? Number(asdfChannelId) : undefined);
+        if (!qDiscordId && !qAsdfId) {
+            return res.status(400).json({ error: '解除するチャンネルを指定してください' });
+        }
+        const removed = await (0, discord_js_1.removeDiscordBinding)({
+            discordChannelId: qDiscordId ? String(qDiscordId) : undefined,
+            asdfChannelId: qAsdfId,
+        });
+        const status = await (0, discord_js_1.getDiscordStatus)();
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: status });
+        logAudit(req.user, 'discord_unsetup_web', 'discord', qAsdfId || null, {
+            message: `Discord チャンネル同期を解除 (${qDiscordId || qAsdfId})`,
+            removed,
+        });
+        res.json({ removed, status });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message || '同期解除に失敗しました' });
+    }
+});
+// Bot ダウンタイム後の未取得メッセージ履歴の手動・自動同期
+app.post('/api/discord/sync-history', authMiddleware, async (req, res) => {
+    try {
+        const { asdfChannelId, discordChannelId, guildId, limit } = req.body || {};
+        const result = await (0, discord_js_1.syncDiscordHistory)({
+            asdfChannelId: asdfChannelId ? Number(asdfChannelId) : undefined,
+            discordChannelId: discordChannelId ? String(discordChannelId) : undefined,
+            guildId: guildId ? String(guildId) : undefined,
+            limit: limit ? Number(limit) : 50,
+        });
+        res.json(result);
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message || '履歴同期に失敗しました' });
+    }
+});
 function jstNowLabel() {
     return new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'long', day: 'numeric', weekday: 'long', hour: '2-digit', minute: '2-digit' });
 }
-function aiSystemInstruction(username, context, allowWrite) {
+const PERSONA_PROMPTS = {
+    standard: '前置きや締めの挨拶は省き、要点だけを日本語で簡潔に答えてください。',
+    teacher: 'あなたは優しくて頼れる中学校の先生です。中学生にも直感的にわかるよう、具体例を交えて丁寧に噛み砕いて教えてください。',
+    friend: 'あなたは親しい同級生の友達です。タメ口でフランクに、親しみやすくカジュアルな口調で話してください。',
+    logical: 'あなたは論理的で無駄を嫌うエキスパートです。結論ファーストで、根拠と構造を明確にして無駄なく回答してください。',
+    enthusiastic: 'あなたはポジティブで明るい応援サポーターです。相手を褒めつつテンション高めに楽しく回答してください。',
+};
+function aiSystemInstruction(username, context, allowWrite, persona = 'standard', customPersona = '') {
+    const personaInstruction = persona === 'custom' && customPersona.trim()
+        ? `【性格・口調の指定】以下のキャラクター・口調・ルールになりきって回答してください:\n${customPersona.trim().slice(0, 1000)}`
+        : (PERSONA_PROMPTS[persona] || PERSONA_PROMPTS.standard);
     return [
         'あなたは中学生向けワークスペース「asdfbase」のAIアシスタントです。',
         `現在は ${jstNowLabel()} (日本時間)、話している相手は ${username} です。「明日」「来週の金曜」などはこの日時を基準に YYYY-MM-DD に直してください。`,
@@ -1617,7 +1932,8 @@ function aiSystemInstruction(username, context, allowWrite) {
         allowWrite
             ? '提出物・宿題の登録、提出物の進捗変更、予定の追加、メモへの追記は、ユーザーがはっきり頼んだときだけ実行してください。内容が曖昧なら実行せずに確認してください。削除や上書きはできません。実行したら何をしたかを一言で伝えてください。'
             : 'この会話では情報の確認だけができ、登録や変更はできません。',
-        '前置きや締めの挨拶は省き、要点だけを日本語で簡潔に答えてください。表や箇条書き (Markdown) を使ってかまいません。',
+        personaInstruction,
+        '表や箇条書き (Markdown) を使ってかまいません。',
         `補助情報 (画面の状態, JSON): ${JSON.stringify(context).slice(0, 8000)}`,
     ].join('\n');
 }
@@ -2278,8 +2594,11 @@ app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
 });
 app.get('/api/users', authMiddleware, async (req, res) => {
     try {
-        const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, avatar_url, class_no, last_active_at FROM users ORDER BY username ASC`);
-        res.json(result.rows);
+        const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, avatar_url, class_no, custom_roles, last_active_at FROM users ORDER BY username ASC`);
+        res.json(result.rows.map(r => ({
+            ...r,
+            custom_roles: Array.isArray(r.custom_roles) ? r.custom_roles : [],
+        })));
     }
     catch (err) {
         res.status(500).json({ error: 'ユーザー一覧取得エラー' });
@@ -2287,17 +2606,266 @@ app.get('/api/users', authMiddleware, async (req, res) => {
 });
 app.put('/api/users/me/settings', authMiddleware, async (req, res) => {
     try {
-        if (req.body?.classNo === undefined)
+        const updates = {};
+        if (req.body?.classNo !== undefined) {
+            const classNo = req.body.classNo === null ? null : parseClassNo(req.body.classNo);
+            if (req.body.classNo !== null && classNo === null)
+                return res.status(400).json({ error: 'クラスは 1〜6 組から選んでください' });
+            await db_js_1.pool.query(`UPDATE users SET class_no = $1 WHERE id = $2`, [classNo, req.user.id]);
+            broadcast({ type: 'USER_UPDATED', payload: { id: req.user.id, class_no: classNo } });
+            updates.class_no = classNo;
+        }
+        if (req.body?.preferences && typeof req.body.preferences === 'object') {
+            const cur = (await db_js_1.pool.query(`SELECT preferences FROM users WHERE id = $1`, [req.user.id])).rows[0]?.preferences || {};
+            const nextPrefs = { ...cur, ...req.body.preferences };
+            await db_js_1.pool.query(`UPDATE users SET preferences = $1 WHERE id = $2`, [JSON.stringify(nextPrefs), req.user.id]);
+            publish({ type: 'USER_PREFERENCES_UPDATED', payload: nextPrefs }, { targetUserId: req.user.id });
+            updates.preferences = nextPrefs;
+        }
+        if (Object.keys(updates).length === 0)
             return res.status(400).json({ error: '変更する項目がありません' });
-        const classNo = req.body.classNo === null ? null : parseClassNo(req.body.classNo);
-        if (req.body.classNo !== null && classNo === null)
-            return res.status(400).json({ error: 'クラスは 1〜6 組から選んでください' });
-        await db_js_1.pool.query(`UPDATE users SET class_no = $1 WHERE id = $2`, [classNo, req.user.id]);
-        broadcast({ type: 'USER_UPDATED', payload: { id: req.user.id, class_no: classNo } });
-        res.json({ class_no: classNo });
+        res.json(updates);
     }
     catch (err) {
         res.status(500).json({ error: '設定の保存に失敗しました' });
+    }
+});
+// アカウント同期設定 (異端末同期用)
+app.get('/api/users/me/preferences', authMiddleware, async (req, res) => {
+    try {
+        const row = (await db_js_1.pool.query(`SELECT preferences FROM users WHERE id = $1`, [req.user.id])).rows[0];
+        res.json({ preferences: row?.preferences || {} });
+    }
+    catch (err) {
+        res.status(500).json({ error: '設定の取得に失敗しました' });
+    }
+});
+app.put('/api/users/me/preferences', authMiddleware, async (req, res) => {
+    try {
+        const patch = req.body?.preferences !== undefined ? req.body.preferences : req.body;
+        if (!patch || typeof patch !== 'object')
+            return res.status(400).json({ error: '設定データが不正です' });
+        const cur = (await db_js_1.pool.query(`SELECT preferences FROM users WHERE id = $1`, [req.user.id])).rows[0]?.preferences || {};
+        const nextPrefs = { ...cur, ...patch };
+        await db_js_1.pool.query(`UPDATE users SET preferences = $1 WHERE id = $2`, [JSON.stringify(nextPrefs), req.user.id]);
+        publish({ type: 'USER_PREFERENCES_UPDATED', payload: nextPrefs }, { targetUserId: req.user.id, excludeConnId: getConnId(req) });
+        res.json({ preferences: nextPrefs });
+    }
+    catch (err) {
+        res.status(500).json({ error: '設定の保存に失敗しました' });
+    }
+});
+// ロール管理 (adminのみ編集可能)
+const DEFAULT_ROLE_DEFINITIONS = [
+    { id: 'admin', name: '管理者', color: '#f43f5e', system: true },
+    { id: 'member', name: 'メンバー', color: '#64748b', system: true },
+    { id: 'leader', name: 'リーダー', color: '#f59e0b', system: false },
+    { id: 'study', name: '学習班', color: '#10b981', system: false },
+    { id: 'game', name: 'ゲーム部', color: '#6366f1', system: false },
+];
+async function getRoleDefinitions() {
+    const raw = await getSetting('custom_role_definitions', '');
+    if (!raw)
+        return DEFAULT_ROLE_DEFINITIONS;
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0)
+            return parsed;
+    }
+    catch (_) { }
+    return DEFAULT_ROLE_DEFINITIONS;
+}
+app.get('/api/roles', authMiddleware, async (req, res) => {
+    try {
+        res.json({ roles: await getRoleDefinitions() });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'ロール定義の取得に失敗しました' });
+    }
+});
+app.put('/api/roles', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const roles = Array.isArray(req.body?.roles) ? req.body.roles : [];
+        const cleaned = roles
+            .map((r) => ({
+            id: String(r.id || '').trim().replace(/[^a-zA-Z0-9_-]/g, ''),
+            name: String(r.name || '').trim().slice(0, 32),
+            color: /^#[0-9a-fA-F]{6}$/.test(String(r.color || '')) ? String(r.color) : '#6366f1',
+            system: r.id === 'admin' || r.id === 'member',
+        }))
+            .filter((r) => r.id && r.name);
+        for (const def of DEFAULT_ROLE_DEFINITIONS.filter(d => d.system)) {
+            if (!cleaned.some((c) => c.id === def.id))
+                cleaned.unshift(def);
+        }
+        await setSetting('custom_role_definitions', JSON.stringify(cleaned));
+        broadcast({ type: 'ROLES_UPDATED', payload: cleaned });
+        res.json({ roles: cleaned });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'ロール定義の保存に失敗しました' });
+    }
+});
+app.put('/api/users/:id/roles', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const targetId = parseInt(req.params.id, 10);
+        const customRoles = Array.isArray(req.body?.custom_roles)
+            ? req.body.custom_roles.map((r) => String(r).trim()).filter(Boolean)
+            : [];
+        const role = req.body?.role === 'admin' ? 'admin' : req.body?.role === 'member' ? 'member' : undefined;
+        if (role !== undefined) {
+            if (role !== 'admin') {
+                const cur = (await db_js_1.pool.query(`SELECT role FROM users WHERE id = $1`, [targetId])).rows[0];
+                if (cur?.role === 'admin') {
+                    const adminCount = await db_js_1.pool.query(`SELECT COUNT(*) FROM users WHERE role = 'admin'`);
+                    if (parseInt(adminCount.rows[0].count, 10) <= 1) {
+                        return res.status(400).json({ error: '最後の管理者は降格できません' });
+                    }
+                }
+            }
+            await db_js_1.pool.query(`UPDATE users SET role = $1, custom_roles = $2 WHERE id = $3`, [role, JSON.stringify(customRoles), targetId]);
+        }
+        else {
+            await db_js_1.pool.query(`UPDATE users SET custom_roles = $1 WHERE id = $2`, [JSON.stringify(customRoles), targetId]);
+        }
+        const updated = (await db_js_1.pool.query(`SELECT id, username, role, custom_roles FROM users WHERE id = $1`, [targetId])).rows[0];
+        broadcast({ type: 'USER_UPDATED', payload: { id: targetId, role: updated.role, custom_roles: updated.custom_roles } });
+        res.json(updated);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'ロール更新に失敗しました' });
+    }
+});
+// カスタム絵文字 (:example: 形式 & アップロード)
+async function ensureDefaultCustomEmojis() {
+    try {
+        const swimFile = path_1.default.join(UPLOAD_DIR, 'emoji-swim.svg');
+        if (!fs_1.default.existsSync(swimFile)) {
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="26" fill="url(#g)"/>
+  <path d="M12 92 Q38 78 64 92 T116 92" fill="none" stroke="#bae6fd" stroke-width="8" stroke-linecap="round"/>
+  <path d="M12 108 Q38 94 64 108 T116 108" fill="none" stroke="#e0f2fe" stroke-width="7" stroke-linecap="round"/>
+  <text x="64" y="48" font-family="sans-serif" font-weight="900" font-size="34" text-anchor="middle" fill="#ffffff">SWIM</text>
+  <text x="64" y="78" font-family="sans-serif" font-weight="900" font-size="27" text-anchor="middle" fill="#fef08a">しよ🏊</text>
+</svg>`;
+            fs_1.default.writeFileSync(swimFile, svg, 'utf8');
+        }
+        await db_js_1.pool.query(`INSERT INTO custom_emojis (name, url, created_by) VALUES ('swim', '/uploads/emoji-swim.svg', NULL) ON CONFLICT (name) DO NOTHING`);
+    }
+    catch (err) {
+        console.error('Default emoji init error:', err);
+    }
+}
+app.get('/api/emojis', authMiddleware, async (req, res) => {
+    try {
+        const result = await db_js_1.pool.query(`SELECT id, name, url, created_by, created_at FROM custom_emojis ORDER BY name ASC`);
+        res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: '絵文字一覧の取得に失敗しました' });
+    }
+});
+app.post('/api/emojis', authMiddleware, upload.single('image'), async (req, res) => {
+    try {
+        const rawName = String(req.body?.name || '').trim().toLowerCase().replace(/^:+|:+$/g, '');
+        if (!/^[a-z0-9_-]{2,32}$/.test(rawName)) {
+            return res.status(400).json({ error: '絵文字名は半角英数字・ハイフン・アンダースコア (2〜32文字) で指定してください' });
+        }
+        if (!req.file)
+            return res.status(400).json({ error: '画像ファイルを選択してください' });
+        const filename = `emoji-${rawName}-${Date.now()}.webp`;
+        await (0, sharp_1.default)(req.file.buffer, { animated: true })
+            .resize({ width: 128, height: 128, fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+            .webp({ quality: 85 })
+            .toFile(path_1.default.join(UPLOAD_DIR, filename));
+        const url = `/uploads/${filename}`;
+        const result = await db_js_1.pool.query(`INSERT INTO custom_emojis (name, url, created_by)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (name) DO UPDATE SET url = EXCLUDED.url, created_by = EXCLUDED.created_by
+       RETURNING *`, [rawName, url, req.user.id]);
+        const saved = result.rows[0];
+        broadcast({ type: 'EMOJI_UPDATED', payload: saved });
+        res.json(saved);
+    }
+    catch (err) {
+        console.error('Emoji upload error:', err);
+        res.status(500).json({ error: '絵文字のアップロードに失敗しました' });
+    }
+});
+app.delete('/api/emojis/:id', authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const cur = (await db_js_1.pool.query(`SELECT * FROM custom_emojis WHERE id = $1`, [id])).rows[0];
+        if (!cur)
+            return res.status(404).json({ error: '絵文字が見つかりません' });
+        if (cur.created_by !== req.user.id && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'この絵文字を削除する権限がありません' });
+        }
+        await db_js_1.pool.query(`DELETE FROM custom_emojis WHERE id = $1`, [id]);
+        broadcast({ type: 'EMOJI_DELETED', payload: { id, name: cur.name } });
+        res.json({ success: true, id });
+    }
+    catch (err) {
+        res.status(500).json({ error: '絵文字の削除に失敗しました' });
+    }
+});
+// AI会話スレッド履歴 (アカウント同期)
+app.get('/api/ai/threads', authMiddleware, async (req, res) => {
+    try {
+        const result = await db_js_1.pool.query(`SELECT id, user_id, title, persona, custom_persona, messages, updated_at, created_at
+       FROM ai_threads WHERE user_id = $1 ORDER BY updated_at DESC, id DESC`, [req.user.id]);
+        res.json(result.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'AI履歴の取得に失敗しました' });
+    }
+});
+app.post('/api/ai/threads', authMiddleware, async (req, res) => {
+    try {
+        const title = String(req.body?.title || '新しい会話').trim().slice(0, 120) || '新しい会話';
+        const persona = String(req.body?.persona || 'default').trim().slice(0, 64);
+        const customPersona = String(req.body?.custom_persona || '').trim().slice(0, 1000);
+        const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+        const result = await db_js_1.pool.query(`INSERT INTO ai_threads (user_id, title, persona, custom_persona, messages)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`, [req.user.id, title, persona, customPersona, JSON.stringify(messages)]);
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'AIスレッドの作成に失敗しました' });
+    }
+});
+app.put('/api/ai/threads/:id', authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const cur = (await db_js_1.pool.query(`SELECT * FROM ai_threads WHERE id = $1 AND user_id = $2`, [id, req.user.id])).rows[0];
+        if (!cur)
+            return res.status(404).json({ error: 'AIスレッドが見つかりません' });
+        const title = req.body?.title !== undefined ? String(req.body.title).trim().slice(0, 120) || '新しい会話' : cur.title;
+        const persona = req.body?.persona !== undefined ? String(req.body.persona).trim().slice(0, 64) : cur.persona;
+        const customPersona = req.body?.custom_persona !== undefined ? String(req.body.custom_persona).trim().slice(0, 1000) : cur.custom_persona;
+        const messages = Array.isArray(req.body?.messages) ? req.body.messages : cur.messages;
+        const result = await db_js_1.pool.query(`UPDATE ai_threads SET title = $1, persona = $2, custom_persona = $3, messages = $4, updated_at = NOW()
+       WHERE id = $5 AND user_id = $6 RETURNING *`, [title, persona, customPersona, JSON.stringify(messages), id, req.user.id]);
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'AIスレッドの更新に失敗しました' });
+    }
+});
+app.delete('/api/ai/threads/:id', authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        await db_js_1.pool.query(`DELETE FROM ai_threads WHERE id = $1 AND user_id = $2`, [id, req.user.id]);
+        res.json({ success: true, id });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'AIスレッドの削除に失敗しました' });
     }
 });
 // アイコン画像 (正方形 256px の WebP に変換)
@@ -2565,14 +3133,24 @@ setInterval(() => {
 async function handleClientMessage(user, connId, msg) {
     if (msg.type === 'SEND_MESSAGE') {
         const { channelId, content, attachments, replyToId, clientNonce } = msg;
+        const chRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [channelId]);
+        if (chRes.rows.length > 0) {
+            const uRes = await db_js_1.pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [user.id]);
+            const role = uRes.rows[0]?.role || 'member';
+            const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
+            const userRoles = [role, ...customRoles];
+            if (!checkChannelWritePermission(role === 'admin', userRoles, chRes.rows[0])) {
+                return;
+            }
+        }
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, user.id, user.username, content, JSON.stringify(attachments || []), replyToId || null]);
         const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: user.username, client_nonce: clientNonce || null }]);
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
-        if (String(content).includes('@everyone')) {
+        const relayed = await relayMessage(savedMessage);
+        if (String(content).includes('@everyone') && !relayed) {
             notifyImportant(`📢 ${user.username} から全員への連絡`, String(content));
         }
-        relayMessage(savedMessage);
         replyAsGemini(channelId, savedMessage);
         return;
     }
@@ -2919,6 +3497,7 @@ server.listen(PORT, async () => {
         // 再起動直後は全員オフライン扱いにし、接続/アクセスで復帰させる
         await db_js_1.pool.query(`UPDATE users SET status = 'offline'`);
         await ensureNoteSlots();
+        await ensureDefaultCustomEmojis();
     }
     catch (err) {
         console.error('DB Init failed:', err);
@@ -2927,8 +3506,17 @@ server.listen(PORT, async () => {
         await (0, discord_js_1.startDiscordBot)({
             getSetting,
             setSetting,
-            listAsdfChannels: async () => (await db_js_1.pool.query(`SELECT id, name, type FROM channels ORDER BY position ASC, id ASC`)).rows,
+            listAsdfChannels: async () => (await db_js_1.pool.query(`SELECT id, name, type, server_id FROM channels ORDER BY position ASC, id ASC`)).rows,
+            isDiscordMessageSynced: async (discordMessageId) => {
+                const res = await db_js_1.pool.query(`SELECT 1 FROM discord_message_links WHERE discord_message_id = $1 LIMIT 1`, [discordMessageId]);
+                return res.rows.length > 0;
+            },
             ingest: async (asdfChannelId, username, content, meta) => {
+                if (meta.discordMessageId) {
+                    const existing = await db_js_1.pool.query(`SELECT 1 FROM discord_message_links WHERE discord_message_id = $1 LIMIT 1`, [meta.discordMessageId]);
+                    if (existing.rows.length > 0)
+                        return;
+                }
                 let replyToId = null;
                 if (meta.replyToDiscordMsgId) {
                     const link = await db_js_1.pool.query(`SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1 LIMIT 1`, [meta.replyToDiscordMsgId]);
@@ -2936,7 +3524,9 @@ server.listen(PORT, async () => {
                         replyToId = link.rows[0].asdf_message_id;
                     }
                 }
-                const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id) VALUES ($1, NULL, $2, $3, $4, $5) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId]);
+                const result = meta.createdAt
+                    ? await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, created_at) VALUES ($1, NULL, $2, $3, $4, $5, $6) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId, meta.createdAt])
+                    : await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id) VALUES ($1, NULL, $2, $3, $4, $5) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId]);
                 const saved = result.rows[0];
                 if (meta.discordMessageId) {
                     await db_js_1.pool.query(`INSERT INTO discord_message_links (asdf_message_id, discord_channel_id, discord_message_id, direction)

@@ -1,12 +1,66 @@
-// チャット本文の装飾 (@メンション・#チャンネル・URL) と、入力欄の補完
+// チャット本文の装飾 (@メンション・#チャンネル・:絵文字:・URL・Markdown) と、入力欄の補完
 import React from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
-const TOKEN_RE = /(@[^\s@#]+|#[^\s@#]+|https?:\/\/[^\s<>"]+)/g;
+const TOKEN_RE = /(@[^\s@#]+|#[^\s@#]+|:[a-zA-Z0-9_-]{2,32}:|https?:\/\/[^\s<>"]+)/g;
 export const SPECIAL_MENTIONS = ['everyone', 'gemini'];
 
-interface RenderOptions {
+export interface CustomEmojiItem {
+  id?: number;
+  name: string;
+  url: string;
+  created_by?: number | null;
+}
+
+export const BUILTIN_SHORTCODES: Record<string, string> = {
+  check: '✅',
+  white_check_mark: '✅',
+  x: '❌',
+  cross_mark: '❌',
+  thumbsup: '👍',
+  '+1': '👍',
+  heart: '❤️',
+  joy: '😂',
+  open_mouth: '😮',
+  sob: '😢',
+  pray: '🙏',
+  fire: '🔥',
+  sparkles: '✨',
+  tada: '🎉',
+  '100': '💯',
+  eyes: '👀',
+  thinking: '🤔',
+  muscle: '💪',
+  clap: '👏',
+  rocket: '🚀',
+  star: '⭐',
+  warning: '⚠️',
+  zzz: '💤',
+  wave: '👋',
+  ok_hand: '👌',
+  salute: '🫡',
+  skull: '💀',
+  party: '🥳',
+  cool: '😎',
+  sweat_smile: '😅',
+  cry: '😭',
+  angry: '😠',
+  poop: '💩',
+  crown: '👑',
+  gem: '💎',
+  book: '📚',
+  pencil: '✏️',
+  bulb: '💡',
+  bell: '🔔',
+  mega: '📣',
+  swimmer: '🏊',
+};
+
+export interface RenderOptions {
   usernames: Set<string>;
   channels: Map<string, number>;
+  customEmojis?: Map<string, string>;
   me?: string;
   onChannelClick: (id: number) => void;
   // このサイトのメッセージリンク (…/#msg-123) はタブを開かずにその場でジャンプ
@@ -14,6 +68,43 @@ interface RenderOptions {
   // メモリンク (…/#memo-3) ジャンプ
   onMemoLink?: (slot: number) => void;
   token?: string;
+}
+
+export function resolveEmojiUrl(name: string, customEmojis?: Map<string, string>): string | null {
+  const clean = name.replace(/^:+|:+$/g, '').toLowerCase();
+  if (customEmojis?.has(clean)) return customEmojis.get(clean)!;
+  if (clean === 'swim') return '/uploads/emoji-swim.svg';
+  return null;
+}
+
+export function renderEmojiToken(
+  token: string,
+  customEmojis?: Map<string, string>,
+  key?: React.Key,
+  sizeClass = 'w-5 h-5'
+): React.ReactNode | null {
+  const clean = token.replace(/^:+|:+$/g, '').toLowerCase();
+  const customUrl = resolveEmojiUrl(clean, customEmojis);
+  if (customUrl) {
+    return (
+      <img
+        key={key}
+        src={customUrl}
+        alt={`:${clean}:`}
+        title={clean === 'swim' ? 'SWIMしよ (:swim:)' : `:${clean}:`}
+        className={`${sizeClass} inline-block object-contain align-middle mx-0.5 select-none`}
+      />
+    );
+  }
+  const unicode = BUILTIN_SHORTCODES[clean];
+  if (unicode) {
+    return (
+      <span key={key} title={`:${clean}:`} className="inline-block align-middle">
+        {unicode}
+      </span>
+    );
+  }
+  return null;
 }
 
 // URL がメッセージリンクならメッセージ ID を返す
@@ -109,6 +200,12 @@ export function renderMessageText(content: string, opts: RenderOptions): React.R
         );
         continue;
       }
+    } else if (token.startsWith(':') && token.endsWith(':')) {
+      const rendered = renderEmojiToken(token, opts.customEmojis, i++);
+      if (rendered) {
+        out.push(rendered);
+        continue;
+      }
     } else {
       const linkedId = opts.onMessageLink ? messageLinkId(token) : null;
       if (linkedId !== null) {
@@ -141,8 +238,147 @@ export function renderMessageText(content: string, opts: RenderOptions): React.R
   return out;
 }
 
+// 見出しテキストから目次アンカー用のスラッグを生成
+export function slugifyHeading(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s_-]/gu, '')
+    .replace(/\s+/g, '-');
+}
+
+function extractTextFromChildren(children: React.ReactNode): string {
+  if (typeof children === 'string' || typeof children === 'number') return String(children);
+  if (Array.isArray(children)) return children.map(extractTextFromChildren).join('');
+  if (React.isValidElement(children)) {
+    return extractTextFromChildren((children.props as any)?.children);
+  }
+  return '';
+}
+
+function decorateInlineChildren(children: React.ReactNode, opts: RenderOptions): React.ReactNode {
+  return React.Children.map(children, (child) => {
+    if (typeof child === 'string') {
+      return <>{renderMessageText(child, opts)}</>;
+    }
+    return child;
+  });
+}
+
+// チャットやメモで使える拡張Markdown (メンション・チャンネル・絵文字・目次アンカージャンプ対応)
+export function SmartMarkdown({
+  content,
+  opts,
+  className = '',
+  containerRef,
+}: {
+  content: string;
+  opts: RenderOptions;
+  className?: string;
+  containerRef?: React.RefObject<HTMLElement | null>;
+}) {
+  const handleAnchorClick = (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
+    const msgId = opts.onMessageLink ? messageLinkId(href) : null;
+    if (msgId !== null) {
+      e.preventDefault();
+      opts.onMessageLink!(msgId);
+      return;
+    }
+    const memoId = opts.onMemoLink ? memoSlotId(href) : null;
+    if (memoId !== null) {
+      e.preventDefault();
+      opts.onMemoLink!(memoId);
+      return;
+    }
+    if (href.startsWith('#')) {
+      e.preventDefault();
+      let rawTarget = href.slice(1);
+      try {
+        rawTarget = decodeURIComponent(rawTarget);
+      } catch (_) {}
+      const slug = slugifyHeading(rawTarget);
+      const root: ParentNode = containerRef?.current || document;
+      const byId =
+        (root instanceof Document ? root.getElementById(rawTarget) : root.querySelector(`[id="${CSS.escape(rawTarget)}"]`)) ||
+        (root instanceof Document ? root.getElementById(slug) : root.querySelector(`[id="${CSS.escape(slug)}"]`));
+      if (byId) {
+        byId.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+      // 見出しテキスト一致でもフォールバック検索
+      const headings = root.querySelectorAll('h1, h2, h3, h4, h5, h6');
+      for (const h of Array.from(headings)) {
+        const text = (h.textContent || '').trim();
+        if (text === rawTarget || slugifyHeading(text) === slug) {
+          h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          return;
+        }
+      }
+    }
+  };
+
+  return (
+    <div className={className}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="mb-1 last:mb-0 leading-relaxed">{decorateInlineChildren(children, opts)}</p>,
+          li: ({ children }) => <li className="leading-relaxed">{decorateInlineChildren(children, opts)}</li>,
+          td: ({ children }) => <td className="border border-stone-700 px-2.5 py-1">{decorateInlineChildren(children, opts)}</td>,
+          th: ({ children }) => <th className="border border-stone-700 px-2.5 py-1 bg-stone-800/70">{decorateInlineChildren(children, opts)}</th>,
+          h1: ({ children }) => {
+            const id = slugifyHeading(extractTextFromChildren(children));
+            return <h1 id={id} className="scroll-mt-16 font-bold text-lg text-white mt-2 mb-1">{decorateInlineChildren(children, opts)}</h1>;
+          },
+          h2: ({ children }) => {
+            const id = slugifyHeading(extractTextFromChildren(children));
+            return <h2 id={id} className="scroll-mt-16 font-bold text-base text-white mt-2 mb-1">{decorateInlineChildren(children, opts)}</h2>;
+          },
+          h3: ({ children }) => {
+            const id = slugifyHeading(extractTextFromChildren(children));
+            return <h3 id={id} className="scroll-mt-16 font-semibold text-sm text-stone-100 mt-1.5 mb-0.5">{decorateInlineChildren(children, opts)}</h3>;
+          },
+          h4: ({ children }) => {
+            const id = slugifyHeading(extractTextFromChildren(children));
+            return <h4 id={id} className="scroll-mt-16 font-semibold text-sm text-stone-200 mt-1 mb-0.5">{decorateInlineChildren(children, opts)}</h4>;
+          },
+          a: ({ href, children }) => {
+            const linkHref = href || '';
+            const isInternal =
+              linkHref.startsWith('#') ||
+              (opts.onMessageLink && messageLinkId(linkHref) !== null) ||
+              (opts.onMemoLink && memoSlotId(linkHref) !== null);
+            return (
+              <a
+                href={linkHref}
+                onClick={(e) => handleAnchorClick(e, linkHref)}
+                target={isInternal ? undefined : '_blank'}
+                rel={isInternal ? undefined : 'noreferrer noopener'}
+                className="text-sky-400 hover:underline break-all cursor-pointer"
+              >
+                {children}
+              </a>
+            );
+          },
+          img: ({ src, alt }) => {
+            const proxied = toProxiedMediaUrl(src || '', opts.token || '');
+            return <img src={proxied} alt={alt || ''} className="max-h-72 rounded-lg my-1 object-contain border border-stone-800" />;
+          },
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 // 入力欄の下に敷く「ハイライトだけの影」。文字は透明で、メンション部分にだけ色を付ける
-export function renderComposerHighlight(text: string, usernames: Set<string>, channels: Map<string, number>): React.ReactNode[] {
+export function renderComposerHighlight(
+  text: string,
+  usernames: Set<string>,
+  channels: Map<string, number>,
+  customEmojis?: Map<string, string>
+): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   let last = 0;
   let i = 0;
@@ -152,7 +388,11 @@ export function renderComposerHighlight(text: string, usernames: Set<string>, ch
     const body = token.slice(1);
     const valid = token.startsWith('@')
       ? usernames.has(body) || SPECIAL_MENTIONS.includes(body.toLowerCase())
-      : token.startsWith('#') && channels.has(body);
+      : token.startsWith('#')
+      ? channels.has(body)
+      : token.startsWith(':') && token.endsWith(':')
+      ? Boolean(resolveEmojiUrl(token, customEmojis) || BUILTIN_SHORTCODES[token.slice(1, -1).toLowerCase()])
+      : false;
     if (!valid) continue;
     if (idx > last) out.push(text.slice(last, idx));
     out.push(
@@ -168,16 +408,17 @@ export function renderComposerHighlight(text: string, usernames: Set<string>, ch
   return out;
 }
 
-// キャレット位置にある @… / #… を探す
-export function findCompletionToken(value: string, caret: number): { kind: '@' | '#'; query: string; start: number } | null {
+// キャレット位置にある @… / #… / :… を探す
+export function findCompletionToken(value: string, caret: number): { kind: '@' | '#' | ':'; query: string; start: number } | null {
   let start = caret;
   while (start > 0 && !/\s/.test(value[start - 1])) start--;
   const token = value.slice(start, caret);
   if (token.length === 0) return null;
   const kind = token[0];
-  if (kind !== '@' && kind !== '#') return null;
+  if (kind !== '@' && kind !== '#' && kind !== ':') return null;
   const query = token.slice(1);
-  if (/[@#]/.test(query)) return null;
+  if (kind === ':' && query.length === 0) return null;
+  if (/[@#:]/.test(query)) return null;
   return { kind, query, start };
 }
 

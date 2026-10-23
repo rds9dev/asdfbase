@@ -81,6 +81,10 @@ import {
   ChevronDown,
   BookOpenCheck,
   Square,
+  Shield,
+  Server,
+  Smile,
+  Upload,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -97,8 +101,12 @@ import {
   computeSchoolStatus, daySlots, periodCountFor, closingFor,
   type ScheduleType, type ScheduleDef, type TimetableConfig, type TimetableItem,
 } from './schedule';
-import { renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates, DiscordBadge, splitSenderName, memoSlotId, toProxiedMediaUrl } from './chatText';
-import { ReactionBar } from './Reactions';
+import {
+  renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates,
+  DiscordBadge, splitSenderName, memoSlotId, toProxiedMediaUrl,
+  BUILTIN_SHORTCODES, type CustomEmojiItem, SmartMarkdown, renderEmojiToken, resolveEmojiUrl,
+} from './chatText';
+import { ReactionBar, DEFAULT_QUICK_EMOJIS, renderReactionEmoji } from './Reactions';
 import HomeworkTab, { type Homework } from './HomeworkTab';
 import { drawStroke, drawText, playTimelapse, timelapsePlan } from './boardTimelapse';
 import { setFaviconBadge } from './favicon';
@@ -115,6 +123,24 @@ interface User {
   status: string;
   avatar_url?: string | null;
   class_no?: number | null;
+  custom_roles?: string[];
+  preferences?: Record<string, any>;
+}
+
+interface RoleDefinition {
+  id: string;
+  name: string;
+  color: string;
+  system?: boolean;
+}
+
+interface ChannelItem {
+  id: number;
+  name: string;
+  type: string;
+  server_id?: string | null;
+  view_roles?: string[];
+  write_roles?: string[];
 }
 
 interface Message {
@@ -308,7 +334,9 @@ export default function App() {
   });
   const setActiveTab = (tab: TabId) => {
     setActiveTabState(tab);
+    setIsNotifyPopoverOpen(false);
     LS.set('asdf_active_tab', tab);
+    syncPreferencesToServer({ activeTab: tab });
   };
   const isSmallScreen = () => typeof window !== 'undefined' && window.innerWidth < 768;
 
@@ -342,8 +370,8 @@ export default function App() {
   const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
   const [editingContent, setEditingContent] = useState('');
   const [replyToMessage, setReplyToMessage] = useState<Message | null>(null);
-  // @メンション / #チャンネル の補完 (Tab・↑↓で選択、Enterで決定)
-  const [completion, setCompletion] = useState<{ kind: '@' | '#'; query: string; start: number; index: number } | null>(null);
+  // @メンション / #チャンネル / :絵文字: の補完 (Tab・↑↓で選択、Enterで決定)
+  const [completion, setCompletion] = useState<{ kind: '@' | '#' | ':'; query: string; start: number; index: number } | null>(null);
   const composerBackdropRef = useRef<HTMLDivElement | null>(null);
   // 入力中のユーザー (userId → 表示期限)
   const [typingUsers, setTypingUsers] = useState<Record<number, { username: string; channelId: number; until: number }>>({});
@@ -357,9 +385,47 @@ export default function App() {
   const [editingChannel, setEditingChannel] = useState<{ id: number; name: string } | null>(null);
   const [editChannelNameInput, setEditChannelNameInput] = useState('');
 
+  // Discord サーバー連携・左レール・簡単紐付け・履歴取得ステート
+  const [discordServers, setDiscordServers] = useState<any[]>([]);
+  const [discordBindings, setDiscordBindings] = useState<any[]>([]);
+  const [discordLinkRequests, setDiscordLinkRequests] = useState<any[]>([]);
+  const [selectedServerId, setSelectedServerId] = useState<string>('all');
+  const [showDiscordServerModal, setShowDiscordServerModal] = useState<boolean>(false);
+  const [isSyncingDiscordHistory, setIsSyncingDiscordHistory] = useState<boolean>(false);
+  const [linkGuildId, setLinkGuildId] = useState<string>('');
+  const [linkDiscordChannelId, setLinkDiscordChannelId] = useState<string>('');
+  const [linkAsdfChannelId, setLinkAsdfChannelId] = useState<string>('new');
+  const [linkNewChannelName, setLinkNewChannelName] = useState<string>('');
+
+  // カスタム絵文字 & ピッカー・アップロード
+  const [customEmojisList, setCustomEmojisList] = useState<CustomEmojiItem[]>([
+    { name: 'swim', url: '/uploads/emoji-swim.svg' },
+  ]);
+  const [showEmojiPicker, setShowEmojiPicker] = useState<boolean>(false);
+  const [emojiUploadName, setEmojiUploadName] = useState<string>('');
+  const [emojiUploadFile, setEmojiUploadFile] = useState<File | null>(null);
+  const [isUploadingEmoji, setIsUploadingEmoji] = useState<boolean>(false);
+
+  // ロール定義 & チャンネルごと権限設定 (admin用)
+  const [roleDefs, setRoleDefs] = useState<RoleDefinition[]>([
+    { id: 'admin', name: '管理者', color: '#f43f5e', system: true },
+    { id: 'member', name: 'メンバー', color: '#64748b', system: true },
+  ]);
+  const [channelPermModal, setChannelPermModal] = useState<ChannelItem | null>(null);
+  const [showRoleManagerModal, setShowRoleManagerModal] = useState<boolean>(false);
+  const [newRoleIdInput, setNewRoleIdInput] = useState<string>('');
+  const [newRoleNameInput, setNewRoleNameInput] = useState<string>('');
+  const [newRoleColorInput, setNewRoleColorInput] = useState<string>('#10b981');
+
+  // Markdown プレビュー & エディタのスクロール同期用 Ref
+  const memoTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const memoPreviewRef = useRef<HTMLDivElement | null>(null);
+  const memoScrollLockRef = useRef<'editor' | 'preview' | null>(null);
+
   // お知らせ & 通知ポップオーバー
   const [announcements, setAnnouncements] = useState<any[]>([]);
   const [isNotifyPopoverOpen, setIsNotifyPopoverOpen] = useState(false);
+  const notifyPopoverContainerRef = useRef<HTMLDivElement | null>(null);
   const [isNewAnnouncementModalOpen, setIsNewAnnouncementModalOpen] = useState(false);
   const [newAnnouncementTitle, setNewAnnouncementTitle] = useState('');
   const [newAnnouncementContent, setNewAnnouncementContent] = useState('');
@@ -371,6 +437,25 @@ export default function App() {
   // モバイル メニューシート & スラッシュコマンド補完
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
+
+  // アカウント同期設定のサーバー保存 (デバウンス)
+  const prefSyncTimerRef = useRef<any>(null);
+  const pendingPrefsRef = useRef<Record<string, any>>({});
+  const syncPreferencesToServer = (patch: Record<string, any>) => {
+    pendingPrefsRef.current = { ...pendingPrefsRef.current, ...patch };
+    clearTimeout(prefSyncTimerRef.current);
+    prefSyncTimerRef.current = setTimeout(() => {
+      const tk = tokenRef.current;
+      const body = pendingPrefsRef.current;
+      pendingPrefsRef.current = {};
+      if (!tk || Object.keys(body).length === 0) return;
+      safeFetch(`/api/users/me/preferences?connId=${encodeURIComponent(realtimeRef.current?.connId || '')}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tk}` },
+        body: JSON.stringify({ preferences: body }),
+      }).catch(() => {});
+    }, 500);
+  };
 
   // Settings State (Account, Notifications, Webhook, Audit Logs, Appearance)
   const [settingsSection, setSettingsSection] = useState<'account' | 'notifications' | 'webhook' | 'audit' | 'appearance' | 'connection'>('account');
@@ -393,6 +478,7 @@ export default function App() {
     const next = { ...notifyPrefsRef.current, ...patch };
     setNotifyPrefs(next);
     try { localStorage.setItem('asdf_notify_prefs', JSON.stringify(next)); } catch (_) {}
+    syncPreferencesToServer({ notifyPrefs: next });
     if ((patch.important || patch.messages) && 'Notification' in window && Notification.permission === 'default') {
       requestNotifyPermission();
     }
@@ -431,7 +517,7 @@ export default function App() {
   const [authError, setAuthError] = useState('');
 
   // Chat State
-  const [channels, setChannels] = useState<{ id: number; name: string; type: string }[]>([
+  const [channels, setChannels] = useState<ChannelItem[]>([
     { id: 1, name: 'general', type: 'text' },
     { id: 2, name: 'homework', type: 'text' },
   ]);
@@ -439,6 +525,7 @@ export default function App() {
   const setActiveChannelId = (id: number) => {
     setActiveChannelIdState(id);
     LS.set('asdf_active_channel', String(id));
+    syncPreferencesToServer({ activeChannelId: id });
     if (isSmallScreen()) setIsChannelsCollapsed(true);
   };
   const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
@@ -819,6 +906,56 @@ export default function App() {
     return fetch(cleanPath, init);
   };
 
+  const applySyncedPreferences = (prefs: Record<string, any> | undefined, isInitial = false) => {
+    if (!prefs || typeof prefs !== 'object') return;
+    if (typeof prefs.uiScale === 'number' && [75, 85, 100, 110].includes(prefs.uiScale)) {
+      setUiScale(prefs.uiScale);
+      LS.set('asdf_ui_scale', String(prefs.uiScale));
+    }
+    if (typeof prefs.chatAutoScrollMode === 'string' && ['always', 'unread_anchor', 'off'].includes(prefs.chatAutoScrollMode)) {
+      setChatAutoScrollMode(prefs.chatAutoScrollMode as any);
+      LS.set('asdf_chat_scroll_mode', prefs.chatAutoScrollMode);
+    }
+    if (typeof prefs.memoAutoSaveInterval === 'number' && [0, 1000, 2000, 5000].includes(prefs.memoAutoSaveInterval)) {
+      setMemoAutoSaveInterval(prefs.memoAutoSaveInterval);
+      LS.set('asdf_memo_autosave_ms', String(prefs.memoAutoSaveInterval));
+    }
+    if (prefs.notifyPrefs && typeof prefs.notifyPrefs === 'object') {
+      const merged = { ...notifyPrefsRef.current, ...prefs.notifyPrefs };
+      setNotifyPrefs(merged);
+      try { localStorage.setItem('asdf_notify_prefs', JSON.stringify(merged)); } catch (_) {}
+    }
+    if (typeof prefs.lastReadAnnouncementTime === 'number' && prefs.lastReadAnnouncementTime > 0) {
+      setLastReadAnnouncementTime(prev => {
+        const next = Math.max(prev, prefs.lastReadAnnouncementTime);
+        LS.set('asdf_last_read_announcement', String(next));
+        return next;
+      });
+    }
+    if (isInitial) {
+      if (typeof prefs.activeTab === 'string' && TABS.some(t => t.id === prefs.activeTab)) {
+        setActiveTabState(prefs.activeTab as TabId);
+        LS.set('asdf_active_tab', prefs.activeTab);
+      }
+      if (typeof prefs.activeChannelId === 'number' && prefs.activeChannelId > 0) {
+        setActiveChannelIdState(prefs.activeChannelId);
+        LS.set('asdf_active_channel', String(prefs.activeChannelId));
+      }
+    }
+  };
+
+  // 通知ポップオーバーの外側クリックで閉じる
+  useEffect(() => {
+    if (!isNotifyPopoverOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (notifyPopoverContainerRef.current && !notifyPopoverContainerRef.current.contains(e.target as Node)) {
+        setIsNotifyPopoverOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [isNotifyPopoverOpen]);
+
   // Fetch Current User
   useEffect(() => {
     if (!token) {
@@ -832,7 +969,10 @@ export default function App() {
         if (!res.ok) throw new Error('Auth failed');
         return res.json();
       })
-      .then(data => setCurrentUser(data))
+      .then(data => {
+        setCurrentUser(data);
+        applySyncedPreferences(data?.preferences, true);
+      })
       .catch(() => {
         localStorage.removeItem('asdf_token');
         setToken(null);
@@ -1158,7 +1298,10 @@ export default function App() {
         setChannels(prev => prev.filter(c => c.id !== msg.payload.id));
       } else if (msg.type === 'ANNOUNCEMENT_CREATED') {
         setAnnouncements(prev => [msg.payload, ...prev.filter(a => a.id !== msg.payload.id)]);
-        if (notifyPrefsRef.current.important) {
+        const isMyAnnouncement =
+          msg.payload?.user_id === currentUserRef.current?.id ||
+          msg.payload?.username === currentUserRef.current?.username;
+        if (!isMyAnnouncement && notifyPrefsRef.current.important) {
           if (notifyPrefsRef.current.sound) playNotificationSound();
           showBrowserNotification(`お知らせ: ${msg.payload.title}`, msg.payload.content || '');
         }
@@ -1168,7 +1311,10 @@ export default function App() {
         setAssignments(prev => prev.map(a => a.id === msg.payload.id ? { ...a, ...msg.payload } : a));
       } else if (msg.type === 'ASSIGNMENT_CREATED') {
         setAssignments(prev => (prev.some(a => a.id === msg.payload.id) ? prev : [...prev, msg.payload].sort((a, b) => String(a.deadline).localeCompare(String(b.deadline)))));
-        if (notifyPrefsRef.current.important) {
+        const isMyAssignment =
+          msg.payload?.created_by === currentUserRef.current?.id ||
+          msg.payload?.author_id === currentUserRef.current?.id;
+        if (!isMyAssignment && notifyPrefsRef.current.important) {
           if (notifyPrefsRef.current.sound) playNotificationSound();
           showBrowserNotification('新しい提出物', `${msg.payload.subject || ''} ${msg.payload.title}`);
         }
@@ -1221,6 +1367,20 @@ export default function App() {
         }
       } else if (msg.type === 'USER_DELETED') {
         setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
+      } else if (msg.type === 'USER_PREFERENCES_UPDATED') {
+        applySyncedPreferences(msg.payload, false);
+      } else if (msg.type === 'EMOJI_UPDATED') {
+        setCustomEmojisList(prev => [msg.payload, ...prev.filter(e => e.name !== msg.payload.name)]);
+      } else if (msg.type === 'EMOJI_DELETED') {
+        setCustomEmojisList(prev => prev.filter(e => e.id !== msg.payload.id && e.name !== msg.payload.name));
+      } else if (msg.type === 'ROLES_UPDATED') {
+        if (Array.isArray(msg.payload)) setRoleDefs(msg.payload);
+      } else if (
+        msg.type === 'DISCORD_BINDINGS_CHANGED' ||
+        msg.type === 'DISCORD_LINK_REQUEST_CREATED' ||
+        msg.type === 'DISCORD_LINK_REQUEST_UPDATED'
+      ) {
+        fetchDiscordServersRef.current();
       }
   };
   const handleRealtimeEventRef = useRef(handleRealtimeEvent);
@@ -1299,6 +1459,21 @@ export default function App() {
   }, [token, rtTransport, rtPollInterval, connRoute]);
 
 
+  const fetchDiscordServers = async () => {
+    const tk = tokenRef.current;
+    if (!tk) return;
+    try {
+      const res = await safeFetch('/api/discord/servers', { headers: { Authorization: `Bearer ${tk}` } });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data?.servers)) setDiscordServers(data.servers);
+      if (Array.isArray(data?.status?.bindings)) setDiscordBindings(data.status.bindings);
+      if (Array.isArray(data?.linkRequests)) setDiscordLinkRequests(data.linkRequests);
+    } catch (_) {}
+  };
+  const fetchDiscordServersRef = useRef(fetchDiscordServers);
+  fetchDiscordServersRef.current = fetchDiscordServers;
+
   // Initial Data Load: リロード直後 (プロキシの起動待ちなど) に失敗しても再試行する
   const loadInitialData = async (attempt = 0) => {
     const tk = tokenRef.current;
@@ -1313,6 +1488,9 @@ export default function App() {
       get('/api/channels').then(data => Array.isArray(data) && setChannels(data)),
       get('/api/users').then(data => Array.isArray(data) && setOnlineUsers(data)),
       get('/api/discord/voice-status').then(data => data?.vcs && setDiscordVcs(data.vcs)).catch(() => {}),
+      fetchDiscordServers(),
+      get('/api/emojis').then(data => Array.isArray(data) && data.length > 0 && setCustomEmojisList(data)).catch(() => {}),
+      get('/api/roles').then(data => Array.isArray(data?.roles) && setRoleDefs(data.roles)).catch(() => {}),
       get('/api/notes').then((data: MemoSlot[]) => {
         if (!Array.isArray(data)) return;
         setMemoSlots(data);
@@ -2116,14 +2294,21 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ name: newChannelName, type: 'text' })
+        body: JSON.stringify({
+          name: newChannelName,
+          type: 'text',
+          server_id: selectedServerId !== 'all' ? selectedServerId : null,
+        })
       });
       if (res.ok) {
         const created = await res.json();
-        setChannels(prev => [...prev, created]);
+        setChannels(prev => prev.some(c => c.id === created.id) ? prev : [...prev, created]);
         setActiveChannelId(created.id);
         setIsNewChannelModalOpen(false);
         setNewChannelName('');
+      } else {
+        const d = await res.json().catch(() => ({}));
+        toast(d.error || 'チャンネル作成に失敗しました', { kind: 'error' });
       }
     } catch (err) {
       console.error(err);
@@ -2435,7 +2620,7 @@ export default function App() {
         throw new Error(d.error || 'お知らせの作成に失敗しました');
       }
       const saved = await res.json();
-      setAnnouncements(prev => [saved, ...prev]);
+      setAnnouncements(prev => [saved, ...prev.filter(a => a.id !== saved.id)]);
       setNewAnnouncementTitle('');
       setNewAnnouncementContent('');
       setIsNewAnnouncementModalOpen(false);
@@ -2485,6 +2670,324 @@ export default function App() {
     } catch (err: any) {
       toast(err.message, { kind: 'error' });
     }
+  };
+
+  // Discord 同期チャンネル解除 (オプションでチャンネル自体も削除可能)
+  const handleUnbindDiscordChannel = async (opts: { discordChannelId?: string; asdfChannelId?: number; label?: string; deleteChannel?: boolean }) => {
+    if (!token) return;
+    const ok = await confirmDialog({
+      title: opts.deleteChannel ? '同期チャンネルを削除しますか？' : 'Discord チャンネルとの同期を解除しますか？',
+      message: opts.deleteChannel
+        ? `${opts.label || 'このチャンネル'} の Discord 同期を解除し、asdfbase 側のチャンネルと履歴も削除します。`
+        : `${opts.label || 'このチャンネル'} と Discord の双方向同期を解除します。（メッセージ履歴は残ります）`,
+      confirmLabel: opts.deleteChannel ? 'チャンネルごと削除' : '同期を解除',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await safeFetch('/api/discord/bindings', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          discordChannelId: opts.discordChannelId,
+          asdfChannelId: opts.asdfChannelId,
+          deleteChannel: Boolean(opts.deleteChannel),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '同期解除に失敗しました');
+      if (data.status?.bindings) setDiscordBindings(data.status.bindings);
+      if (opts.deleteChannel && opts.asdfChannelId) {
+        setChannels(prev => {
+          const remaining = prev.filter(c => c.id !== opts.asdfChannelId);
+          if (activeChannelId === opts.asdfChannelId && remaining.length > 0) {
+            setActiveChannelId(remaining[0].id);
+          }
+          return remaining;
+        });
+      }
+      fetchDiscordServers().catch(() => {});
+      loadIntegrations().catch(() => {});
+      toast(opts.deleteChannel ? '同期を解除してチャンネルを削除しました' : 'Discord チャンネル同期を解除しました', { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message || '同期解除に失敗しました', { kind: 'error' });
+    }
+  };
+
+  // Bot ダウンタイム後のメッセージ履歴キャッチアップ同期
+  const handleSyncDiscordHistory = async (opts?: { asdfChannelId?: number; discordChannelId?: string; guildId?: string }) => {
+    if (!token || isSyncingDiscordHistory) return;
+    setIsSyncingDiscordHistory(true);
+    try {
+      const res = await safeFetch('/api/discord/sync-history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ ...opts, limit: 60 }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '履歴の取得に失敗しました');
+      await fetchDiscordServers().catch(() => {});
+      if (activeChannelId) loadChannelMessages(activeChannelId);
+      toast(`Discord から未取得メッセージ ${data.syncedCount || 0} 件を同期しました`, { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message || '履歴同期に失敗しました', { kind: 'error' });
+    } finally {
+      setIsSyncingDiscordHistory(false);
+    }
+  };
+
+  // Discord 簡単チャンネル紐付け (admin/rds9 は即時、メンバーは承認申請)
+  const handleRequestOrCreateDiscordBinding = async (opts: {
+    guildId: string;
+    guildName: string;
+    discordChannelId: string;
+    discordChannelName: string;
+    asdfChannelId: number | null;
+    asdfChannelName: string;
+  }) => {
+    if (!token || !opts.discordChannelId.trim()) return;
+    try {
+      const res = await safeFetch('/api/discord/bindings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          guildId: opts.guildId,
+          guildName: opts.guildName,
+          discordChannelId: opts.discordChannelId.trim(),
+          discordChannelName: opts.discordChannelName,
+          asdfChannelId: opts.asdfChannelId,
+          newChannelName: opts.asdfChannelId ? '' : opts.asdfChannelName,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Discord 連携の設定に失敗しました');
+      if (data.pendingApproval) {
+        toast('rds9 (管理者) へ連携リクエストを送信しました！承認されると自動で同期が始まります', { kind: 'success' });
+      } else {
+        toast('Discord チャンネルを紐付け、履歴を同期しました！', { kind: 'success' });
+        if (data.asdfChannelId) setActiveChannelId(Number(data.asdfChannelId));
+      }
+      setLinkNewChannelName('');
+      fetchDiscordServers().catch(() => {});
+      loadIntegrations().catch(() => {});
+    } catch (err: any) {
+      toast(err.message || '連携設定に失敗しました', { kind: 'error' });
+    }
+  };
+
+  const handleApproveDiscordRequest = async (id: number) => {
+    if (!token) return;
+    try {
+      const res = await safeFetch(`/api/discord/link-requests/${id}/approve`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '承認に失敗しました');
+      toast('連携申請を承認し、同期を開始しました', { kind: 'success' });
+      fetchDiscordServers().catch(() => {});
+      loadIntegrations().catch(() => {});
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  const handleRejectDiscordRequest = async (id: number) => {
+    if (!token) return;
+    try {
+      const res = await safeFetch(`/api/discord/link-requests/${id}/reject`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error('却下に失敗しました');
+      toast('連携申請を却下しました', { kind: 'info' });
+      fetchDiscordServers().catch(() => {});
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  const handleToggleApproveGuild = async (guildId: string, approve: boolean) => {
+    if (!token) return;
+    try {
+      const res = await safeFetch(`/api/discord/guilds/${guildId}/approve`, {
+        method: approve ? 'POST' : 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'サーバー設定の更新に失敗しました');
+      if (Array.isArray(data.servers)) setDiscordServers(data.servers);
+      toast(approve ? 'サーバーを連携許可しました' : 'サーバーの連携許可を解除しました', { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  // カスタム絵文字アップロード & 削除
+  const handleUploadCustomEmoji = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !emojiUploadFile || !emojiUploadName.trim() || isUploadingEmoji) return;
+    setIsUploadingEmoji(true);
+    try {
+      const fd = new FormData();
+      fd.append('name', emojiUploadName.trim().toLowerCase().replace(/^:+|:+$/g, ''));
+      fd.append('image', emojiUploadFile);
+      const res = await safeFetch('/api/emojis', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: fd,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '絵文字のアップロードに失敗しました');
+      setCustomEmojisList(prev => [...prev.filter(x => x.name !== data.name), data].sort((a, b) => a.name.localeCompare(b.name)));
+      setEmojiUploadName('');
+      setEmojiUploadFile(null);
+      toast(`カスタム絵文字 :${data.name}: を追加しました！`, { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    } finally {
+      setIsUploadingEmoji(false);
+    }
+  };
+
+  const handleDeleteCustomEmoji = async (id: number | undefined, name: string) => {
+    if (!token || !id) return;
+    const ok = await confirmDialog({
+      title: `:${name}: を削除しますか？`,
+      message: 'カスタム絵文字を削除します。',
+      confirmLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await safeFetch(`/api/emojis/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setCustomEmojisList(prev => prev.filter(e => e.id !== id));
+        toast(`:${name}: を削除しました`, { kind: 'success' });
+      }
+    } catch (_) {}
+  };
+
+  // チャンネル権限 & サーバー紐付け保存 (admin限定)
+  const handleSaveChannelPermissions = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!channelPermModal || !token) return;
+    try {
+      const res = await safeFetch(`/api/channels/${channelPermModal.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          name: channelPermModal.name,
+          server_id: channelPermModal.server_id || null,
+          view_roles: channelPermModal.view_roles || [],
+          write_roles: channelPermModal.write_roles || [],
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'チャンネル権限の保存に失敗しました');
+      setChannels(prev => prev.map(c => (c.id === data.id ? { ...c, ...data } : c)));
+      setChannelPermModal(null);
+      toast(`#${data.name} のロール・権限設定を保存しました`, { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  // ロール定義の追加・削除 & ユーザーへのロール付与 (admin限定)
+  const saveRoleDefsToServer = async (nextRoles: RoleDefinition[]) => {
+    if (!token) return;
+    const res = await safeFetch('/api/roles', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ roles: nextRoles }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'ロール設定の保存に失敗しました');
+    if (Array.isArray(data.roles)) setRoleDefs(data.roles);
+  };
+
+  const handleAddRoleDef = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const id = newRoleIdInput.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    const name = newRoleNameInput.trim();
+    if (!id || !name) {
+      toast('ロールID (半角英数) と表示名を入力してください', { kind: 'error' });
+      return;
+    }
+    if (roleDefs.some(r => r.id === id)) {
+      toast('同じIDのロールが既に存在します', { kind: 'error' });
+      return;
+    }
+    try {
+      await saveRoleDefsToServer([...roleDefs, { id, name, color: newRoleColorInput || '#10b981', system: false }]);
+      setNewRoleIdInput('');
+      setNewRoleNameInput('');
+      toast(`ロール「${name}」を作成しました`, { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  const handleDeleteRoleDef = async (roleId: string) => {
+    try {
+      await saveRoleDefsToServer(roleDefs.filter(r => r.id !== roleId || r.system));
+      toast('ロールを削除しました', { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  const handleToggleUserCustomRole = async (u: User, roleId: string) => {
+    if (!token) return;
+    const current = Array.isArray(u.custom_roles) ? u.custom_roles : [];
+    const next = current.includes(roleId) ? current.filter(r => r !== roleId) : [...current, roleId];
+    try {
+      const res = await safeFetch(`/api/users/${u.id}/roles`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ custom_roles: next }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'ロールの更新に失敗しました');
+      setOnlineUsers(prev => prev.map(x => (x.id === u.id ? { ...x, custom_roles: data.custom_roles || next } : x)));
+      if (currentUser?.id === u.id) setCurrentUser(prev => (prev ? { ...prev, custom_roles: data.custom_roles || next } : prev));
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  // メモの Markdown エディタ ⇔ プレビュー スクロール同期
+  const handleMemoEditorScroll = () => {
+    if (memoScrollLockRef.current === 'preview') return;
+    const ed = memoTextareaRef.current;
+    const pr = memoPreviewRef.current;
+    if (!ed || !pr) return;
+    const edMax = ed.scrollHeight - ed.clientHeight;
+    const prMax = pr.scrollHeight - pr.clientHeight;
+    if (edMax <= 0 || prMax <= 0) return;
+    memoScrollLockRef.current = 'editor';
+    pr.scrollTop = (ed.scrollTop / edMax) * prMax;
+    requestAnimationFrame(() => {
+      if (memoScrollLockRef.current === 'editor') memoScrollLockRef.current = null;
+    });
+  };
+
+  const handleMemoPreviewScroll = () => {
+    if (memoScrollLockRef.current === 'editor') return;
+    const ed = memoTextareaRef.current;
+    const pr = memoPreviewRef.current;
+    if (!ed || !pr) return;
+    const edMax = ed.scrollHeight - ed.clientHeight;
+    const prMax = pr.scrollHeight - pr.clientHeight;
+    if (edMax <= 0 || prMax <= 0) return;
+    memoScrollLockRef.current = 'preview';
+    ed.scrollTop = (pr.scrollTop / prMax) * edMax;
+    requestAnimationFrame(() => {
+      if (memoScrollLockRef.current === 'preview') memoScrollLockRef.current = null;
+    });
   };
 
   // 曜日ごとに 5限 / 6限 を切り替え
@@ -3409,12 +3912,18 @@ export default function App() {
   });
   const urgentHomework = urgentHomeworkList.length;
   const unreadAnnouncements = announcements.filter(a => new Date(a.created_at).getTime() > lastReadAnnouncementTime).length;
-  const totalNotifications = urgentHomework + unreadAnnouncements;
+  const pendingLinkRequests = discordLinkRequests.filter(r => r.status === 'pending');
+  const totalNotifications = urgentHomework + unreadAnnouncements + (currentUser.role === 'admin' ? pendingLinkRequests.length : 0);
   const nameOfUser = (id: number) => userById.get(id)?.username;
-  const activeChannelName = channels.find(c => c.id === activeChannelId)?.name || 'chat';
+  const activeChannelObj = channels.find(c => c.id === activeChannelId);
+  const activeChannelName = activeChannelObj?.name || 'chat';
+  const customEmojisMap = new Map(customEmojisList.map(e => [e.name.toLowerCase(), e.url]));
+  const bindingByAsdfId = new Map(discordBindings.map((b: any) => [Number(b.asdfChannelId), b]));
+  const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
+  const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
 
   // 補完候補
-  const completionItems: { key: string; label: string; insert: string; sub?: string; avatar?: string | null }[] = (() => {
+  const completionItems: { key: string; label: string; insert: string; sub?: string; avatar?: string | null; emojiUrl?: string }[] = (() => {
     if (!completion) return [];
     if (completion.kind === '@') {
       const pool = [
@@ -3423,6 +3932,24 @@ export default function App() {
         ...onlineUsers.filter(u => u.id !== currentUser.id).map(u => ({ key: `u${u.id}`, label: u.username, insert: `@${u.username}`, avatar: u.avatar_url, sub: u.status === 'online' ? 'オンライン' : undefined })),
       ];
       return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
+    }
+    if (completion.kind === ':') {
+      const customPool = customEmojisList.map(e => ({
+        key: `ce-${e.name}`,
+        label: e.name,
+        insert: `:${e.name}:`,
+        sub: 'カスタム絵文字',
+        emojiUrl: e.url,
+      }));
+      const builtinPool = Object.entries(BUILTIN_SHORTCODES)
+        .filter(([k]) => !customEmojisMap.has(k))
+        .map(([k, v]) => ({
+          key: `be-${k}`,
+          label: k,
+          insert: `:${k}:`,
+          sub: v,
+        }));
+      return rankCandidates([...customPool, ...builtinPool], completion.query, x => x.label).slice(0, 8);
     }
     const pool = channels.filter(c => c.type !== 'voice').map(c => ({ key: `c${c.id}`, label: c.name, insert: `#${c.name}` }));
     return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
@@ -3476,16 +4003,16 @@ export default function App() {
     >
       {/* 1. TOP BAR */}
       <header className="relative h-12 md:h-14 shrink-0 border-b border-stone-800/80 bg-[#090A0C]/90 backdrop-blur-md z-50 px-2 sm:px-4 flex items-center justify-between select-none gap-2">
-        <div className="flex items-center gap-1 sm:gap-2 min-w-0">
+        <div className="flex items-center gap-1 sm:gap-2 flex-1 min-w-0 overflow-hidden mr-1">
           <div 
             onClick={() => setActiveTab('chat')}
-            className="logo-container mr-1 lg:mr-3 font-['Space_Grotesk'] font-extrabold text-base sm:text-lg flex items-center tracking-wider shrink-0"
+            className="logo-container mr-1 lg:mr-2 font-['Space_Grotesk'] font-extrabold text-base sm:text-lg flex items-center tracking-wider shrink-0"
           >
             <span className="text-white">asdfbase</span>
             <span className="logo-dot">.</span>
           </div>
 
-          <nav className="hidden md:flex items-center gap-0.5 lg:gap-1 font-mono text-xs">
+          <nav className="hidden md:flex items-center gap-0.5 lg:gap-1 font-mono text-xs overflow-x-auto no-scrollbar min-w-0 py-1">
             {TABS.map(tab => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -3522,14 +4049,16 @@ export default function App() {
         </div>
 
         {/* Right Header Block: ホバーで概要、クリックで詳細 */}
-        <div className="flex items-center gap-1 sm:gap-2 font-mono text-[11px] sm:text-xs shrink-0">
+        <div className="flex items-center gap-1 sm:gap-1.5 font-mono text-[11px] sm:text-xs shrink-0">
           {/* 通知ボタン (放課後などの左隣) */}
-          <div className="relative">
+          <div ref={notifyPopoverContainerRef} className="relative">
             <button
               onClick={() => {
+                const nowTs = Date.now();
                 setIsNotifyPopoverOpen(v => !v);
-                setLastReadAnnouncementTime(Date.now());
-                localStorage.setItem('asdf_last_read_announcement', String(Date.now()));
+                setLastReadAnnouncementTime(nowTs);
+                localStorage.setItem('asdf_last_read_announcement', String(nowTs));
+                syncPreferencesToServer({ lastReadAnnouncementTime: nowTs });
               }}
               title="通知とお知らせ"
               className={`${headerChip} relative text-stone-300 bg-stone-900/60 border-stone-800/70 hover:bg-stone-800/80 hover:border-stone-600 ${
@@ -3573,6 +4102,42 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
+                {/* Discord連携承認待ちリクエスト (admin / rds9 専用) */}
+                {currentUser?.role === 'admin' && pendingLinkRequests.length > 0 && (
+                  <div className="space-y-1.5 pb-2 border-b border-stone-800/80">
+                    <div className="text-[10px] uppercase font-bold text-indigo-400 flex items-center gap-1">
+                      <Server className="w-3 h-3" />
+                      <span>Discord 連携の承認待ち ({pendingLinkRequests.length})</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {pendingLinkRequests.map((req: any) => (
+                        <div key={req.id} className="p-2 rounded-xl bg-indigo-500/10 border border-indigo-500/30 space-y-1.5">
+                          <div className="text-[11px] text-indigo-200 font-bold">
+                            {req.requester_username} が Discord #{req.discord_channel_name} の同期をリクエスト
+                          </div>
+                          <div className="text-[10px] text-stone-400">
+                            サーバー: {req.guild_name || req.guild_id} → asdfbase #{req.new_channel_name || req.asdf_channel_id}
+                          </div>
+                          <div className="flex gap-1.5">
+                            <button
+                              onClick={() => handleApproveDiscordRequest(req.id)}
+                              className="px-2.5 py-1 rounded-lg bg-emerald-500 text-black font-bold text-[10px] hover:bg-emerald-400"
+                            >
+                              許可して連携
+                            </button>
+                            <button
+                              onClick={() => handleRejectDiscordRequest(req.id)}
+                              className="px-2.5 py-1 rounded-lg bg-stone-800 text-stone-300 text-[10px] hover:bg-red-950 hover:text-red-300"
+                            >
+                              却下
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* システム通知: 宿題期限 */}
                 <div className="space-y-1.5">
@@ -3794,35 +4359,239 @@ export default function App() {
               />
             )}
 
-            {/* Channels Sidebar */}
+            {/* Channels Sidebar (左にサーバーレール + チャンネル一覧) */}
             {!isChannelsCollapsed && (
-              <aside className="absolute md:static inset-y-0 left-0 z-40 w-64 md:w-56 border-r border-stone-800 bg-[#0C0D10] flex flex-col shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
-                <div className="flex-1 min-h-0 flex flex-col p-2.5 sm:p-3">
-                  <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold shrink-0">
-                    <span>チャンネル</span>
-                    <button
-                      onClick={() => setIsNewChannelModalOpen(true)}
-                      className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800"
-                      title="チャンネルを作成"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                    </button>
+              <aside className="absolute md:static inset-y-0 left-0 z-40 w-72 md:w-64 border-r border-stone-800 bg-[#0C0D10] flex flex-row shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
+                {/* 左端: Discord風 サーバーレール (プロキシ/ローカルキャッシュアイコン表示 & オンライン/VCバッジ) */}
+                <div className="w-14 border-r border-stone-800/80 bg-[#08090B] flex flex-col items-center py-2.5 gap-2 overflow-y-auto shrink-0 select-none">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedServerId('all')}
+                    title="すべてのチャンネル (asdfbase)"
+                    className={`relative w-10 h-10 rounded-2xl flex items-center justify-center font-['Space_Grotesk'] font-black text-sm transition ${
+                      selectedServerId === 'all'
+                        ? 'bg-amber-500 text-black rounded-xl shadow-[0_0_12px_rgba(245,158,11,0.35)]'
+                        : 'bg-[#14161C] text-stone-300 hover:bg-stone-800 hover:text-white hover:rounded-xl border border-stone-800'
+                    }`}
+                  >
+                    {selectedServerId === 'all' && <span className="absolute -left-2 w-1 h-6 rounded-r bg-amber-400" />}
+                    <span>a.</span>
+                  </button>
+
+                  <div className="w-6 h-px bg-stone-800 my-0.5 shrink-0" />
+
+                  {discordServers.map((srv: any) => {
+                    const isSelected = selectedServerId === srv.id;
+                    const vcCount = Array.isArray(srv.vcs) ? srv.vcs.reduce((s: number, v: any) => s + (v.members?.length || 0), 0) : 0;
+                    return (
+                      <button
+                        key={srv.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedServerId(srv.id);
+                          const srvChannels = channels.filter(
+                            c => c.type !== 'voice' && (c.server_id === srv.id || bindingByAsdfId.get(c.id)?.guildId === srv.id)
+                          );
+                          if (srvChannels.length > 0 && !srvChannels.some(c => c.id === activeChannelId)) {
+                            setActiveChannelId(srvChannels[0].id);
+                          }
+                        }}
+                        title={`${srv.name} (${srv.onlineCount || 0}人オンライン / 全${srv.memberCount || 0}人${vcCount > 0 ? ` / VC ${vcCount}人` : ''})`}
+                        className={`relative w-10 h-10 rounded-2xl flex items-center justify-center transition group ${
+                          isSelected
+                            ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
+                            : 'bg-[#14161C] hover:bg-stone-800 hover:rounded-xl border border-stone-800/80'
+                        }`}
+                      >
+                        {isSelected && <span className="absolute -left-2 w-1 h-6 rounded-r bg-indigo-400" />}
+                        {srv.iconUrl ? (
+                          <img
+                            src={toProxiedMediaUrl(srv.iconUrl, token)}
+                            alt={srv.name}
+                            className="w-full h-full rounded-[inherit] object-cover"
+                          />
+                        ) : (
+                          <span className="text-xs font-bold text-indigo-200 truncate px-1">
+                            {String(srv.name || 'DC').slice(0, 2)}
+                          </span>
+                        )}
+                        {srv.onlineCount > 0 && (
+                          <span
+                            className="absolute -bottom-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-emerald-500 text-black text-[9px] font-extrabold leading-4 text-center border border-[#08090B]"
+                            title={`オンライン ${srv.onlineCount}人`}
+                          >
+                            {srv.onlineCount > 99 ? '99+' : srv.onlineCount}
+                          </span>
+                        )}
+                        {vcCount > 0 && (
+                          <span
+                            className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-indigo-500 text-white text-[9px] font-bold leading-4 text-center border border-[#08090B]"
+                            title={`VC参加中 ${vcCount}人`}
+                          >
+                            🔊
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      fetchDiscordServers();
+                      if (!linkGuildId && discordServers[0]?.id) setLinkGuildId(discordServers[0].id);
+                      setShowDiscordServerModal(true);
+                    }}
+                    title="Discord サーバー・簡単チャンネル紐付け・履歴取得"
+                    className="relative w-10 h-10 rounded-2xl bg-[#14161C] border border-dashed border-stone-700 hover:border-indigo-400 text-stone-400 hover:text-indigo-300 flex items-center justify-center transition mt-auto"
+                  >
+                    <Server className="w-4 h-4" />
+                    {currentUser?.role === 'admin' && pendingLinkRequests.length > 0 && (
+                      <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center">
+                        {pendingLinkRequests.length}
+                      </span>
+                    )}
+                  </button>
+                </div>
+
+                {/* 右側: サーバー情報 & チャンネル一覧 */}
+                <div className="flex-1 min-w-0 min-h-0 flex flex-col p-2 sm:p-2.5">
+                  <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-stone-400 px-1.5 mb-1.5 font-bold shrink-0 gap-1">
+                    <span className="truncate text-stone-200">
+                      {selectedServer ? selectedServer.name : 'チャンネル'}
+                    </span>
+                    <div className="flex items-center gap-0.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleSyncDiscordHistory(selectedServer ? { guildId: selectedServer.id } : undefined)}
+                        disabled={isSyncingDiscordHistory}
+                        className="p-1 hover:text-indigo-300 rounded text-stone-400 hover:bg-stone-800 disabled:opacity-40"
+                        title="Botダウンタイム中のDiscord未取得履歴を同期"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isSyncingDiscordHistory ? 'animate-spin text-indigo-400' : ''}`} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          fetchDiscordServers();
+                          if (selectedServer) setLinkGuildId(selectedServer.id);
+                          else if (!linkGuildId && discordServers[0]?.id) setLinkGuildId(discordServers[0].id);
+                          setShowDiscordServerModal(true);
+                        }}
+                        className="p-1 hover:text-indigo-300 rounded text-stone-400 hover:bg-stone-800"
+                        title="Discord Bot 簡単紐付け・サーバー状態"
+                      >
+                        <Link className="w-3.5 h-3.5" />
+                      </button>
+                      {currentUser?.role === 'admin' && (
+                        <button
+                          type="button"
+                          onClick={() => setShowRoleManagerModal(true)}
+                          className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800"
+                          title="ロール管理・メンバー権限設定 (admin専用)"
+                        >
+                          <Shield className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                      {currentUser?.role === 'admin' && (
+                        <button
+                          type="button"
+                          onClick={() => setIsNewChannelModalOpen(true)}
+                          className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800"
+                          title="チャンネルを作成"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
+
+                  {/* 選択中のDiscordサーバーの人数・オンライン・VC・喋ってる人サマリー */}
+                  {selectedServer && (
+                    <div className="mb-2 p-2 rounded-xl bg-[#12141B] border border-indigo-500/25 text-[11px] space-y-1.5 shrink-0">
+                      <div className="flex items-center justify-between text-stone-300">
+                        <span className="flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                          <b className="text-emerald-300">{selectedServer.onlineCount || 0}</b> オンライン
+                        </span>
+                        <span className="text-stone-400">全 <b>{selectedServer.memberCount || 0}</b> 人</span>
+                      </div>
+                      {Array.isArray(selectedServer.vcs) && selectedServer.vcs.length > 0 && (
+                        <div className="space-y-1 pt-1 border-t border-stone-800/80">
+                          {selectedServer.vcs.map((vc: any) => (
+                            <div key={vc.channelId} className="space-y-0.5">
+                              <div className="text-[10px] font-bold text-indigo-300 flex items-center gap-1">
+                                <Volume2 className="w-3 h-3 animate-pulse" /> {vc.channelName} ({vc.members?.length || 0})
+                              </div>
+                              <div className="flex flex-wrap gap-1">
+                                {(vc.members || []).map((m: any) => (
+                                  <span
+                                    key={m.id}
+                                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] border ${
+                                      m.speaking
+                                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold'
+                                        : 'bg-stone-900 border-stone-800 text-stone-300'
+                                    }`}
+                                    title={`${m.name}${m.speaking ? ' (発話中/マイクON)' : ' (ミュート)'}${m.streaming ? ' [画面共有中]' : ''}`}
+                                  >
+                                    {m.avatarUrl ? (
+                                      <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
+                                    ) : (
+                                      <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
+                                    )}
+                                    <span className="max-w-[68px] truncate">{m.name}</span>
+                                    {m.speaking ? <Mic className="w-2.5 h-2.5 text-emerald-400" /> : <MicOff className="w-2.5 h-2.5 text-stone-500" />}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {Array.isArray(selectedServer.onlineMembers) && selectedServer.onlineMembers.length > 0 && (
+                        <div className="pt-1 border-t border-stone-800/80">
+                          <div className="text-[10px] text-stone-500 mb-1">オンラインメンバー</div>
+                          <div className="flex flex-wrap gap-1 max-h-16 overflow-y-auto">
+                            {selectedServer.onlineMembers.slice(0, 24).map((m: any) => (
+                              <span
+                                key={m.id}
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-stone-900/90 border border-stone-800 text-[10px] text-stone-300"
+                                title={`${m.name} (${m.status})${m.inVc ? ` · VC: ${m.vcChannelName}` : ''}`}
+                              >
+                                <span className={`w-1.5 h-1.5 rounded-full ${m.status === 'online' ? 'bg-emerald-400' : m.status === 'idle' ? 'bg-amber-400' : 'bg-red-400'}`} />
+                                <span className="max-w-[65px] truncate">{m.name}</span>
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {/* チャンネル一覧: 収まらない時はこの中だけスクロール */}
-                  <div className="flex-1 min-h-0 overflow-y-auto space-y-0.5 pr-1">
-                    {channels.filter(ch => ch.type !== 'voice').map((ch, idx, textChannels) => {
+                  <div className="flex-1 min-h-0 overflow-y-auto space-y-0.5 pr-0.5">
+                    {channels
+                      .filter(ch => {
+                        if (ch.type === 'voice') return false;
+                        if (selectedServerId === 'all') return true;
+                        const b = bindingByAsdfId.get(ch.id);
+                        return ch.server_id === selectedServerId || b?.guildId === selectedServerId;
+                      })
+                      .map((ch, idx, textChannels) => {
                       const isActiveCh = activeChannelId === ch.id;
                       const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0);
                       const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0);
+                      const binding = bindingByAsdfId.get(ch.id);
+                      const hasRoleRestriction = (Array.isArray(ch.view_roles) && ch.view_roles.length > 0) || (Array.isArray(ch.write_roles) && ch.write_roles.length > 0);
                       return (
                       <div
                         key={ch.id}
-                        className={`group relative flex items-center justify-between pl-3 pr-2 py-2 rounded-lg text-sm transition ${
+                        className={`group relative flex items-center justify-between pl-2.5 pr-1.5 py-1.5 rounded-lg text-sm transition ${
                           isActiveCh
                             ? 'bg-amber-500/15 text-amber-300 font-bold'
                             : unread > 0
                               ? 'text-white font-bold bg-white/[0.04] hover:bg-stone-800/60'
-                              : 'text-stone-500 hover:bg-stone-900/60 hover:text-stone-300'
+                              : 'text-stone-400 hover:bg-stone-900/60 hover:text-stone-200'
                         }`}
                       >
                         {/* 左端インジケーター: 選択中=アンバーのバー / 未読=白い点 */}
@@ -3833,13 +4602,26 @@ export default function App() {
                         ) : null}
                         <button
                           onClick={() => setActiveChannelId(ch.id)}
-                          className="flex items-center gap-2 flex-1 text-left truncate min-w-0"
+                          className="flex items-center gap-1.5 flex-1 text-left truncate min-w-0"
                         >
-                          <Hash className={`w-4 h-4 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
+                          <Hash className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : binding ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
                           <span className="truncate">{ch.name}</span>
+                          {binding && (
+                            <span
+                              className="shrink-0 text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono"
+                              title={`Discord #${binding.discordChannelName} と同期中`}
+                            >
+                              DC
+                            </span>
+                          )}
+                          {hasRoleRestriction && (
+                            <span title="ロール制限チャンネル" className="shrink-0">
+                              <Shield className="w-3 h-3 text-amber-400/80" />
+                            </span>
+                          )}
                         </button>
 
-                        <div className="flex items-center gap-1 shrink-0 ml-1">
+                        <div className="flex items-center gap-0.5 shrink-0 ml-1">
                           {/* メンションされた時だけ赤い数字 */}
                           {mentions > 0 && (
                             <span className="anim-badge min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold leading-5 text-center shadow">
@@ -3847,21 +4629,46 @@ export default function App() {
                             </span>
                           )}
 
-                          {/* チャンネル並び替え (↑ / ↓) */}
+                          {/* チャンネル操作 (名前変更 / 権限設定 / 並び替え / 同期解除 / 削除) */}
                           <div className="opacity-0 group-hover:opacity-100 flex items-center transition">
-                            {currentUser?.role === 'admin' && (
+                            {binding && (
                               <button
-                                onClick={() => {
-                                  setEditingChannel({ id: ch.id, name: ch.name });
-                                  setEditChannelNameInput(ch.name);
-                                }}
-                                className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
-                                title="チャンネル名を変更"
+                                type="button"
+                                onClick={() => handleUnbindDiscordChannel({ asdfChannelId: ch.id, discordChannelId: binding.discordChannelId, label: `#${ch.name}` })}
+                                className="p-0.5 hover:text-amber-400 text-indigo-400 mr-0.5"
+                                title="Discord同期を解除"
                               >
-                                <Edit3 className="w-3 h-3" />
+                                <X className="w-3 h-3" />
                               </button>
                             )}
-                            {idx > 0 && (
+                            {currentUser?.role === 'admin' && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => setChannelPermModal({
+                                    ...ch,
+                                    view_roles: Array.isArray(ch.view_roles) ? ch.view_roles : [],
+                                    write_roles: Array.isArray(ch.write_roles) ? ch.write_roles : [],
+                                  })}
+                                  className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
+                                  title="チャンネルのロール・権限・サーバー設定 (admin専用)"
+                                >
+                                  <Shield className="w-3 h-3" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingChannel({ id: ch.id, name: ch.name });
+                                    setEditChannelNameInput(ch.name);
+                                  }}
+                                  className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
+                                  title="チャンネル名を変更"
+                                >
+                                  <Edit3 className="w-3 h-3" />
+                                </button>
+                              </>
+                            )}
+                            {currentUser?.role === 'admin' && idx > 0 && (
                               <button
                                 onClick={e => handleMoveChannel(e, idx, 'up')}
                                 className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
@@ -3870,7 +4677,7 @@ export default function App() {
                                 ▲
                               </button>
                             )}
-                            {idx < textChannels.length - 1 && (
+                            {currentUser?.role === 'admin' && idx < textChannels.length - 1 && (
                               <button
                                 onClick={e => handleMoveChannel(e, idx, 'down')}
                                 className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
@@ -3881,10 +4688,10 @@ export default function App() {
                             )}
                           </div>
 
-                          {channels.length > 1 && currentUser?.role === 'admin' && (
+                          {channels.length > 1 && (currentUser?.role === 'admin' || Boolean(binding) || Boolean(ch.server_id)) && (
                             <button
                               onClick={() => handleDeleteChannel(ch.id)}
-                              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-600"
+                              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 rounded text-stone-500"
                               title="チャンネル削除"
                             >
                               <Trash2 className="w-3 h-3" />
@@ -3894,6 +4701,21 @@ export default function App() {
                       </div>
                       );
                     })}
+                    {selectedServer && channels.filter(ch => ch.type !== 'voice' && (ch.server_id === selectedServer.id || bindingByAsdfId.get(ch.id)?.guildId === selectedServer.id)).length === 0 && (
+                      <div className="p-3 text-center text-xs text-stone-500 space-y-2 border border-dashed border-stone-800 rounded-xl mt-2">
+                        <div>このサーバーに紐付いたチャンネルがまだありません</div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setLinkGuildId(selectedServer.id);
+                            setShowDiscordServerModal(true);
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 text-[11px] font-bold hover:bg-indigo-500/30"
+                        >
+                          + Discordチャンネルを紐付ける
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               </aside>
@@ -3915,6 +4737,28 @@ export default function App() {
                   </button>
                   <Hash className="w-4 h-4 text-amber-400 shrink-0" />
                   <span className="text-sm truncate">{activeChannelName}</span>
+                  {activeChannelBinding && (
+                    <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-[10px] font-normal shrink-0">
+                      <span>Discord #{activeChannelBinding.discordChannelName}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleSyncDiscordHistory({ asdfChannelId: activeChannelId, discordChannelId: activeChannelBinding.discordChannelId })}
+                        disabled={isSyncingDiscordHistory}
+                        className="hover:text-white ml-0.5"
+                        title="Botダウンタイム中の履歴を取得"
+                      >
+                        <RefreshCw className={`w-3 h-3 ${isSyncingDiscordHistory ? 'animate-spin' : ''}`} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleUnbindDiscordChannel({ asdfChannelId: activeChannelId, discordChannelId: activeChannelBinding.discordChannelId, label: `#${activeChannelName}` })}
+                        className="hover:text-red-300 ml-0.5"
+                        title="Discord同期を解除"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </span>
+                  )}
                   <span
                     className={`ml-1 flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-normal cursor-pointer shrink-0 ${
                       wsStatus === 'online'
@@ -4212,25 +5056,26 @@ export default function App() {
                                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 text-xs">
                                       <Film className="w-3.5 h-3.5" /> 動画 (asdfbase では表示できません)
                                     </span>
-                                  ) : isGemini ? (
-                                    <div className="markdown-body whitespace-normal">
-                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
-                                    </div>
                                   ) : (
-                                    <span>
-                                      {renderMessageText(m.content, {
-                                        usernames: knownUsernames,
-                                        channels: channelByName,
-                                        me: currentUser.username,
-                                        onChannelClick: id => setActiveChannelId(id),
-                                        onMessageLink: id => openMessageLink(id),
-                                        onMemoLink: slot => {
-                                          setActiveTab('memo');
-                                          setSelectedSlotIndex(slot);
-                                        },
-                                        token,
-                                      })}
-                                    </span>
+                                    <div className="markdown-body whitespace-normal text-[14px]">
+                                      <SmartMarkdown
+                                        content={m.content}
+                                        containerRef={chatScrollContainerRef}
+                                        opts={{
+                                          usernames: knownUsernames,
+                                          channels: channelByName,
+                                          me: currentUser.username,
+                                          onChannelClick: id => setActiveChannelId(id),
+                                          onMessageLink: id => openMessageLink(id),
+                                          onMemoLink: slot => {
+                                            setActiveTab('memo');
+                                            setSelectedSlotIndex(slot);
+                                          },
+                                          token,
+                                          customEmojis: customEmojisMap,
+                                        }}
+                                      />
+                                    </div>
                                   )}
                                   {m.edited_at && (
                                     <span
@@ -4260,6 +5105,7 @@ export default function App() {
                                   meId={currentUser.id}
                                   nameOf={nameOfUser}
                                   onToggle={emoji => handleToggleReaction(m.id, emoji)}
+                                  customEmojis={customEmojisMap}
                                 />
                               )}
                             </div>
@@ -4274,6 +5120,15 @@ export default function App() {
                               </button>
                               <button onClick={() => handleToggleReaction(m.id, '❤️')} title="ハート" className="p-1 hover:bg-stone-800 rounded text-xs">
                                 ❤️
+                              </button>
+                              <button onClick={() => handleToggleReaction(m.id, '✅')} title="完了 / OK" className="p-1 hover:bg-stone-800 rounded text-xs">
+                                ✅
+                              </button>
+                              <button onClick={() => handleToggleReaction(m.id, '❌')} title="NG / バツ" className="p-1 hover:bg-stone-800 rounded text-xs">
+                                ❌
+                              </button>
+                              <button onClick={() => handleToggleReaction(m.id, ':swim:')} title="SWIMしよ" className="p-1 hover:bg-stone-800 rounded text-xs flex items-center">
+                                {renderReactionEmoji(':swim:', customEmojisMap, 'w-4 h-4')}
                               </button>
                               <button onClick={() => handleTogglePin(m.id)} title={m.is_pinned ? 'ピン留めを外す' : 'ピン留め'} className="p-1 hover:bg-stone-800 rounded text-stone-400 hover:text-amber-400">
                                 <Pin className="w-3.5 h-3.5" />
@@ -4361,7 +5216,7 @@ export default function App() {
                 {completion && completionItems.length > 0 && (
                   <div className="absolute bottom-full left-2 sm:left-4 mb-1 w-[calc(100%-1rem)] sm:w-72 bg-[#111214] border border-stone-700/80 rounded-xl shadow-2xl p-1.5 text-xs z-30 anim-pop-down">
                     <div className="flex items-center justify-between px-2 py-1 text-[10px] text-stone-500">
-                      <span>{completion.kind === '@' ? 'メンション' : 'チャンネル'}</span>
+                      <span>{completion.kind === '@' ? 'メンション' : completion.kind === ':' ? '絵文字 (:shortcode:)' : 'チャンネル'}</span>
                       <span><kbd className="kbd">Tab</kbd> 選択 · <kbd className="kbd">Enter</kbd> 決定</span>
                     </div>
                     {completionItems.map((item, i) => (
@@ -4377,10 +5232,18 @@ export default function App() {
                       >
                         {completion.kind === '@' ? (
                           item.key.startsWith('u') ? <Avatar name={item.label} url={item.avatar} size="w-5 h-5 text-[10px]" /> : <Bot className="w-4 h-4 text-amber-400" />
+                        ) : completion.kind === ':' ? (
+                          item.emojiUrl ? (
+                            <img src={toProxiedMediaUrl(item.emojiUrl, token)} alt={item.label} className="w-5 h-5 object-contain shrink-0" />
+                          ) : (
+                            <span className="text-base leading-none shrink-0">{item.sub || '😀'}</span>
+                          )
                         ) : (
                           <Hash className="w-4 h-4 text-emerald-400" />
                         )}
-                        <span className={completion.kind === '@' ? 'text-sky-300 font-bold' : 'text-emerald-300 font-bold'}>{item.insert}</span>
+                        <span className={completion.kind === '@' ? 'text-sky-300 font-bold' : completion.kind === ':' ? 'text-amber-300 font-mono font-bold' : 'text-emerald-300 font-bold'}>
+                          {item.insert}
+                        </span>
                         {item.sub && <span className="ml-auto text-[10px] text-stone-500">{item.sub}</span>}
                       </button>
                     ))}
@@ -4485,6 +5348,121 @@ export default function App() {
                       {isUploading ? <RefreshCw className="w-4 h-4 animate-spin text-amber-400" /> : <Image className="w-4 h-4" />}
                     </button>
 
+                    {/* 絵文字ピッカー & カスタム絵文字アップロードボタン */}
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setShowEmojiPicker(v => !v)}
+                        title="絵文字 (:shortcode:) & カスタム絵文字アップロード"
+                        className={`p-1 rounded-lg transition ${showEmojiPicker ? 'text-amber-400 bg-stone-800' : 'text-stone-400 hover:text-amber-400 hover:bg-stone-800'}`}
+                      >
+                        <Smile className="w-4 h-4" />
+                      </button>
+
+                      {showEmojiPicker && (
+                        <div
+                          onClick={e => e.stopPropagation()}
+                          className="absolute bottom-full left-0 mb-2 w-72 sm:w-80 bg-[#111214] border border-stone-700/80 rounded-2xl shadow-2xl p-3 z-40 space-y-3 text-xs anim-pop"
+                        >
+                          <div className="flex items-center justify-between border-b border-stone-800 pb-2">
+                            <span className="font-bold text-white flex items-center gap-1.5">
+                              <Smile className="w-4 h-4 text-amber-400" /> 絵文字 & カスタム絵文字
+                            </span>
+                            <button type="button" onClick={() => setShowEmojiPicker(false)} className="text-stone-500 hover:text-white">
+                              <X className="w-4 h-4" />
+                            </button>
+                          </div>
+
+                          <div>
+                            <div className="text-[10px] text-stone-500 font-bold mb-1.5">カスタム絵文字 (:name: で入力可)</div>
+                            <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
+                              {customEmojisList.map(ce => (
+                                <div key={ce.name} className="group/ce relative inline-flex items-center">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setChatInput(prev => `${prev}${prev && !prev.endsWith(' ') ? ' ' : ''}:${ce.name}: `);
+                                      setShowEmojiPicker(false);
+                                      chatInputRef.current?.focus();
+                                    }}
+                                    title={`:${ce.name}:`}
+                                    className="flex items-center gap-1 px-2 py-1 rounded-lg bg-[#16181D] border border-stone-800 hover:border-amber-500/50 text-stone-200"
+                                  >
+                                    <img src={toProxiedMediaUrl(ce.url, token)} alt={ce.name} className="w-5 h-5 object-contain" />
+                                    <span className="font-mono text-[10px] text-stone-400">:{ce.name}:</span>
+                                  </button>
+                                  {ce.id && (ce.created_by === currentUser.id || currentUser.role === 'admin') && ce.name !== 'swim' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteCustomEmoji(ce.id, ce.name)}
+                                      className="hidden group-hover/ce:flex absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-red-600 text-white items-center justify-center text-[9px]"
+                                      title="削除"
+                                    >
+                                      ×
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="text-[10px] text-stone-500 font-bold mb-1.5">よく使う絵文字</div>
+                            <div className="grid grid-cols-8 gap-1 max-h-28 overflow-y-auto">
+                              {Object.entries(BUILTIN_SHORTCODES).map(([code, ch]) => (
+                                <button
+                                  key={code}
+                                  type="button"
+                                  onClick={() => {
+                                    setChatInput(prev => `${prev}${ch}`);
+                                    setShowEmojiPicker(false);
+                                    chatInputRef.current?.focus();
+                                  }}
+                                  title={`:${code}:`}
+                                  className="p-1.5 rounded-lg hover:bg-stone-800 text-base text-center"
+                                >
+                                  {ch}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div className="pt-2 border-t border-stone-800 space-y-2">
+                            <div className="text-[10px] text-amber-400 font-bold flex items-center gap-1">
+                              <Upload className="w-3 h-3" /> 新しい絵文字をアップロード
+                            </div>
+                            <div className="flex gap-1.5">
+                              <input
+                                type="text"
+                                placeholder="名前 (例: party)"
+                                value={emojiUploadName}
+                                onChange={e => setEmojiUploadName(e.target.value)}
+                                className="flex-1 min-w-0 bg-[#16181D] border border-stone-800 rounded-lg px-2 py-1 text-[11px] text-white font-mono focus:outline-none focus:border-amber-500"
+                              />
+                              <label className="px-2 py-1 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 text-[11px] cursor-pointer shrink-0 flex items-center gap-1">
+                                <Image className="w-3 h-3" />
+                                <span className="max-w-[70px] truncate">{emojiUploadFile ? emojiUploadFile.name : '画像選択'}</span>
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  className="hidden"
+                                  onChange={e => setEmojiUploadFile(e.target.files?.[0] || null)}
+                                />
+                              </label>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={!emojiUploadFile || !emojiUploadName.trim() || isUploadingEmoji}
+                              onClick={handleUploadCustomEmoji}
+                              className="w-full py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-bold text-[11px]"
+                            >
+                              {isUploadingEmoji ? 'アップロード中…' : '絵文字を登録'}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
                     {/* メンションを色付けするため、同じ位置にハイライトだけの影を重ねる */}
                     <div className="relative flex-1 min-w-0">
                       <div
@@ -4492,7 +5470,7 @@ export default function App() {
                         aria-hidden="true"
                         className="composer-text absolute inset-0 text-sm leading-relaxed py-0.5 whitespace-pre-wrap break-words text-transparent overflow-hidden pointer-events-none"
                       >
-                        {renderComposerHighlight(chatInput, knownUsernames, channelByName)}
+                        {renderComposerHighlight(chatInput, knownUsernames, channelByName, customEmojisMap)}
                       </div>
                       <textarea
                         ref={chatInputRef}
@@ -4600,12 +5578,20 @@ export default function App() {
                             <span className="text-[10px] text-stone-500">({vc.guildName})</span>
                           </div>
                           <div className="flex flex-wrap gap-1">
-                            {vc.members.map(m => (
-                              <span key={m.id} className="inline-flex items-center gap-1 text-[11px] bg-stone-800 text-stone-200 px-1.5 py-0.5 rounded-full" title={m.name}>
+                            {vc.members.map((m: any) => (
+                              <span
+                                key={m.id}
+                                className={`inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded-full border ${
+                                  m.speaking
+                                    ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold'
+                                    : 'bg-stone-800 border-stone-700/60 text-stone-200'
+                                }`}
+                                title={`${m.name}${m.speaking ? ' (マイクON/発話可)' : ' (ミュート)'}`}
+                              >
                                 {m.avatarUrl ? (
-                                  <img src={m.avatarUrl} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
+                                  <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
                                 ) : (
-                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                                  <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
                                 )}
                                 <span className="max-w-[70px] truncate">{m.name}</span>
                               </span>
@@ -4908,31 +5894,71 @@ export default function App() {
                     />
                   </div>
                 ) : memoViewMode === 'view_only' ? (
-                  <div className="flex-1 p-3 sm:p-6 overflow-y-auto">
+                  <div ref={memoPreviewRef} className="flex-1 p-3 sm:p-6 overflow-y-auto">
                     <div className="max-w-4xl mx-auto markdown-body text-stone-200 text-[15px] anim-fade">
                       {memoContent ? (
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{memoContent}</ReactMarkdown>
+                        <SmartMarkdown
+                          content={memoContent}
+                          containerRef={memoPreviewRef}
+                          opts={{
+                            usernames: knownUsernames,
+                            channels: channelByName,
+                            me: currentUser.username,
+                            onChannelClick: id => {
+                              setActiveTab('chat');
+                              setActiveChannelId(id);
+                            },
+                            onMessageLink: id => openMessageLink(id),
+                            onMemoLink: slot => setSelectedSlotIndex(slot),
+                            token,
+                            customEmojis: customEmojisMap,
+                          }}
+                        />
                       ) : (
                         <p className="text-stone-600">まだ何も書かれていません</p>
                       )}
                     </div>
                   </div>
                 ) : (
-                  /* Markdown 編集 + プレビュー (スマホは縦並び) */
+                  /* Markdown 編集 + プレビュー (スクロール同期・目次アンカージャンプ対応) */
                   <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-2 sm:gap-4 p-2 sm:p-4 overflow-hidden">
                     <textarea
+                      ref={memoTextareaRef}
                       value={memoContent}
                       readOnly={isMonacoLocked}
                       onChange={e => handleMemoContentChange(e.target.value)}
                       onKeyDown={handleMemoTextareaKeyDown}
-                      placeholder="Markdown で書けます (# 見出し、- 箇条書き など)"
+                      onScroll={handleMemoEditorScroll}
+                      placeholder="Markdown で書けます (# 見出し、[目次](#見出し) のページ内リンク、:swim: 絵文字対応)"
                       className="flex-1 min-h-0 bg-[#16181D] border border-stone-800 rounded-xl p-3 sm:p-3.5 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
                     />
-                    <div className="flex-1 min-h-0 bg-[#16181D]/60 border border-stone-800 rounded-xl p-3 sm:p-4 text-stone-300 text-sm overflow-y-auto">
-                      <div className="text-[10px] font-mono text-stone-500 mb-2 pb-1 border-b border-stone-800">プレビュー</div>
+                    <div
+                      ref={memoPreviewRef}
+                      onScroll={handleMemoPreviewScroll}
+                      className="flex-1 min-h-0 bg-[#16181D]/60 border border-stone-800 rounded-xl p-3 sm:p-4 text-stone-300 text-sm overflow-y-auto"
+                    >
+                      <div className="text-[10px] font-mono text-stone-500 mb-2 pb-1 border-b border-stone-800 flex items-center justify-between">
+                        <span>プレビュー (スクロール同期・目次リンク対応)</span>
+                      </div>
                       <div className="markdown-body">
                         {memoContent ? (
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{memoContent}</ReactMarkdown>
+                          <SmartMarkdown
+                            content={memoContent}
+                            containerRef={memoPreviewRef}
+                            opts={{
+                              usernames: knownUsernames,
+                              channels: channelByName,
+                              me: currentUser.username,
+                              onChannelClick: id => {
+                                setActiveTab('chat');
+                                setActiveChannelId(id);
+                              },
+                              onMessageLink: id => openMessageLink(id),
+                              onMemoLink: slot => setSelectedSlotIndex(slot),
+                              token,
+                              customEmojis: customEmojisMap,
+                            }}
+                          />
                         ) : (
                           <p className="text-stone-600">まだ何も書かれていません</p>
                         )}
@@ -5659,6 +6685,10 @@ export default function App() {
               {/* 0. 表示・操作 */}
               {settingsSection === 'appearance' && (
                 <div className="space-y-4 text-xs">
+                  <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span>設定はすべてアカウントに自動同期され、スマホ・PC・Chromebookなど別端末でもそのまま引き継がれます。</span>
+                  </div>
                   {([
                     {
                       title: '画面の大きさ',
@@ -5667,6 +6697,7 @@ export default function App() {
                       onPick: (v: number) => {
                         setUiScale(v);
                         LS.set('asdf_ui_scale', String(v));
+                        syncPreferencesToServer({ uiScale: v });
                       },
                     },
                     {
@@ -5680,6 +6711,7 @@ export default function App() {
                       onPick: (v: any) => {
                         setChatAutoScrollMode(v);
                         LS.set('asdf_chat_scroll_mode', v);
+                        syncPreferencesToServer({ chatAutoScrollMode: v });
                       },
                     },
                     {
@@ -5694,6 +6726,7 @@ export default function App() {
                       onPick: (v: number) => {
                         setMemoAutoSaveInterval(v);
                         LS.set('asdf_memo_autosave_ms', String(v));
+                        syncPreferencesToServer({ memoAutoSaveInterval: v });
                       },
                     },
                   ] as { title: string; value: any; options: { v: any; label: string }[]; onPick: (v: any) => void }[]).map(group => (
@@ -5940,17 +6973,51 @@ export default function App() {
                             <div className="text-stone-500">同期中のチャンネルはありません</div>
                           ) : (
                             integrations.bot.bindings.map((b: any) => (
-                              <div key={b.discordChannelId} className="flex items-center gap-2 p-2 rounded-lg bg-[#16181D] border border-stone-800">
-                                <span className="text-indigo-300">Discord #{b.discordChannelName}</span>
-                                <span className="text-stone-600">⇔</span>
-                                <span className="text-amber-300">asdfbase #{b.asdfChannelName}</span>
+                              <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[#16181D] border border-stone-800">
+                                <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                                  <span className="text-indigo-300 font-bold">{b.discordGuildName ? `${b.discordGuildName} / ` : ''}#{b.discordChannelName}</span>
+                                  <span className="text-stone-600">⇔</span>
+                                  <span className="text-amber-300 font-bold">asdfbase #{b.asdfChannelName}</span>
+                                </div>
+                                {currentUser?.role === 'admin' && (
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    <button
+                                      onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
+                                      className="px-2 py-1 rounded bg-stone-800 hover:bg-stone-700 text-stone-300 text-[10px]"
+                                    >
+                                      同期解除
+                                    </button>
+                                    <button
+                                      onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
+                                      className="px-2 py-1 rounded bg-red-950/50 hover:bg-red-900/50 border border-red-900 text-red-300 text-[10px]"
+                                    >
+                                      チャンネルごと削除
+                                    </button>
+                                  </div>
+                                )}
                               </div>
                             ))
                           )}
                         </div>
-                        <button onClick={loadIntegrations} className="px-3 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 flex items-center gap-1.5">
-                          <RefreshCw className="w-3 h-3" /> 状態を更新
-                        </button>
+                        <div className="flex flex-wrap gap-2">
+                          <button onClick={loadIntegrations} className="px-3 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 flex items-center gap-1.5">
+                            <RefreshCw className="w-3 h-3" /> 状態を更新
+                          </button>
+                          <button
+                            onClick={() => setShowDiscordServerModal(true)}
+                            className="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-300 font-bold flex items-center gap-1.5"
+                          >
+                            <Link className="w-3 h-3" /> 簡単チャンネル紐付け・サーバー管理
+                          </button>
+                          <button
+                            onClick={() => handleSyncDiscordHistory()}
+                            disabled={isSyncingDiscordHistory}
+                            className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 font-bold flex items-center gap-1.5 disabled:opacity-40"
+                          >
+                            <RefreshCw className={`w-3 h-3 ${isSyncingDiscordHistory ? 'animate-spin' : ''}`} />
+                            {isSyncingDiscordHistory ? '履歴同期中…' : '未取得の過去履歴を同期 (ダウンタイム補完)'}
+                          </button>
+                        </div>
                       </div>
 
                       {/* 古いチャットの自動削除 */}
@@ -6299,16 +7366,16 @@ export default function App() {
                 <span className="ml-2 line-clamp-2">{summarizeContent(m.content)}</span>
               </div>
               <div className="flex justify-around py-2">
-                {['👍', '❤️', '😂', '😮', '🙏'].map(e => (
+                {['👍', '❤️', '✅', '❌', ':swim:', '😂'].map(e => (
                   <button
                     key={e}
                     onClick={() => {
                       handleToggleReaction(m.id, e);
                       close();
                     }}
-                    className="w-12 h-12 rounded-full bg-stone-900 border border-stone-800 text-xl active:scale-95"
+                    className="w-11 h-11 rounded-full bg-stone-900 border border-stone-800 text-xl active:scale-95 flex items-center justify-center"
                   >
-                    {e}
+                    {renderReactionEmoji(e, customEmojisMap)}
                   </button>
                 ))}
               </div>
@@ -6525,6 +7592,542 @@ export default function App() {
                 変更を保存
               </button>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Discord サーバー & 簡単チャンネル紐付けモーダル */}
+      {showDiscordServerModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setShowDiscordServerModal(false)}>
+          <div onClick={e => e.stopPropagation()} className="w-full max-w-2xl max-h-[85vh] overflow-y-auto bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-5 anim-pop">
+            <div className="flex items-center justify-between border-b border-stone-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Bot className="w-5 h-5 text-indigo-400" />
+                <div>
+                  <div className="font-bold text-white text-sm">Discord サーバー & 簡単チャンネル連携</div>
+                  <div className="text-[11px] text-stone-400">サーバー情報の表示・簡単チャンネル紐付け (rds9 承認制)・ダウンタイム履歴補完</div>
+                </div>
+              </div>
+              <button onClick={() => setShowDiscordServerModal(false)} className="p-1 text-stone-500 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* 承認待ちリクエスト (管理者 または 申請者向け) */}
+            {discordLinkRequests.filter(r => r.status === 'pending').length > 0 && (
+              <div className="p-3.5 rounded-xl bg-indigo-950/30 border border-indigo-800/60 space-y-2">
+                <div className="font-bold text-indigo-300 flex items-center gap-1.5">
+                  <Shield className="w-4 h-4" /> 承認待ちの Discord 連携リクエスト ({discordLinkRequests.filter(r => r.status === 'pending').length}件)
+                </div>
+                <div className="space-y-1.5">
+                  {discordLinkRequests.filter(r => r.status === 'pending').map(req => (
+                    <div key={req.id} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[#16181D] border border-stone-800">
+                      <div className="min-w-0">
+                        <div className="text-stone-200 font-bold truncate">
+                          {req.guild_name} #{req.discord_channel_name} ⇔ asdfbase #{req.asdf_channel_name}
+                        </div>
+                        <div className="text-[10px] text-stone-400">申請者: @{req.requested_by_username}</div>
+                      </div>
+                      {currentUser.role === 'admin' ? (
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            onClick={() => handleApproveDiscordRequest(req.id)}
+                            className="px-2.5 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-bold"
+                          >
+                            許可して紐付け
+                          </button>
+                          <button
+                            onClick={() => handleRejectDiscordRequest(req.id)}
+                            className="px-2.5 py-1 rounded-lg bg-stone-800 hover:bg-red-950/60 text-stone-300 hover:text-red-300"
+                          >
+                            却下
+                          </button>
+                        </div>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 text-[10px] shrink-0">
+                          rds9 (管理者) の承認待ち
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 簡単チャンネル紐付けフォーム */}
+            <form
+              onSubmit={e => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                const rawTarget = String(fd.get('discordTarget') || '');
+                if (!rawTarget) {
+                  toast('Discord 側のチャンネルを選択してください', { kind: 'error' });
+                  return;
+                }
+                const [guildId, guildName, discordChannelId, discordChannelName] = rawTarget.split('|');
+                const asdfChannelRaw = String(fd.get('asdfChannelId') || '');
+                const customName = String(fd.get('customChannelName') || '').trim();
+                const existingCh = asdfChannelRaw ? channels.find(c => String(c.id) === asdfChannelRaw) : undefined;
+                handleRequestOrCreateDiscordBinding({
+                  guildId,
+                  guildName,
+                  discordChannelId,
+                  discordChannelName,
+                  asdfChannelId: existingCh ? existingCh.id : null,
+                  asdfChannelName: existingCh ? existingCh.name : (customName || discordChannelName),
+                });
+              }}
+              className="p-4 rounded-xl bg-[#16181D] border border-stone-800 space-y-3"
+            >
+              <div className="font-bold text-white flex items-center gap-1.5">
+                <Link className="w-4 h-4 text-amber-400" /> ワンクリック簡単チャンネル紐付け
+                {currentUser.role !== 'admin' && (
+                  <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300">
+                    ※ 申請すると rds9 (管理者) に通知され、許可後に同期開始されます
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-stone-400 mb-1">1. Discord のテキストチャンネル</label>
+                  <select
+                    name="discordTarget"
+                    required
+                    className="w-full bg-[#111214] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                  >
+                    <option value="">チャンネルを選択…</option>
+                    {discordServers.map(srv => {
+                      const gid = srv.id || srv.guildId;
+                      return (
+                        <optgroup key={gid} label={`${srv.name} (${srv.onlineCount}/${srv.memberCount}人)`}>
+                          {(srv.textChannels || []).map((tc: any) => (
+                            <option
+                              key={tc.id}
+                              value={`${gid}|${srv.name}|${tc.id}|${tc.name}`}
+                              disabled={Boolean(tc.boundChannelId)}
+                            >
+                              #{tc.name} {tc.boundChannelId ? '(連携済み)' : ''}
+                            </option>
+                          ))}
+                        </optgroup>
+                      );
+                    })}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-stone-400 mb-1">2. 紐付ける asdfbase チャンネル</label>
+                  <select
+                    name="asdfChannelId"
+                    className="w-full bg-[#111214] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                  >
+                    <option value="">＋ 新規チャンネルを自動作成して紐付け</option>
+                    {channels.map(c => (
+                      <option key={c.id} value={String(c.id)}>
+                        #{c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  name="customChannelName"
+                  placeholder="新規作成時のチャンネル名 (空欄ならDiscordと同じ名前)"
+                  className="flex-1 min-w-[200px] bg-[#111214] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                />
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold transition shrink-0"
+                >
+                  {currentUser.role === 'admin' ? '今すぐ紐付け' : '紐付けをリクエスト (rds9承認)'}
+                </button>
+              </div>
+            </form>
+
+            {/* 接続中の Discord サーバー一覧 & ステータス */}
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-stone-300">Bot が参加している Discord サーバー ({discordServers.length})</span>
+                <button
+                  onClick={() => handleSyncDiscordHistory()}
+                  disabled={isSyncingDiscordHistory}
+                  className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 font-bold flex items-center gap-1.5 disabled:opacity-40"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingDiscordHistory ? 'animate-spin' : ''}`} />
+                  {isSyncingDiscordHistory ? '過去履歴を取得中…' : 'Botダウンタイム中の未取得履歴を一括取得'}
+                </button>
+              </div>
+              {discordServers.length === 0 ? (
+                <div className="p-4 rounded-xl bg-[#16181D] border border-stone-800 text-stone-500 text-center">
+                  接続されている Discord サーバーがありません。
+                </div>
+              ) : (
+                discordServers.map(srv => {
+                  const gid = srv.id || srv.guildId;
+                  return (
+                  <div key={gid} className="p-3.5 rounded-xl bg-[#16181D] border border-stone-800 space-y-2.5">
+                    <div className="flex items-center gap-3">
+                      {srv.iconUrl ? (
+                        <img src={srv.iconUrl} alt={srv.name} className="w-10 h-10 rounded-xl object-cover shrink-0 border border-stone-700" />
+                      ) : (
+                        <div className="w-10 h-10 rounded-xl bg-stone-800 flex items-center justify-center font-bold text-sm text-stone-300 shrink-0">
+                          {srv.name.slice(0, 2)}
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="font-bold text-white text-sm truncate flex items-center gap-2">
+                          <span>{srv.name}</span>
+                          {srv.approved && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300">
+                              公認サーバー
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-stone-400 flex items-center gap-3 mt-0.5">
+                          <span className="text-emerald-400 font-bold">● オンライン {srv.onlineCount}人</span>
+                          <span>総メンバー {srv.memberCount}人</span>
+                          <span>VC接続 {(srv.voiceChannels || []).reduce((acc: number, vc: any) => acc + vc.members.length, 0)}人</span>
+                        </div>
+                      </div>
+                      {currentUser.role === 'admin' && (
+                        <button
+                          onClick={() => handleToggleApproveGuild(gid, !srv.approved)}
+                          className={`px-3 py-1.5 rounded-xl border font-bold text-[11px] transition shrink-0 ${
+                            srv.approved
+                              ? 'bg-emerald-950/40 border-emerald-800 text-emerald-300 hover:bg-stone-800'
+                              : 'bg-stone-800 border-stone-700 text-stone-300 hover:border-amber-500/50'
+                          }`}
+                        >
+                          {srv.approved ? '承認済み (解除)' : 'サーバーを承認'}
+                        </button>
+                      )}
+                    </div>
+
+                    {/* VC 状況 */}
+                    {(srv.voiceChannels || []).length > 0 && (
+                      <div className="space-y-1 pt-1 border-t border-stone-800/80">
+                        <div className="text-[10px] text-stone-400 font-bold">ボイスチャンネル状況</div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                          {srv.voiceChannels.map((vc: any) => (
+                            <div key={vc.id} className="p-2 rounded-lg bg-[#111214] border border-stone-800/80">
+                              <div className="flex items-center justify-between text-[11px]">
+                                <span className="text-stone-300 font-bold flex items-center gap-1">
+                                  <Volume2 className="w-3 h-3 text-emerald-400" /> {vc.name}
+                                </span>
+                                <span className="text-[10px] text-stone-500">{vc.members.length}人</span>
+                              </div>
+                              {vc.members.length > 0 && (
+                                <div className="flex flex-wrap gap-1 mt-1.5">
+                                  {vc.members.map((m: any) => (
+                                    <span
+                                      key={m.id}
+                                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] ${
+                                        m.speaking
+                                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold'
+                                          : 'bg-stone-900 text-stone-300 border border-stone-800'
+                                      }`}
+                                    >
+                                      {m.avatarUrl && <img src={m.avatarUrl} alt="" className="w-3.5 h-3.5 rounded-full" />}
+                                      <span className="truncate max-w-[90px]">{m.displayName}</span>
+                                      {m.speaking && <Mic className="w-2.5 h-2.5 text-emerald-400 animate-pulse" />}
+                                      {(m.selfMute || m.serverMute) && <MicOff className="w-2.5 h-2.5 text-red-400" />}
+                                      {m.streaming && <span className="px-1 rounded bg-red-500 text-white text-[8px] font-bold">LIVE</span>}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* 現在のチャンネル同期一覧 & 解除 */}
+            {discordBindings.length > 0 && (
+              <div className="space-y-2 border-t border-stone-800 pt-3">
+                <div className="font-bold text-stone-300">現在同期中のチャンネル ({discordBindings.length})</div>
+                <div className="space-y-1.5">
+                  {discordBindings.map(b => (
+                    <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-[#16181D] border border-stone-800">
+                      <div className="min-w-0 flex items-center gap-2 flex-wrap">
+                        <span className="text-indigo-300 font-bold">{b.discordGuildName ? `${b.discordGuildName} / ` : ''}#{b.discordChannelName}</span>
+                        <span className="text-stone-500">⇔</span>
+                        <span className="text-amber-300 font-bold">asdfbase #{b.asdfChannelName}</span>
+                      </div>
+                      {currentUser.role === 'admin' && (
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
+                            className="px-2.5 py-1 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 text-[11px]"
+                          >
+                            同期解除
+                          </button>
+                          <button
+                            onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
+                            className="px-2.5 py-1 rounded-lg bg-red-950/50 hover:bg-red-900/60 border border-red-900 text-red-300 text-[11px]"
+                          >
+                            チャンネルごと削除
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* チャンネルごとのロール権限 & サーバー紐付け設定モーダル (admin限定) */}
+      {channelPermModal && currentUser.role === 'admin' && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setChannelPermModal(null)}>
+          <form onSubmit={handleSaveChannelPermissions} onClick={e => e.stopPropagation()} className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
+            <div className="flex items-center justify-between border-b border-stone-800 pb-2.5">
+              <div className="font-bold text-white text-sm flex items-center gap-2">
+                <Lock className="w-4 h-4 text-amber-400" /> #{channelPermModal.name} の権限・サーバー設定
+              </div>
+              <button type="button" onClick={() => setChannelPermModal(null)} className="text-stone-500 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-stone-400 font-bold mb-1">所属サーバー (左のサーバー欄での分類)</label>
+                <select
+                  value={channelPermModal.server_id || ''}
+                  onChange={e => setChannelPermModal(prev => prev ? { ...prev, server_id: e.target.value || null } : prev)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                >
+                  <option value="">指定なし (すべてに表示)</option>
+                  {discordServers.map(srv => {
+                    const gid = srv.id || srv.guildId;
+                    return <option key={gid} value={gid}>{srv.name}</option>;
+                  })}
+                </select>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-stone-400 font-bold">閲覧できるロール (未選択なら全員閲覧可能)</label>
+                  <button
+                    type="button"
+                    onClick={() => setChannelPermModal(prev => prev ? { ...prev, view_roles: [] } : prev)}
+                    className="text-[10px] text-amber-400 hover:underline"
+                  >
+                    全員に開放
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-1.5 p-2.5 rounded-xl bg-[#16181D] border border-stone-800">
+                  {roleDefs.map(r => {
+                    const currentView = channelPermModal.view_roles || [];
+                    const active = currentView.includes(r.id);
+                    return (
+                      <button
+                        key={r.id}
+                        type="button"
+                        onClick={() => {
+                          setChannelPermModal(prev => {
+                            if (!prev) return prev;
+                            const cur = prev.view_roles || [];
+                            const next = active ? cur.filter((x: string) => x !== r.id) : [...cur, r.id];
+                            return { ...prev, view_roles: next };
+                          });
+                        }}
+                        className={`px-2.5 py-1 rounded-lg border font-bold transition flex items-center gap-1.5 ${
+                          active
+                            ? 'bg-amber-500/20 border-amber-500 text-amber-300'
+                            : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-stone-200'
+                        }`}
+                      >
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.color }} />
+                        <span>{r.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-stone-400 font-bold">書き込みできるロール (未選択なら全員送信可能)</label>
+                  <button
+                    type="button"
+                    onClick={() => setChannelPermModal(prev => prev ? { ...prev, write_roles: [] } : prev)}
+                    className="text-[10px] text-amber-400 hover:underline"
+                  >
+                    全員に開放
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-1.5 p-2.5 rounded-xl bg-[#16181D] border border-stone-800">
+                  {roleDefs.map(r => {
+                    const currentWrite = channelPermModal.write_roles || [];
+                    const active = currentWrite.includes(r.id);
+                    return (
+                      <button
+                        key={r.id}
+                        type="button"
+                        onClick={() => {
+                          setChannelPermModal(prev => {
+                            if (!prev) return prev;
+                            const cur = prev.write_roles || [];
+                            const next = active ? cur.filter((x: string) => x !== r.id) : [...cur, r.id];
+                            return { ...prev, write_roles: next };
+                          });
+                        }}
+                        className={`px-2.5 py-1 rounded-lg border font-bold transition flex items-center gap-1.5 ${
+                          active
+                            ? 'bg-amber-500/20 border-amber-500 text-amber-300'
+                            : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-stone-200'
+                        }`}
+                      >
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.color }} />
+                        <span>{r.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setChannelPermModal(null);
+                  setShowRoleManagerModal(true);
+                }}
+                className="text-amber-400 hover:underline text-[11px]"
+              >
+                ロールの作成・メンバー割り当てを開く →
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold transition"
+              >
+                権限を保存
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* ロール管理・メンバー割り当てモーダル (admin限定) */}
+      {showRoleManagerModal && currentUser.role === 'admin' && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setShowRoleManagerModal(false)}>
+          <div onClick={e => e.stopPropagation()} className="w-full max-w-lg max-h-[85vh] overflow-y-auto bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
+            <div className="flex items-center justify-between border-b border-stone-800 pb-2.5">
+              <div className="font-bold text-white text-sm flex items-center gap-2">
+                <Shield className="w-4 h-4 text-amber-400" /> ロール管理・権限割り当て (管理者専用)
+              </div>
+              <button onClick={() => setShowRoleManagerModal(false)} className="text-stone-500 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleAddRoleDef} className="p-3.5 rounded-xl bg-[#16181D] border border-stone-800 space-y-2.5">
+              <div className="font-bold text-stone-200">新しいロールを追加</div>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="ロール名 (例: 生徒会 / 放送委員)"
+                  required
+                  value={newRoleNameInput}
+                  onChange={e => setNewRoleNameInput(e.target.value)}
+                  className="flex-1 min-w-[140px] bg-[#111214] border border-stone-800 rounded-xl px-3 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                />
+                <input
+                  type="text"
+                  placeholder="ID (任意: council)"
+                  value={newRoleIdInput}
+                  onChange={e => setNewRoleIdInput(e.target.value)}
+                  className="w-28 bg-[#111214] border border-stone-800 rounded-xl px-2.5 py-1.5 text-white focus:outline-none focus:border-amber-500"
+                />
+                <input
+                  type="color"
+                  value={newRoleColorInput}
+                  onChange={e => setNewRoleColorInput(e.target.value)}
+                  className="w-9 h-8 rounded-lg bg-transparent border border-stone-700 cursor-pointer"
+                  title="ロールの色"
+                />
+                <button type="submit" className="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold">
+                  追加
+                </button>
+              </div>
+            </form>
+
+            <div className="space-y-1.5">
+              <div className="font-bold text-stone-300">登録済みロール一覧</div>
+              {roleDefs.length === 0 ? (
+                <div className="text-stone-500 py-2">カスタムロールはまだありません</div>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  {roleDefs.map(r => (
+                    <div key={r.id} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#16181D] border border-stone-800">
+                      <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: r.color }} />
+                      <span className="text-white font-bold">{r.name}</span>
+                      <span className="text-[10px] text-stone-500">({r.id})</span>
+                      {!r.system && (
+                        <button
+                          onClick={() => handleDeleteRoleDef(r.id)}
+                          className="text-stone-500 hover:text-red-400 ml-1"
+                          title="ロールを削除"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-2 border-t border-stone-800 pt-3">
+              <div className="font-bold text-stone-300">メンバーへのロール割り当て (クリックでON/OFF)</div>
+              <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+                {onlineUsers.map(u => {
+                  const uRoles = Array.isArray(u.custom_roles) ? u.custom_roles : [];
+                  return (
+                    <div key={u.id} className="p-2.5 rounded-xl bg-[#16181D] border border-stone-800 flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Avatar name={u.username} url={u.avatar_url} size="w-6 h-6 text-[10px]" />
+                        <span className="text-white font-bold truncate">{u.username}</span>
+                        {u.role === 'admin' && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold">ADMIN</span>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {roleDefs.filter(r => !r.system).map(r => {
+                          const has = uRoles.includes(r.id);
+                          return (
+                            <button
+                              key={r.id}
+                              type="button"
+                              onClick={() => handleToggleUserCustomRole(u, r.id)}
+                              className={`px-2 py-0.5 rounded-md border text-[10px] font-bold transition flex items-center gap-1 ${
+                                has
+                                  ? 'bg-amber-500/20 border-amber-500 text-amber-200'
+                                  : 'bg-stone-900 border-stone-800 text-stone-500 hover:text-stone-300'
+                              }`}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: r.color }} />
+                              {r.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </div>
       )}

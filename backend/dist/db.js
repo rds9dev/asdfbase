@@ -219,6 +219,44 @@ async function initDb() {
         content TEXT NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_roles JSONB DEFAULT '[]';
+      ALTER TABLE channels ADD COLUMN IF NOT EXISTS server_id VARCHAR(64) DEFAULT NULL;
+      ALTER TABLE channels ADD COLUMN IF NOT EXISTS view_roles JSONB DEFAULT '[]';
+      ALTER TABLE channels ADD COLUMN IF NOT EXISTS write_roles JSONB DEFAULT '[]';
+      CREATE TABLE IF NOT EXISTS custom_emojis (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(64) UNIQUE NOT NULL,
+        url TEXT NOT NULL,
+        created_by VARCHAR(64),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS ai_threads (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(200) NOT NULL DEFAULT '新しい会話',
+        persona VARCHAR(64) NOT NULL DEFAULT 'standard',
+        custom_persona TEXT DEFAULT '',
+        messages JSONB NOT NULL DEFAULT '[]',
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS ai_threads_user_idx ON ai_threads (user_id, updated_at DESC);
+      CREATE TABLE IF NOT EXISTS discord_link_requests (
+        id SERIAL PRIMARY KEY,
+        requester_id INT REFERENCES users(id) ON DELETE SET NULL,
+        requester_username VARCHAR(64) NOT NULL,
+        guild_id VARCHAR(64) NOT NULL,
+        guild_name VARCHAR(200) DEFAULT '',
+        discord_channel_id VARCHAR(64) NOT NULL,
+        discord_channel_name VARCHAR(200) DEFAULT '',
+        asdf_channel_id INT REFERENCES channels(id) ON DELETE CASCADE,
+        new_channel_name VARCHAR(100) DEFAULT '',
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        reviewed_by VARCHAR(64),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
     `).catch(err => console.warn('Migration class/edit/discord/homework warning:', err.message));
         // 以前の編集 (updated_at だけ更新されていたもの) にも「編集済み」を付ける (初回のみ)
         const editMigrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_message_edited_at'`);

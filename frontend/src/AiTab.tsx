@@ -1,8 +1,8 @@
-// AI タブ: 会話はこの端末に保存。返信は少しずつ表示し、常に最下部へ追従する
+// AI タブ: チャンネル風の会話履歴スレッド管理 (アカウント同期) + 性格カスタマイズ対応
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Bot, Check, Copy, Globe, Image as ImageIcon, Plus, Search, Send, Sparkles, Trash2, Wrench, X, Zap, Brain, Activity, Info } from 'lucide-react';
+import { Bot, Check, Copy, Globe, Hash, Image as ImageIcon, Menu, MessageSquarePlus, Pencil, Plus, Search, Send, Sparkles, Trash2, UserCheck, Wrench, X, Zap, Brain, Activity } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
 
 interface AiStep {
@@ -23,12 +23,32 @@ interface AiMessage {
   thumbs?: string[];
 }
 
+interface AiThread {
+  id: number;
+  title: string;
+  persona: string;
+  custom_persona: string;
+  messages: AiMessage[];
+  updated_at: string;
+}
+
 interface PendingImage {
   id: number;
   mimeType: string;
   data: string;
   thumb: string;
 }
+
+const PERSONA_OPTIONS = [
+  { id: 'default', label: '標準 (親切・簡潔)', short: '標準' },
+  { id: 'やさしく丁寧に教える先生', label: 'やさしい先生 (丁寧・わかりやすい)', short: '先生' },
+  { id: 'フレンドリーな友達（タメ口）', label: '友達・タメ口 (気軽・親しみやすい)', short: '友達' },
+  { id: '厳格で論理的なコーチ', label: '厳格コーチ (論理的・ストイック)', short: 'コーチ' },
+  { id: 'ハイテンションな応援団', label: 'ハイテンション応援団 (全力肯定)', short: '応援団' },
+  { id: 'ツンデレ風', label: 'ツンデレ', short: 'ツンデレ' },
+  { id: '関西弁', label: '関西弁', short: '関西弁' },
+  { id: 'custom', label: 'カスタム (自由入力)', short: 'カスタム' },
+];
 
 const SUGGESTIONS = [
   '今日の時間割と持ち物は？',
@@ -79,7 +99,15 @@ function loadHistory(key: string): AiMessage[] {
 
 export default function AiTab({ active, userId, token, safeFetch, buildContext, memo, onAppendToMemo }: AiTabProps) {
   const storageKey = `asdf_ai_history_${userId}`;
+  const [threads, setThreads] = useState<AiThread[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [messages, setMessages] = useState<AiMessage[]>(() => loadHistory(storageKey));
+  const [persona, setPersona] = useState<string>('default');
+  const [customPersona, setCustomPersona] = useState<string>('');
+  const [showPersonaModal, setShowPersonaModal] = useState(false);
+  const [editingThreadId, setEditingThreadId] = useState<number | null>(null);
+  const [editingTitle, setEditingTitle] = useState('');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [images, setImages] = useState<PendingImage[]>([]);
@@ -95,6 +123,44 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
+  // スレッド一覧の取得と初期化
+  const fetchThreads = async () => {
+    try {
+      const res = await safeFetch('/api/ai/threads', { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) return;
+      const list: AiThread[] = await res.json();
+      if (list.length > 0) {
+        setThreads(list);
+        const cur = list.find(t => t.id === activeThreadId) || list[0];
+        setActiveThreadId(cur.id);
+        setMessages(Array.isArray(cur.messages) ? cur.messages : []);
+        setPersona(cur.persona || 'default');
+        setCustomPersona(cur.custom_persona || '');
+      } else {
+        // 既存のローカル履歴があれば初回スレッドとして移行
+        const legacy = loadHistory(storageKey);
+        const createRes = await safeFetch('/api/ai/threads', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            title: legacy.length > 0 ? (legacy[0].content.slice(0, 24) || 'これまでの会話') : '新しい会話',
+            persona: 'default',
+            custom_persona: '',
+            messages: legacy.slice(-MAX_HISTORY),
+          }),
+        });
+        if (createRes.ok) {
+          const created: AiThread = await createRes.json();
+          setThreads([created]);
+          setActiveThreadId(created.id);
+          setMessages(Array.isArray(created.messages) ? created.messages : []);
+          setPersona(created.persona || 'default');
+          setCustomPersona(created.custom_persona || '');
+        }
+      }
+    } catch (_) {}
+  };
+
   // 利用枠統計の取得
   const fetchUsage = async () => {
     try {
@@ -107,6 +173,10 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   };
 
   useEffect(() => {
+    fetchThreads();
+  }, [userId]);
+
+  useEffect(() => {
     if (active) fetchUsage();
   }, [active]);
 
@@ -116,6 +186,95 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
     } catch (_) {}
   }, [messages, storageKey]);
 
+  const selectThread = (t: AiThread) => {
+    setActiveThreadId(t.id);
+    setMessages(Array.isArray(t.messages) ? t.messages : []);
+    setPersona(t.persona || 'default');
+    setCustomPersona(t.custom_persona || '');
+    setReveal(null);
+    setSidebarOpen(false);
+  };
+
+  const syncThreadToServer = async (
+    threadId: number | null,
+    patch: { title?: string; persona?: string; custom_persona?: string; messages?: AiMessage[] }
+  ) => {
+    if (!threadId) return null;
+    try {
+      const res = await safeFetch(`/api/ai/threads/${threadId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(patch),
+      });
+      if (res.ok) {
+        const updated: AiThread = await res.json();
+        setThreads(prev => [updated, ...prev.filter(t => t.id !== updated.id)]);
+        return updated;
+      }
+    } catch (_) {}
+    return null;
+  };
+
+  const createNewThread = async () => {
+    try {
+      const res = await safeFetch('/api/ai/threads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          title: '新しい会話',
+          persona,
+          custom_persona: customPersona,
+          messages: [],
+        }),
+      });
+      if (res.ok) {
+        const created: AiThread = await res.json();
+        setThreads(prev => [created, ...prev]);
+        selectThread(created);
+      }
+    } catch (_) {
+      toast('新しい会話の作成に失敗しました', { kind: 'error' });
+    }
+  };
+
+  const deleteThread = async (t: AiThread) => {
+    const ok = await confirmDialog({
+      title: `「${t.title}」を削除しますか？`,
+      message: 'このスレッドの会話履歴が削除されます。',
+      confirmLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await safeFetch(`/api/ai/threads/${t.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const remaining = threads.filter(item => item.id !== t.id);
+      setThreads(remaining);
+      if (activeThreadId === t.id) {
+        if (remaining.length > 0) {
+          selectThread(remaining[0]);
+        } else {
+          await createNewThread();
+        }
+      }
+      toast('会話を削除しました', { kind: 'success' });
+    } catch (_) {
+      toast('削除に失敗しました', { kind: 'error' });
+    }
+  };
+
+  const savePersonaSettings = async (nextPersona: string, nextCustom: string) => {
+    setPersona(nextPersona);
+    setCustomPersona(nextCustom);
+    if (activeThreadId) {
+      await syncThreadToServer(activeThreadId, { persona: nextPersona, custom_persona: nextCustom });
+    }
+    toast('AIの性格設定を更新しました', { kind: 'success' });
+    setShowPersonaModal(false);
+  };
+
   const scrollToBottom = (smooth: boolean) => {
     const el = scrollRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
@@ -124,7 +283,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   // 開いた時は一番下から
   useLayoutEffect(() => {
     if (active) scrollToBottom(false);
-  }, [active]);
+  }, [active, activeThreadId]);
   useEffect(() => scrollToBottom(true), [messages.length, loading]);
   useEffect(() => {
     if (reveal) scrollToBottom(false);
@@ -171,6 +330,13 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
     setForceWebSearch(false);
     if (inputRef.current) inputRef.current.style.height = 'auto';
     setLoading(true);
+
+    const currentThread = threads.find(t => t.id === activeThreadId);
+    const autoTitle =
+      currentThread && (currentThread.title === '新しい会話' || !currentThread.title) && text
+        ? text.replace(/\s+/g, ' ').slice(0, 26)
+        : currentThread?.title;
+
     try {
       const res = await safeFetch('/api/ai/chat', {
         method: 'POST',
@@ -181,6 +347,8 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
           images: sentImages.map(im => ({ mimeType: im.mimeType, data: im.data })),
           webSearch,
           modelMode,
+          persona: persona === 'custom' ? '' : persona === 'default' ? '' : persona,
+          customPersona: persona === 'custom' ? customPersona : customPersona,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -190,11 +358,30 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
         steps: Array.isArray(data.steps) && data.steps.length ? data.steps : undefined,
       };
       if (reply.steps?.some(st => st.write && st.ok)) toast('AI が操作を実行しました', { kind: 'success' });
-      setMessages(prev => [...prev, reply]);
+      const finalMessages = [...next, reply].slice(-MAX_HISTORY);
+      setMessages(finalMessages);
       setReveal({ id: reply.id, shown: 0 });
+      await syncThreadToServer(activeThreadId, {
+        title: autoTitle,
+        persona,
+        custom_persona: customPersona,
+        messages: finalMessages,
+      });
       fetchUsage();
     } catch (err: any) {
-      setMessages(prev => [...prev, { id: Date.now() + 1, role: 'model', content: err.message || 'AI の応答に失敗しました', timestamp: timeNow(), error: true }]);
+      const errMsg: AiMessage = {
+        id: Date.now() + 1,
+        role: 'model',
+        content: err.message || 'AI の応答に失敗しました',
+        timestamp: timeNow(),
+        error: true,
+      };
+      const finalMessages = [...next, errMsg].slice(-MAX_HISTORY);
+      setMessages(finalMessages);
+      await syncThreadToServer(activeThreadId, {
+        title: autoTitle,
+        messages: finalMessages,
+      });
     } finally {
       setLoading(false);
     }
@@ -203,86 +390,287 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const clearHistory = async () => {
     if (messages.length === 0) return;
     const ok = await confirmDialog({
-      title: '会話履歴を削除しますか？',
-      message: 'この端末に保存されている AI との会話がすべて消えます。',
-      confirmLabel: '削除する',
+      title: 'このスレッドの会話をクリアしますか？',
+      message: '現在開いているスレッドの会話履歴が消去されます。',
+      confirmLabel: 'クリアする',
       danger: true,
     });
     if (!ok) return;
     setMessages([]);
     setReveal(null);
-    toast('会話履歴を削除しました', { kind: 'success' });
+    await syncThreadToServer(activeThreadId, { messages: [] });
+    toast('会話をクリアしました', { kind: 'success' });
   };
 
+  const activeThread = threads.find(t => t.id === activeThreadId);
+  const currentPersonaObj = PERSONA_OPTIONS.find(p => p.id === persona) || PERSONA_OPTIONS[0];
+
   return (
-    <div className="flex-1 min-h-0 flex flex-col bg-[#0C0D10]/50">
-      <div className="h-12 shrink-0 border-b border-stone-800/80 px-3 sm:px-4 flex items-center justify-between gap-2 text-xs bg-[#111214]">
-        <div className="flex items-center gap-2 sm:gap-3">
-          <div className="flex items-center gap-1.5 font-bold text-white">
+    <div className="flex-1 min-h-0 flex bg-[#0C0D10]/50 relative overflow-hidden">
+      {/* モバイル用オーバーレイ */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/60 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      {/* 左サイドバー: チャンネル風 AI 会話スレッド一覧 */}
+      <aside
+        className={`${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
+        } fixed md:static inset-y-0 left-0 z-40 w-64 shrink-0 bg-[#111214] border-r border-stone-800/80 flex flex-col transition-transform duration-200`}
+      >
+        <div className="h-12 px-3 border-b border-stone-800/80 flex items-center justify-between gap-2">
+          <span className="text-xs font-bold text-stone-300 flex items-center gap-1.5">
             <Bot className="w-4 h-4 text-amber-400" />
-            <span className="hidden sm:inline">AI</span>
-          </div>
-
-          {/* モデル切り替え */}
-          <div className="flex items-center p-0.5 rounded-lg bg-stone-900 border border-stone-800 text-[11px]">
-            <button
-              onClick={() => setModelMode('fast')}
-              title="gemini-3.5-flash-lite (RPM:30, TPM:10M, RPD:1500)"
-              className={`flex items-center gap-1 px-2 py-1 rounded-md transition ${
-                modelMode === 'fast'
-                  ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30'
-                  : 'text-stone-400 hover:text-white'
-              }`}
-            >
-              <Zap className="w-3 h-3 text-amber-400" />
-              <span>高速</span>
-            </button>
-            <button
-              onClick={() => setModelMode('thinking')}
-              title="gemini-3.8-flash (RPM:15, TPM:3M, RPD:1500)"
-              className={`flex items-center gap-1 px-2 py-1 rounded-md transition ${
-                modelMode === 'thinking'
-                  ? 'bg-sky-500/20 text-sky-300 font-bold border border-sky-500/30'
-                  : 'text-stone-400 hover:text-white'
-              }`}
-            >
-              <Brain className="w-3 h-3 text-sky-400" />
-              <span>思考</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-1.5 sm:gap-2">
-          {/* 利用枠インジケーター */}
-          {usageStats && (
-            <button
-              onClick={() => setShowUsageModal(true)}
-              title="クリックして5枠ローテーションとリセット時刻の詳細を表示"
-              className="flex items-center gap-1.5 px-2 py-1 rounded-lg border border-stone-800 bg-stone-900/80 text-[11px] text-stone-300 hover:border-stone-700 hover:bg-stone-800/60"
-            >
-              <Activity className="w-3 h-3 text-emerald-400" />
-              <span className="font-mono text-emerald-400 font-bold">
-                本日 {usageStats.dailySummary?.[modelMode]?.used ?? 0}
-              </span>
-              <span className="text-stone-500 hidden sm:inline">
-                / {usageStats.dailySummary?.[modelMode]?.max ?? 7500}回
-              </span>
-              <span className="text-[10px] text-stone-500 hidden md:inline">
-                (残 {usageStats.dailySummary?.[modelMode]?.remaining ?? 0})
-              </span>
-            </button>
-          )}
-
+            AI 会話チャンネル
+          </span>
           <button
-            onClick={clearHistory}
-            disabled={messages.length === 0}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-stone-800 bg-stone-900 text-stone-300 hover:text-red-300 hover:border-red-900/70 hover:bg-red-950/30 disabled:opacity-40"
+            onClick={createNewThread}
+            className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-bold text-[11px] flex items-center gap-1 transition"
           >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">履歴を削除</span>
+            <MessageSquarePlus className="w-3.5 h-3.5" />
+            新規作成
           </button>
         </div>
-      </div>
+
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          {threads.map(t => {
+            const isSelected = t.id === activeThreadId;
+            const isEditing = editingThreadId === t.id;
+            const pLabel = PERSONA_OPTIONS.find(p => p.id === t.persona)?.short || '標準';
+            return (
+              <div
+                key={t.id}
+                onClick={() => !isEditing && selectThread(t)}
+                className={`group rounded-xl px-2.5 py-2 text-xs cursor-pointer transition flex items-center justify-between gap-1.5 ${
+                  isSelected
+                    ? 'bg-amber-500/15 border border-amber-500/40 text-white font-semibold'
+                    : 'text-stone-400 hover:bg-stone-800/60 hover:text-stone-200 border border-transparent'
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  {isEditing ? (
+                    <input
+                      autoFocus
+                      value={editingTitle}
+                      onChange={e => setEditingTitle(e.target.value)}
+                      onClick={e => e.stopPropagation()}
+                      onKeyDown={async e => {
+                        if (e.key === 'Enter') {
+                          await syncThreadToServer(t.id, { title: editingTitle.trim() || '新しい会話' });
+                          setEditingThreadId(null);
+                        } else if (e.key === 'Escape') {
+                          setEditingThreadId(null);
+                        }
+                      }}
+                      onBlur={async () => {
+                        await syncThreadToServer(t.id, { title: editingTitle.trim() || '新しい会話' });
+                        setEditingThreadId(null);
+                      }}
+                      className="w-full bg-[#16181D] border border-amber-500/60 rounded px-1.5 py-0.5 text-xs text-white focus:outline-none"
+                    />
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-1.5 truncate">
+                        <Hash className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-amber-400' : 'text-stone-500'}`} />
+                        <span className="truncate">{t.title || '新しい会話'}</span>
+                      </div>
+                      <div className="flex items-center gap-1.5 mt-0.5 text-[10px] text-stone-500 pl-5">
+                        <span className="px-1.5 py-0.2 rounded bg-stone-800/80 text-stone-400">{pLabel}</span>
+                        <span>{(t.messages || []).length}件</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+                {!isEditing && (
+                  <div className="flex items-center gap-0.5 opacity-70 group-hover:opacity-100">
+                    <button
+                      type="button"
+                      onClick={e => {
+                        e.stopPropagation();
+                        setEditingThreadId(t.id);
+                        setEditingTitle(t.title || '');
+                      }}
+                      className="p-1 rounded text-stone-500 hover:text-stone-200"
+                      title="名前を変更"
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                    {threads.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={e => {
+                          e.stopPropagation();
+                          deleteThread(t);
+                        }}
+                        className="p-1 rounded text-stone-500 hover:text-red-400"
+                        title="スレッドを削除"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </aside>
+
+      {/* メイン会話エリア */}
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+        <div className="h-12 shrink-0 border-b border-stone-800/80 px-3 sm:px-4 flex items-center justify-between gap-2 text-xs bg-[#111214]">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(v => !v)}
+              className="md:hidden p-1.5 rounded-lg border border-stone-800 text-stone-300 hover:text-white"
+              title="会話一覧を開く"
+            >
+              <Menu className="w-4 h-4" />
+            </button>
+            <div className="flex items-center gap-1.5 font-bold text-white truncate">
+              <Hash className="w-4 h-4 text-amber-400 shrink-0" />
+              <span className="truncate max-w-[8rem] sm:max-w-[14rem]">{activeThread?.title || '新しい会話'}</span>
+            </div>
+
+            {/* モデル切り替え */}
+            <div className="flex items-center p-0.5 rounded-lg bg-stone-900 border border-stone-800 text-[11px] shrink-0">
+              <button
+                onClick={() => setModelMode('fast')}
+                title="gemini-3.5-flash-lite (RPM:30, TPM:10M, RPD:1500)"
+                className={`flex items-center gap-1 px-2 py-1 rounded-md transition ${
+                  modelMode === 'fast'
+                    ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30'
+                    : 'text-stone-400 hover:text-white'
+                }`}
+              >
+                <Zap className="w-3 h-3 text-amber-400" />
+                <span>高速</span>
+              </button>
+              <button
+                onClick={() => setModelMode('thinking')}
+                title="gemini-3.8-flash (RPM:15, TPM:3M, RPD:1500)"
+                className={`flex items-center gap-1 px-2 py-1 rounded-md transition ${
+                  modelMode === 'thinking'
+                    ? 'bg-sky-500/20 text-sky-300 font-bold border border-sky-500/30'
+                    : 'text-stone-400 hover:text-white'
+                }`}
+              >
+                <Brain className="w-3 h-3 text-sky-400" />
+                <span>思考</span>
+              </button>
+            </div>
+
+            {/* 性格設定ボタン */}
+            <button
+              type="button"
+              onClick={() => setShowPersonaModal(true)}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 text-[11px] shrink-0"
+              title="AIの性格・口調を設定"
+            >
+              <UserCheck className="w-3.5 h-3.5" />
+              <span>性格: {currentPersonaObj.short}</span>
+            </button>
+          </div>
+
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            {/* 利用枠インジケーター */}
+            {usageStats && (
+              <button
+                onClick={() => setShowUsageModal(true)}
+                title="クリックして5枠ローテーションとリセット時刻の詳細を表示"
+                className="flex items-center gap-1.5 px-2 py-1 rounded-lg border border-stone-800 bg-stone-900/80 text-[11px] text-stone-300 hover:border-stone-700 hover:bg-stone-800/60"
+              >
+                <Activity className="w-3 h-3 text-emerald-400" />
+                <span className="font-mono text-emerald-400 font-bold">
+                  本日 {usageStats.dailySummary?.[modelMode]?.used ?? 0}
+                </span>
+                <span className="text-stone-500 hidden sm:inline">
+                  / {usageStats.dailySummary?.[modelMode]?.max ?? 7500}回
+                </span>
+              </button>
+            )}
+
+            <button
+              onClick={clearHistory}
+              disabled={messages.length === 0}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-stone-800 bg-stone-900 text-stone-300 hover:text-red-300 hover:border-red-900/70 hover:bg-red-950/30 disabled:opacity-40"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">クリア</span>
+            </button>
+          </div>
+        </div>
+
+        {/* 性格カスタマイズモーダル */}
+        {showPersonaModal && (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 anim-fade" onClick={() => setShowPersonaModal(false)}>
+            <div className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-4 sm:p-5 space-y-4 anim-pop text-xs text-stone-300" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between pb-2 border-b border-stone-800">
+                <div className="flex items-center gap-2 text-white font-bold text-sm">
+                  <UserCheck className="w-4 h-4 text-amber-400" />
+                  <span>AI の性格・話し方設定</span>
+                </div>
+                <button onClick={() => setShowPersonaModal(false)} className="text-stone-500 hover:text-white p-1 rounded-lg">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="text-stone-400 font-bold">プリセットから選ぶ</div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                  {PERSONA_OPTIONS.map(opt => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setPersona(opt.id)}
+                      className={`px-3 py-2 rounded-xl border text-left transition ${
+                        persona === opt.id
+                          ? 'bg-amber-500/20 border-amber-500/60 text-amber-200 font-bold'
+                          : 'bg-[#16181D] border-stone-800 text-stone-300 hover:border-stone-700'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-stone-400 font-bold">
+                  カスタム性格・追加指示 (自由入力)
+                </label>
+                <textarea
+                  rows={3}
+                  value={customPersona}
+                  onChange={e => setCustomPersona(e.target.value)}
+                  placeholder="例: 語尾に「なのだ」をつけて話して / 数学の先生としてステップごとにヒントを出して"
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-2.5 text-white focus:outline-none focus:border-amber-500/60 resize-none"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowPersonaModal(false)}
+                  className="px-4 py-2 rounded-xl border border-stone-800 text-stone-400 hover:text-white"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="button"
+                  onClick={() => savePersonaSettings(persona, customPersona)}
+                  className="px-5 py-2 rounded-xl btn-primary font-bold"
+                >
+                  このスレッドに適用
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
       {/* 利用状況詳細モーダル */}
       {showUsageModal && usageStats && (
@@ -536,6 +924,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
             </>
           )}
         </div>
+      </div>
       </div>
     </div>
   );

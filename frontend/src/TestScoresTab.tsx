@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Award, Plus, Sparkles, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
+import { Award, Plus, Sparkles, Trash2, TrendingDown, TrendingUp, X } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
 import { MAIN_SUBJECTS, PRACTICAL_SUBJECTS } from './schedule';
 
@@ -39,7 +39,7 @@ export default function TestScoresTab({ token, safeFetch, currentUser, users }: 
   const [scores, setScores] = useState<TestScore[]>([]);
   const [label, setLabel] = useState('');
   const [draft, setDraft] = useState<Record<string, string>>({});
-  const [withPractical, setWithPractical] = useState(false);
+  const [selectedPractical, setSelectedPractical] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [advice, setAdvice] = useState<Record<string, string>>({});
   const [adviceLoading, setAdviceLoading] = useState(false);
@@ -57,8 +57,35 @@ export default function TestScoresTab({ token, safeFetch, currentUser, users }: 
   }, [viewUserId]);
 
   useEffect(() => {
-    setWithPractical(examType === 'final' || examType === 'yearend');
+    setSelectedPractical(examType === 'final' || examType === 'yearend' ? [...PRACTICAL_SUBJECTS] : []);
   }, [examType]);
+
+  const togglePracticalSubject = (sub: string) => {
+    setSelectedPractical(prev => {
+      if (prev.includes(sub)) {
+        setDraft(d => {
+          const next = { ...d };
+          delete next[sub];
+          return next;
+        });
+        return prev.filter(s => s !== sub);
+      }
+      return [...prev, sub];
+    });
+  };
+
+  const toggleAllPractical = (checked: boolean) => {
+    if (checked) {
+      setSelectedPractical([...PRACTICAL_SUBJECTS]);
+    } else {
+      setSelectedPractical([]);
+      setDraft(d => {
+        const next = { ...d };
+        for (const sub of PRACTICAL_SUBJECTS) delete next[sub];
+        return next;
+      });
+    }
+  };
 
   const ofType = scores.filter(s => (s.exam_type || 'midterm') === examType);
   // 回ごと (古い順)
@@ -78,7 +105,7 @@ export default function TestScoresTab({ token, safeFetch, currentUser, users }: 
     ofType.some(s => s.subject === sub)
   );
   const pastLabels = Array.from(new Set(scores.map(s => s.exam_label).filter(Boolean)));
-  const inputSubjects = withPractical ? [...MAIN_SUBJECTS, ...PRACTICAL_SUBJECTS] : MAIN_SUBJECTS;
+  const inputSubjects = [...MAIN_SUBJECTS, ...PRACTICAL_SUBJECTS.filter(s => selectedPractical.includes(s))];
 
   const save = async () => {
     const entries = inputSubjects
@@ -187,26 +214,80 @@ export default function TestScoresTab({ token, safeFetch, currentUser, users }: 
                 {pastLabels.map(l => <option key={l} value={l} />)}
               </datalist>
               <label className="flex items-center gap-1.5 text-stone-400 cursor-pointer select-none">
-                <input type="checkbox" checked={withPractical} onChange={e => setWithPractical(e.target.checked)} className="accent-amber-500" />
-                実技4教科も入力
+                <input
+                  type="checkbox"
+                  checked={selectedPractical.length === PRACTICAL_SUBJECTS.length}
+                  onChange={e => toggleAllPractical(e.target.checked)}
+                  className="accent-amber-500"
+                />
+                実技4教科すべて
               </label>
             </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] text-stone-500 mr-1">実技教科 (1つずつ追加・解除):</span>
+              {PRACTICAL_SUBJECTS.map(sub => {
+                const active = selectedPractical.includes(sub);
+                return (
+                  <button
+                    key={sub}
+                    type="button"
+                    onClick={() => togglePracticalSubject(sub)}
+                    className={`px-2.5 py-1 rounded-lg border text-xs font-medium flex items-center gap-1 transition ${
+                      active
+                        ? 'bg-amber-500/20 border-amber-500/50 text-amber-300'
+                        : 'bg-[#16181D] border-stone-800 text-stone-500 hover:text-stone-300 hover:border-stone-700'
+                    }`}
+                  >
+                    <span>{sub}</span>
+                    {active ? <X className="w-3 h-3" /> : <Plus className="w-3 h-3" />}
+                  </button>
+                );
+              })}
+            </div>
             <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
-              {inputSubjects.map(sub => (
-                <label key={sub} className="flex flex-col gap-1">
-                  <span className="text-stone-400">{sub}</span>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min={0}
-                    max={100}
-                    value={draft[sub] ?? ''}
-                    onChange={e => setDraft(d => ({ ...d, [sub]: e.target.value }))}
-                    placeholder="-"
-                    className="bg-[#16181D] border border-stone-800 rounded-lg px-2.5 py-2 text-white text-sm tabular-nums focus:outline-none focus:border-amber-500/60"
-                  />
-                </label>
-              ))}
+              {inputSubjects.map(sub => {
+                const isPractical = (PRACTICAL_SUBJECTS as readonly string[]).includes(sub);
+                const hasVal = draft[sub] !== undefined && draft[sub] !== '';
+                return (
+                  <div key={sub} className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between">
+                      <span className={isPractical ? 'text-amber-300/90 font-medium' : 'text-stone-400'}>{sub}</span>
+                      <div className="flex items-center gap-1">
+                        {hasVal && (
+                          <button
+                            type="button"
+                            onClick={() => setDraft(d => ({ ...d, [sub]: '' }))}
+                            title={`${sub}の入力をクリア`}
+                            className="text-stone-500 hover:text-stone-200 px-1 text-[10px]"
+                          >
+                            クリア
+                          </button>
+                        )}
+                        {isPractical && (
+                          <button
+                            type="button"
+                            onClick={() => togglePracticalSubject(sub)}
+                            title={`${sub}を入力欄から外す`}
+                            className="p-0.5 rounded text-stone-500 hover:text-red-400 hover:bg-red-500/10"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={0}
+                      max={100}
+                      value={draft[sub] ?? ''}
+                      onChange={e => setDraft(d => ({ ...d, [sub]: e.target.value }))}
+                      placeholder="-"
+                      className="bg-[#16181D] border border-stone-800 rounded-lg px-2.5 py-2 text-white text-sm tabular-nums focus:outline-none focus:border-amber-500/60"
+                    />
+                  </div>
+                );
+              })}
             </div>
             <div className="flex justify-end">
               <button onClick={save} disabled={saving} className="px-5 py-2 rounded-xl btn-primary font-bold disabled:opacity-50">
@@ -256,8 +337,8 @@ export default function TestScoresTab({ token, safeFetch, currentUser, users }: 
                           <span className="text-stone-400">{r.subject}</span>
                           <span className="font-bold text-amber-300 tabular-nums">{Number(r.score)}</span>
                           {isMine && (
-                            <button onClick={() => remove([r.id], `${s.name} の ${r.subject}`)} className="hidden group-hover:inline text-stone-600 hover:text-red-400" aria-label="削除">
-                              <Trash2 className="w-3 h-3" />
+                            <button onClick={() => remove([r.id], `${s.name} の ${r.subject}`)} className="ml-0.5 text-stone-500 hover:text-red-400 transition" title={`${r.subject}を削除`} aria-label="削除">
+                              <X className="w-3 h-3" />
                             </button>
                           )}
                         </span>
