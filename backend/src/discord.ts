@@ -392,7 +392,10 @@ export interface DiscordMemberInfo {
 export interface DiscordTextChannelInfo {
   id: string;
   name: string;
+  parentId?: string | null;
   parentName: string | null;
+  parentPosition?: number;
+  position?: number;
   type?: number;
   boundAsdfChannelId: number | null;
   boundAsdfChannelName?: string | null;
@@ -518,21 +521,30 @@ export async function getDiscordServers(includeUnapproved = false): Promise<Disc
       if (chType === 0 || chType === 5 || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
         const binding = bindings.find(b => b.discordChannelId === channel.id);
         const boundChId = binding ? binding.asdfChannelId : null;
+        const parent = (channel as any).parent;
+        const parentPos = parent ? ((parent.rawPosition ?? parent.position) ?? 0) : 999;
+        const chPos = ((channel as any).rawPosition ?? (channel as any).position) ?? 0;
         textChannels.push({
           id: channel.id,
           name: channel.name,
-          parentName: (channel as any).parent?.name || null,
+          parentId: channel.parentId || parent?.id || null,
+          parentName: parent?.name || null,
+          parentPosition: parentPos,
+          position: chPos,
           type: chType,
           boundAsdfChannelId: boundChId,
           boundAsdfChannelName: boundChId ? (asdfMap.get(boundChId) || null) : null,
         });
       }
     }
-    // チャンネルを親カテゴリ名、名前順でソート
+    // チャンネルを Discord と同じカテゴリ位置・チャンネル位置順でソート
     textChannels.sort((a, b) => {
-      const pA = a.parentName || '';
-      const pB = b.parentName || '';
-      if (pA !== pB) return pA.localeCompare(pB, 'ja');
+      const pPosA = a.parentPosition ?? 999;
+      const pPosB = b.parentPosition ?? 999;
+      if (pPosA !== pPosB) return pPosA - pPosB;
+      const posA = a.position ?? 0;
+      const posB = b.position ?? 0;
+      if (posA !== posB) return posA - posB;
       return a.name.localeCompare(b.name, 'ja');
     });
 

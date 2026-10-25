@@ -297,6 +297,52 @@ async function initDb() {
             }
             await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_channel_server_assign_v1', 'done') ON CONFLICT DO NOTHING`);
         }
+        // チャンネル入れ違い修復マイグレーション (お知らせ・自己紹介の2年団/rds9分離 & server_id整合)
+        const swapRepair = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_channel_swap_repair_v2'`);
+        if (swapRepair.rows.length === 0) {
+            const bRes = await client.query(`SELECT value FROM system_settings WHERE key = 'discord_bindings'`);
+            let bindings = [];
+            if (bRes.rows.length > 0 && bRes.rows[0].value) {
+                try {
+                    bindings = JSON.parse(bRes.rows[0].value) || [];
+                }
+                catch (_) { }
+            }
+            // 1. 2年団のお知らせ (1525039269662691328) を asdfChannelId: 4 に正しく紐付け、server_id を 2年団に戻す
+            await client.query(`UPDATE channels SET server_id = '1524703392927191100' WHERE id = 4`);
+            // rds9のお知らせ (1550716941314822224) は rds9用に新規チャンネル作成
+            const rds9NoticeRes = await client.query(`INSERT INTO channels (name, type, position, server_id) VALUES ('お知らせ', 'text', 100, '1550475182643347466') RETURNING id`);
+            const rds9NoticeId = rds9NoticeRes.rows[0].id;
+            // 2. 2年団の自己紹介 (1525690725277241344) を asdfChannelId: 24 に正しく紐付け、server_id を 2年団に戻す
+            await client.query(`UPDATE channels SET server_id = '1524703392927191100' WHERE id = 24`);
+            // rds9の自己紹介 (1560903171654815766) は rds9用に新規チャンネル作成
+            const rds9IntroRes = await client.query(`INSERT INTO channels (name, type, position, server_id) VALUES ('自己紹介', 'text', 101, '1550475182643347466') RETURNING id`);
+            const rds9IntroId = rds9IntroRes.rows[0].id;
+            // バインディングを更新
+            bindings = bindings.map((b) => {
+                if (b.discordChannelId === '1550716941314822224') {
+                    return { ...b, asdfChannelId: rds9NoticeId, guildId: '1550475182643347466' };
+                }
+                if (b.discordChannelId === '1560903171654815766') {
+                    return { ...b, asdfChannelId: rds9IntroId, guildId: '1550475182643347466' };
+                }
+                return b;
+            });
+            if (!bindings.some(b => b.discordChannelId === '1525039269662691328')) {
+                bindings.push({ discordChannelId: '1525039269662691328', asdfChannelId: 4, guildId: '1524703392927191100' });
+            }
+            if (!bindings.some(b => b.discordChannelId === '1525690725277241344')) {
+                bindings.push({ discordChannelId: '1525690725277241344', asdfChannelId: 24, guildId: '1524703392927191100' });
+            }
+            await client.query(`UPDATE system_settings SET value = $1 WHERE key = 'discord_bindings'`, [JSON.stringify(bindings)]);
+            // すべてのバインド済みチャンネルの server_id を確実に guildId と一致させる
+            for (const b of bindings) {
+                if (b.guildId && b.asdfChannelId) {
+                    await client.query(`UPDATE channels SET server_id = $1 WHERE id = $2`, [b.guildId, b.asdfChannelId]);
+                }
+            }
+            await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_channel_swap_repair_v2', 'done') ON CONFLICT DO NOTHING`);
+        }
         // 初期チャンネルの作成
         const channelRes = await client.query('SELECT COUNT(*) FROM channels');
         if (parseInt(channelRes.rows[0].count, 10) === 0) {

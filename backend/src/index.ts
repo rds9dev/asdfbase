@@ -2155,15 +2155,19 @@ app.post('/api/discord/sync-all-channels', authMiddleware, adminOnly, async (req
     if (!targetServer) return res.status(404).json({ error: '対象のDiscordサーバーが見つかりません' });
 
     const existingChannels = (await pool.query(`SELECT id, name, server_id FROM channels`)).rows;
+    const currentStatus = await getDiscordStatus();
+    const currentBindings = currentStatus.bindings || [];
+    const boundChannelIds = new Set(currentBindings.map(b => b.asdfChannelId));
     let createdCount = 0;
     let boundCount = 0;
 
     for (const tc of targetServer.textChannels) {
       if (tc.boundAsdfChannelId) continue; // すでにバインド済み
 
-      // 既存の同名チャンネルを探す (同じサーバーID優先)
-      let targetAsdfCh = existingChannels.find(c => c.server_id === guildId && c.name.toLowerCase() === tc.name.toLowerCase())
-        || existingChannels.find(c => c.name.toLowerCase() === tc.name.toLowerCase());
+      // 同じサーバーIDかつ同じ名前で、まだ他のDiscordチャンネルにバインドされていないものを探す
+      let targetAsdfCh = existingChannels.find(
+        c => c.server_id === guildId && c.name.toLowerCase() === tc.name.toLowerCase() && !boundChannelIds.has(c.id)
+      );
 
       if (!targetAsdfCh) {
         // 新規チャンネルを作成
@@ -2177,14 +2181,14 @@ app.post('/api/discord/sync-all-channels', authMiddleware, adminOnly, async (req
         existingChannels.push(targetAsdfCh);
         broadcast({ type: 'CHANNEL_CREATED', payload: targetAsdfCh });
         createdCount++;
-      } else if (!targetAsdfCh.server_id) {
-        // server_id を付与
+      } else if (targetAsdfCh.server_id !== guildId) {
         await pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2`, [guildId, targetAsdfCh.id]);
         targetAsdfCh.server_id = guildId;
         broadcast({ type: 'CHANNEL_UPDATED', payload: targetAsdfCh });
       }
 
       await addDiscordBinding(tc.id, targetAsdfCh.id, guildId);
+      boundChannelIds.add(targetAsdfCh.id);
       boundCount++;
     }
 

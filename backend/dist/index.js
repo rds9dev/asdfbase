@@ -1909,14 +1909,16 @@ app.post('/api/discord/sync-all-channels', authMiddleware, adminOnly, async (req
         if (!targetServer)
             return res.status(404).json({ error: '対象のDiscordサーバーが見つかりません' });
         const existingChannels = (await db_js_1.pool.query(`SELECT id, name, server_id FROM channels`)).rows;
+        const currentStatus = await (0, discord_js_1.getDiscordStatus)();
+        const currentBindings = currentStatus.bindings || [];
+        const boundChannelIds = new Set(currentBindings.map(b => b.asdfChannelId));
         let createdCount = 0;
         let boundCount = 0;
         for (const tc of targetServer.textChannels) {
             if (tc.boundAsdfChannelId)
                 continue; // すでにバインド済み
-            // 既存の同名チャンネルを探す (同じサーバーID優先)
-            let targetAsdfCh = existingChannels.find(c => c.server_id === guildId && c.name.toLowerCase() === tc.name.toLowerCase())
-                || existingChannels.find(c => c.name.toLowerCase() === tc.name.toLowerCase());
+            // 同じサーバーIDかつ同じ名前で、まだ他のDiscordチャンネルにバインドされていないものを探す
+            let targetAsdfCh = existingChannels.find(c => c.server_id === guildId && c.name.toLowerCase() === tc.name.toLowerCase() && !boundChannelIds.has(c.id));
             if (!targetAsdfCh) {
                 // 新規チャンネルを作成
                 const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM channels`);
@@ -1927,13 +1929,13 @@ app.post('/api/discord/sync-all-channels', authMiddleware, adminOnly, async (req
                 broadcast({ type: 'CHANNEL_CREATED', payload: targetAsdfCh });
                 createdCount++;
             }
-            else if (!targetAsdfCh.server_id) {
-                // server_id を付与
+            else if (targetAsdfCh.server_id !== guildId) {
                 await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2`, [guildId, targetAsdfCh.id]);
                 targetAsdfCh.server_id = guildId;
                 broadcast({ type: 'CHANNEL_UPDATED', payload: targetAsdfCh });
             }
             await (0, discord_js_1.addDiscordBinding)(tc.id, targetAsdfCh.id, guildId);
+            boundChannelIds.add(targetAsdfCh.id);
             boundCount++;
         }
         const updatedServers = await (0, discord_js_1.getDiscordServers)(true);

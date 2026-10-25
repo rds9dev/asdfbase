@@ -138,6 +138,7 @@ interface ChannelItem {
   id: number;
   name: string;
   type: string;
+  position?: number;
   server_id?: string | null;
   view_roles?: string[];
   write_roles?: string[];
@@ -3850,11 +3851,11 @@ export default function App() {
     return srv?.id || '1524703392927191100';
   };
 
-  // チャンネルを所属する Discord サーバーに振り分ける
+  // チャンネルを所属する Discord サーバーに振り分ける (バインディングを最優先)
   const resolveChannelServerId = (ch: ChannelItem): string => {
-    if (ch.server_id) return ch.server_id;
     const b = discordBindings.find((x: any) => Number(x.asdfChannelId) === ch.id && x.guildId);
     if (b?.guildId) return b.guildId;
+    if (ch.server_id) return ch.server_id;
     const chName = String(ch.name || '').toLowerCase();
     if (/rds9|bot/i.test(chName)) {
       const rds9Srv = discordServers.find(s => s.id === '1550475182643347466' || /rds9/i.test(s.name || ''));
@@ -3862,6 +3863,96 @@ export default function App() {
     }
     return getMainServerId();
   };
+
+  // 各 asdfbase チャンネルに対応する Discord チャンネル情報をマッピング
+  const dcChannelMap = useMemo(() => {
+    const map = new Map<number, any>();
+    for (const srv of discordServers) {
+      for (const tc of (srv.textChannels || [])) {
+        if (tc.boundAsdfChannelId) {
+          map.set(Number(tc.boundAsdfChannelId), { ...tc, guildId: srv.id, guildName: srv.name });
+        }
+      }
+    }
+    for (const b of discordBindings) {
+      if (b.asdfChannelId && !map.has(Number(b.asdfChannelId))) {
+        map.set(Number(b.asdfChannelId), {
+          id: b.discordChannelId,
+          name: b.discordChannelName,
+          parentName: b.parentName || null,
+          guildId: b.guildId,
+        });
+      }
+    }
+    return map;
+  }, [discordServers, discordBindings]);
+
+  // カテゴリ折りたたみステート (localStorage で永続化)
+  const [collapsedCategories, setCollapsedCategories] = useState<Record<string, boolean>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('asdf_collapsed_categories') || '{}');
+    } catch {
+      return {};
+    }
+  });
+
+  const toggleCategoryCollapse = (categoryKey: string) => {
+    setCollapsedCategories(prev => {
+      const next = { ...prev, [categoryKey]: !prev[categoryKey] };
+      try {
+        localStorage.setItem('asdf_collapsed_categories', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  // 選択中サーバーのチャンネルを Discord のカテゴリごとにグループ分け
+  const groupedChannels = useMemo(() => {
+    const currentServerChannels = channels.filter(
+      ch => ch.type !== 'voice' && resolveChannelServerId(ch) === selectedServerId
+    );
+
+    const groups: {
+      key: string;
+      name: string;
+      position: number;
+      channels: ChannelItem[];
+    }[] = [];
+    const groupMap = new Map<string, typeof groups[0]>();
+
+    for (const ch of currentServerChannels) {
+      const dc = dcChannelMap.get(ch.id);
+      const catName = dc?.parentName ? String(dc.parentName).trim() : '';
+      const catKey = catName ? `cat-${selectedServerId}-${catName}` : `cat-${selectedServerId}-uncategorized`;
+      const displayName = catName || 'チャンネル';
+      const catPos = dc?.parentPosition ?? (catName ? 500 : 999);
+
+      let g = groupMap.get(catKey);
+      if (!g) {
+        g = { key: catKey, name: displayName, position: catPos, channels: [] };
+        groupMap.set(catKey, g);
+        groups.push(g);
+      }
+      g.channels.push(ch);
+    }
+
+    // カテゴリの順序でソート (Discord の親カテゴリ position 順)
+    groups.sort((a, b) => (a.position - b.position) || a.name.localeCompare(b.name, 'ja'));
+
+    // 各カテゴリ内のチャンネルを Discord の position 順にソート
+    for (const g of groups) {
+      g.channels.sort((a, b) => {
+        const dcA = dcChannelMap.get(a.id);
+        const dcB = dcChannelMap.get(b.id);
+        const posA = dcA?.position ?? a.position ?? 0;
+        const posB = dcB?.position ?? b.position ?? 0;
+        if (posA !== posB) return posA - posB;
+        return a.name.localeCompare(b.name, 'ja');
+      });
+    }
+
+    return groups;
+  }, [channels, discordBindings, discordServers, selectedServerId, dcChannelMap]);
 
   useEffect(() => {
     const activeCh = channels.find(c => c.id === activeChannelId);
@@ -4689,137 +4780,194 @@ export default function App() {
                     );
                   })()}
 
-                  {/* チャンネル一覧: 収まらない時はこの中だけスクロール */}
-                  <div className="flex-1 min-h-0 overflow-y-auto space-y-0.5 pr-0.5">
-                    {channels
-                      .filter(ch => {
-                        if (ch.type === 'voice') return false;
-                        return resolveChannelServerId(ch) === selectedServerId;
-                      })
-                      .map((ch, idx, textChannels) => {
-                      const isActiveCh = activeChannelId === ch.id;
-                      const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0);
-                      const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0);
-                      const binding = bindingByAsdfId.get(ch.id);
-                      const hasRoleRestriction = (Array.isArray(ch.view_roles) && ch.view_roles.length > 0) || (Array.isArray(ch.write_roles) && ch.write_roles.length > 0);
-                      return (
-                      <div
-                        key={ch.id}
-                        className={`group relative flex items-center justify-between pl-2.5 pr-1.5 py-1.5 rounded-lg text-sm transition ${
-                          isActiveCh
-                            ? 'bg-amber-500/15 text-amber-300 font-bold'
-                            : unread > 0
-                              ? 'text-white font-bold bg-white/[0.04] hover:bg-stone-800/60'
-                              : 'text-stone-400 hover:bg-stone-900/60 hover:text-stone-200'
-                        }`}
-                      >
-                        {/* 左端インジケーター: 選択中=アンバーのバー / 未読=白い点 */}
-                        {isActiveCh ? (
-                          <span className="absolute left-0 top-1.5 bottom-1.5 w-1 rounded-r bg-amber-400" />
-                        ) : unread > 0 ? (
-                          <span className="absolute -left-0.5 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-white anim-badge" />
-                        ) : null}
-                        <button
-                          onClick={() => setActiveChannelId(ch.id)}
-                          className="flex items-center gap-1.5 flex-1 text-left min-w-0"
-                        >
-                          <Hash className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : binding ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
-                          <span className="truncate flex-1">{ch.name}</span>
-                          {binding && (
-                            <span
-                              className="shrink-0 text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono"
-                              title={`Discord #${binding.discordChannelName} と同期中`}
+                  {/* チャンネル一覧: Discord のカテゴリごとにグループ化 & 折りたたみ表示 */}
+                  <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-0.5">
+                    {groupedChannels.length === 0 ? (
+                      <div className="p-3 text-center text-xs text-stone-500 space-y-2 border border-dashed border-stone-800 rounded-xl mt-2">
+                        <div>このサーバーに紐付いたチャンネルがまだありません</div>
+                        {selectedServer && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setLinkGuildId(selectedServer.id);
+                              setShowDiscordServerModal(true);
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 font-bold text-[11px]"
+                          >
+                            チャンネルを一括同期
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      groupedChannels.map(group => {
+                        const isCollapsed = Boolean(collapsedCategories[group.key]);
+                        const groupUnread = group.channels.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (unreadCounts[c.id] || 0)), 0);
+                        const groupMentions = group.channels.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (mentionCounts[c.id] || 0)), 0);
+
+                        return (
+                          <div key={group.key} className="space-y-0.5">
+                            {/* カテゴリヘッダー (クリックで折りたたみ/展開) */}
+                            <button
+                              type="button"
+                              onClick={() => toggleCategoryCollapse(group.key)}
+                              className="w-full flex items-center justify-between px-1.5 py-1 text-[10px] font-extrabold uppercase tracking-wider text-stone-400 hover:text-stone-200 transition group select-none rounded hover:bg-stone-900/40"
+                              title={`${group.name} を${isCollapsed ? '展開' : '折りたたむ'}`}
                             >
-                              DC
-                            </span>
-                          )}
-                          {hasRoleRestriction && (
-                            <span title="ロール制限チャンネル" className="shrink-0">
-                              <Shield className="w-3 h-3 text-amber-400/80" />
-                            </span>
-                          )}
-                        </button>
+                              <div className="flex items-center gap-1 min-w-0">
+                                {isCollapsed ? (
+                                  <ChevronRight className="w-3 h-3 shrink-0 text-stone-500 group-hover:text-stone-300 transition-transform" />
+                                ) : (
+                                  <ChevronDown className="w-3 h-3 shrink-0 text-stone-500 group-hover:text-stone-300 transition-transform" />
+                                )}
+                                <span className="truncate">{group.name}</span>
+                              </div>
+                              {/* 折りたたみ時のみ表示する未読・メンションバッジ */}
+                              {isCollapsed && (
+                                <div className="flex items-center gap-1 shrink-0">
+                                  {groupMentions > 0 ? (
+                                    <span className="min-w-[16px] h-3.5 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-3.5 text-center shadow">
+                                      {groupMentions > 99 ? '99+' : groupMentions}
+                                    </span>
+                                  ) : groupUnread > 0 ? (
+                                    <span className="w-2 h-2 rounded-full bg-white anim-badge" />
+                                  ) : null}
+                                </div>
+                              )}
+                            </button>
 
-                        <div className="flex items-center gap-0.5 shrink-0 ml-1">
-                          {/* メンションされた時だけ赤い数字 */}
-                          {mentions > 0 && (
-                            <span className="anim-badge min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold leading-5 text-center shadow">
-                              {mentions > 99 ? '99+' : mentions}
-                            </span>
-                          )}
+                            {/* カテゴリ内のチャンネル一覧 */}
+                            {!isCollapsed && (
+                              <div className="space-y-0.5">
+                                {group.channels.map((ch, idx, textChannels) => {
+                                  const isActiveCh = activeChannelId === ch.id;
+                                  const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0);
+                                  const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0);
+                                  const binding = bindingByAsdfId.get(ch.id);
+                                  const hasRoleRestriction = (Array.isArray(ch.view_roles) && ch.view_roles.length > 0) || (Array.isArray(ch.write_roles) && ch.write_roles.length > 0);
+                                  return (
+                                    <div
+                                      key={ch.id}
+                                      className={`group relative flex items-center justify-between pl-2.5 pr-1.5 py-1.5 rounded-lg text-sm transition ${
+                                        isActiveCh
+                                          ? 'bg-amber-500/15 text-amber-300 font-bold'
+                                          : unread > 0
+                                            ? 'text-white font-bold bg-white/[0.04] hover:bg-stone-800/60'
+                                            : 'text-stone-400 hover:bg-stone-900/60 hover:text-stone-200'
+                                      }`}
+                                    >
+                                      {/* 左端インジケーター: 選択中=アンバーのバー / 未読=白い点 */}
+                                      {isActiveCh ? (
+                                        <span className="absolute left-0 top-1.5 bottom-1.5 w-1 rounded-r bg-amber-400" />
+                                      ) : unread > 0 ? (
+                                        <span className="absolute -left-0.5 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-white anim-badge" />
+                                      ) : null}
+                                      <button
+                                        onClick={() => setActiveChannelId(ch.id)}
+                                        className="flex items-center gap-1.5 flex-1 text-left min-w-0"
+                                      >
+                                        <Hash className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : binding ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
+                                        <span className="truncate flex-1">{ch.name}</span>
+                                        {binding && (
+                                          <span
+                                            className="shrink-0 text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono"
+                                            title={`Discord #${binding.discordChannelName} と同期中`}
+                                          >
+                                            DC
+                                          </span>
+                                        )}
+                                        {hasRoleRestriction && (
+                                          <span title="ロール制限チャンネル" className="shrink-0">
+                                            <Shield className="w-3 h-3 text-amber-400/80" />
+                                          </span>
+                                        )}
+                                      </button>
 
-                          {/* チャンネル操作: ホバー時のみ表示して通常時はチャンネル名の幅を広く確保 */}
-                          <div className="hidden group-hover:flex items-center">
-                            {binding && (
-                              <button
-                                type="button"
-                                onClick={() => handleUnbindDiscordChannel({ asdfChannelId: ch.id, discordChannelId: binding.discordChannelId, label: `#${ch.name}` })}
-                                className="p-0.5 hover:text-amber-400 text-indigo-400 mr-0.5"
-                                title="Discord同期を解除"
-                              >
-                                <X className="w-3 h-3" />
-                              </button>
-                            )}
-                            {currentUser?.role === 'admin' && (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => setChannelPermModal({
-                                    ...ch,
-                                    view_roles: Array.isArray(ch.view_roles) ? ch.view_roles : [],
-                                    write_roles: Array.isArray(ch.write_roles) ? ch.write_roles : [],
-                                  })}
-                                  className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
-                                  title="チャンネルのロール・権限・サーバー設定 (admin専用)"
-                                >
-                                  <Shield className="w-3 h-3" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setEditingChannel({ id: ch.id, name: ch.name });
-                                    setEditChannelNameInput(ch.name);
-                                  }}
-                                  className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
-                                  title="チャンネル名を変更"
-                                >
-                                  <Edit3 className="w-3 h-3" />
-                                </button>
-                              </>
-                            )}
-                            {currentUser?.role === 'admin' && idx > 0 && (
-                              <button
-                                onClick={e => handleMoveChannel(e, idx, 'up', textChannels)}
-                                className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
-                                title="上へ移動"
-                              >
-                                ▲
-                              </button>
-                            )}
-                            {currentUser?.role === 'admin' && idx < textChannels.length - 1 && (
-                              <button
-                                onClick={e => handleMoveChannel(e, idx, 'down', textChannels)}
-                                className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
-                                title="下へ移動"
-                              >
-                                ▼
-                              </button>
+                                      <div className="flex items-center gap-0.5 shrink-0 ml-1">
+                                        {/* メンションされた時だけ赤い数字 */}
+                                        {mentions > 0 && (
+                                          <span className="anim-badge min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[11px] font-bold leading-5 text-center shadow">
+                                            {mentions > 99 ? '99+' : mentions}
+                                          </span>
+                                        )}
+
+                                        {/* チャンネル操作: ホバー時のみ表示して通常時はチャンネル名の幅を広く確保 */}
+                                        <div className="hidden group-hover:flex items-center">
+                                          {binding && (
+                                            <button
+                                              type="button"
+                                              onClick={() => handleUnbindDiscordChannel({ asdfChannelId: ch.id, discordChannelId: binding.discordChannelId, label: `#${ch.name}` })}
+                                              className="p-0.5 hover:text-amber-400 text-indigo-400 mr-0.5"
+                                              title="Discord同期を解除"
+                                            >
+                                              <X className="w-3 h-3" />
+                                            </button>
+                                          )}
+                                          {currentUser?.role === 'admin' && (
+                                            <>
+                                              <button
+                                                type="button"
+                                                onClick={() => setChannelPermModal({
+                                                  ...ch,
+                                                  view_roles: Array.isArray(ch.view_roles) ? ch.view_roles : [],
+                                                  write_roles: Array.isArray(ch.write_roles) ? ch.write_roles : [],
+                                                })}
+                                                className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
+                                                title="チャンネルのロール・権限・サーバー設定 (admin専用)"
+                                              >
+                                                <Shield className="w-3 h-3" />
+                                              </button>
+                                              <button
+                                                type="button"
+                                                onClick={() => {
+                                                  setEditingChannel({ id: ch.id, name: ch.name });
+                                                  setEditChannelNameInput(ch.name);
+                                                }}
+                                                className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
+                                                title="チャンネル名を変更"
+                                              >
+                                                <Edit3 className="w-3 h-3" />
+                                              </button>
+                                            </>
+                                          )}
+                                          {currentUser?.role === 'admin' && idx > 0 && (
+                                            <button
+                                              onClick={e => handleMoveChannel(e, idx, 'up', textChannels)}
+                                              className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
+                                              title="上へ移動"
+                                            >
+                                              ▲
+                                            </button>
+                                          )}
+                                          {currentUser?.role === 'admin' && idx < textChannels.length - 1 && (
+                                            <button
+                                              onClick={e => handleMoveChannel(e, idx, 'down', textChannels)}
+                                              className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
+                                              title="下へ移動"
+                                            >
+                                              ▼
+                                            </button>
+                                          )}
+                                        </div>
+
+                                        {channels.length > 1 && (currentUser?.role === 'admin' || Boolean(binding) || Boolean(ch.server_id)) && (
+                                          <button
+                                            onClick={() => handleDeleteChannel(ch.id)}
+                                            className="hidden group-hover:inline-flex p-0.5 hover:text-red-400 rounded text-stone-500"
+                                            title="チャンネル削除"
+                                          >
+                                            <Trash2 className="w-3 h-3" />
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
                             )}
                           </div>
-
-                          {channels.length > 1 && (currentUser?.role === 'admin' || Boolean(binding) || Boolean(ch.server_id)) && (
-                            <button
-                              onClick={() => handleDeleteChannel(ch.id)}
-                              className="hidden group-hover:inline-flex p-0.5 hover:text-red-400 rounded text-stone-500"
-                              title="チャンネル削除"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      );
-                    })}
+                        );
+                      })
+                    )}
                     {selectedServer && channels.filter(ch => ch.type !== 'voice' && resolveChannelServerId(ch) === selectedServer.id).length === 0 && (
                       <div className="p-3 text-center text-xs text-stone-500 space-y-2 border border-dashed border-stone-800 rounded-xl mt-2">
                         <div>このサーバーに紐付いたチャンネルがまだありません</div>
