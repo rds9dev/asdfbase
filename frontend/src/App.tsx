@@ -390,13 +390,24 @@ export default function App() {
   const [discordServers, setDiscordServers] = useState<any[]>([]);
   const [discordBindings, setDiscordBindings] = useState<any[]>([]);
   const [discordLinkRequests, setDiscordLinkRequests] = useState<any[]>([]);
-  const [selectedServerId, setSelectedServerId] = useState<string>('all');
+  const [selectedServerId, setSelectedServerId] = useState<string>('1524703392927191100');
   const [showDiscordServerModal, setShowDiscordServerModal] = useState<boolean>(false);
   const [isSyncingDiscordHistory, setIsSyncingDiscordHistory] = useState<boolean>(false);
   const [linkGuildId, setLinkGuildId] = useState<string>('');
   const [linkDiscordChannelId, setLinkDiscordChannelId] = useState<string>('');
   const [linkAsdfChannelId, setLinkAsdfChannelId] = useState<string>('new');
   const [linkNewChannelName, setLinkNewChannelName] = useState<string>('');
+
+  const discordUsernames = useMemo(() => {
+    const s = new Set<string>();
+    for (const srv of discordServers) {
+      for (const m of (srv.members || [])) {
+        if (m.displayName) s.add(m.displayName);
+        if (m.username) s.add(m.username);
+      }
+    }
+    return s;
+  }, [discordServers]);
 
   // カスタム絵文字 & ピッカー・アップロード
   const [customEmojisList, setCustomEmojisList] = useState<CustomEmojiItem[]>([
@@ -2136,9 +2147,9 @@ export default function App() {
     if (!me) return false;
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
-      if (m.id > 0 && m.user_id === me.id && m.channel_id === activeChannelId && !IMAGE_MESSAGE_RE.test(m.content.trim())) {
+      if (m.id > 0 && m.user_id === me.id && m.channel_id === activeChannelId && !IMAGE_MESSAGE_RE.test((m.content || '').trim())) {
         setEditingMessageId(m.id);
-        setEditingContent(m.content);
+        setEditingContent(m.content || '');
         setTimeout(() => document.getElementById(`msg-${m.id}`)?.scrollIntoView({ block: 'nearest' }), 0);
         return true;
       }
@@ -4006,17 +4017,6 @@ export default function App() {
   const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
   const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
 
-  const discordUsernames = useMemo(() => {
-    const s = new Set<string>();
-    for (const srv of discordServers) {
-      for (const m of (srv.members || [])) {
-        if (m.displayName) s.add(m.displayName);
-        if (m.username) s.add(m.username);
-      }
-    }
-    return s;
-  }, [discordServers]);
-
   // 補完候補
   const completionItems: { key: string; label: string; insert: string; sub?: string; avatar?: string | null; emojiUrl?: string }[] = (() => {
     if (!completion) return [];
@@ -4967,7 +4967,7 @@ export default function App() {
                   </div>
                 )}
 
-                {messages.filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
+                {messages.filter(m => !chatSearchQuery || (m.content || '').toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
                   channelLoadState !== 'ready' && !chatSearchQuery ? (
                     <div className="h-full flex flex-col items-center justify-center text-stone-500 text-xs space-y-3 anim-fade">
                       {channelLoadState === 'loading' ? (
@@ -4993,7 +4993,7 @@ export default function App() {
                   )
                 ) : (
                   messages
-                    .filter(m => !chatSearchQuery || m.content.toLowerCase().includes(chatSearchQuery.toLowerCase()))
+                    .filter(m => !chatSearchQuery || (m.content || '').toLowerCase().includes(chatSearchQuery.toLowerCase()))
                     .map((m, mIdx, filteredList) => {
                       const lastReadId = unreadAnchor && unreadAnchor.channelId === activeChannelId ? unreadAnchor.lastReadId : 0;
                       const prevMsg = mIdx > 0 ? filteredList[mIdx - 1] : null;
@@ -5017,7 +5017,7 @@ export default function App() {
                         created.getTime() - (prevCreated?.getTime() || 0) < 5 * 60 * 1000
                       );
                       const isMentioningMe = Boolean(
-                        currentUser && !isMine && (m.content.includes(`@${currentUser.username}`) || m.content.includes('@everyone') || m.reply_to?.user_id === currentUser.id)
+                        currentUser && !isMine && ((m.content || '').includes(`@${currentUser.username}`) || (m.content || '').includes('@everyone') || m.reply_to?.user_id === currentUser.id)
                       );
                       const timeLabel = created.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -5160,9 +5160,9 @@ export default function App() {
                                 <div className={`text-[15px] leading-relaxed whitespace-pre-wrap break-words ${
                                   isGemini ? 'text-amber-100' : 'text-stone-200'
                                 }`}>
-                                  {IMAGE_MESSAGE_RE.test(m.content.trim()) ? (
+                                  {IMAGE_MESSAGE_RE.test((m.content || '').trim()) ? (
                                     <img
-                                      src={toProxiedMediaUrl(m.content.trim().match(IMAGE_MESSAGE_RE)?.[1] || '', token)}
+                                      src={toProxiedMediaUrl((m.content || '').trim().match(IMAGE_MESSAGE_RE)?.[1] || '', token)}
                                       alt="attachment"
                                       loading="lazy"
                                       onLoad={() => {
@@ -5172,7 +5172,7 @@ export default function App() {
                                           if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 600) scheduleScrollToBottom(false);
                                         }
                                       }}
-                                      onClick={() => setLightbox({ src: toProxiedMediaUrl(m.content.trim().match(IMAGE_MESSAGE_RE)?.[1] || '', token), zoom: 1 })}
+                                      onClick={() => setLightbox({ src: toProxiedMediaUrl((m.content || '').trim().match(IMAGE_MESSAGE_RE)?.[1] || '', token), zoom: 1 })}
                                       className="max-h-72 max-w-full rounded-lg object-contain my-1 border border-stone-800 cursor-zoom-in hover:opacity-90 transition"
                                     />
                                   ) : m.content === VIDEO_NOTICE ? (
@@ -5182,7 +5182,7 @@ export default function App() {
                                   ) : (
                                     <div className="markdown-body whitespace-normal text-[14px]">
                                       <SmartMarkdown
-                                        content={m.content}
+                                        content={m.content || ''}
                                         containerRef={chatScrollContainerRef}
                                         opts={{
                                           usernames: knownUsernames,
@@ -7536,7 +7536,7 @@ export default function App() {
       {msgActionSheet && (() => {
         const m = msgActionSheet;
         const isMine = m.user_id === currentUser.id;
-        const isImage = IMAGE_MESSAGE_RE.test(m.content.trim());
+        const isImage = IMAGE_MESSAGE_RE.test((m.content || '').trim());
         const close = () => setMsgActionSheet(null);
         const item = 'w-full flex items-center gap-3 px-4 py-3 text-sm text-left active:bg-stone-800 rounded-xl';
         return (
@@ -7544,7 +7544,7 @@ export default function App() {
             <div onClick={e => e.stopPropagation()} className="w-full bg-[#111214] border-t border-stone-800 rounded-t-2xl p-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] anim-slide-up">
               <div className="px-4 pt-2 pb-3 text-xs text-stone-400 border-b border-stone-800 mb-1">
                 <b className="text-stone-200">{splitSenderName(m.sender_username || m.username || '').name}</b>
-                <span className="ml-2 line-clamp-2">{summarizeContent(m.content)}</span>
+                <span className="ml-2 line-clamp-2">{summarizeContent(m.content || '')}</span>
               </div>
               <div className="flex justify-around py-2">
                 {['👍', '❤️', '✅', '❌', ':swim:', '😂'].map(e => (
