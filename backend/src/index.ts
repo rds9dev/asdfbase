@@ -2196,8 +2196,8 @@ app.post('/api/discord/sync-all-channels', authMiddleware, adminOnly, async (req
     const updatedStatus = await getDiscordStatus();
     broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: updatedStatus });
 
-    // バックグラウンドで過去履歴を自動取得
-    syncDiscordHistory({ guildId, limit: 50 }).catch(err => console.warn('[discord] bulk sync history error:', err.message));
+    // 新規紐付けチャンネルの古い過去ログは取り込まず、これ以降のリアルタイムメッセージのみ同期する
+    // (古いメッセージでチャット欄が埋まるのを防止)
 
     logAudit(req.user!, 'discord_sync_all', 'discord', null, {
       guildId,

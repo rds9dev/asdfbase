@@ -350,6 +350,18 @@ export async function initDb() {
       await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_channel_swap_repair_v2', 'done') ON CONFLICT DO NOTHING`);
     }
 
+    // 過去の同期で取り込まれてしまった古い Discord メッセージ (24時間以上前) をクリーンアップ
+    const cleanupOldDiscord = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_cleanup_old_discord_history_v1'`);
+    if (cleanupOldDiscord.rows.length === 0) {
+      const delRes = await client.query(`
+        DELETE FROM messages
+        WHERE username LIKE '[Discord]%'
+          AND created_at < NOW() - INTERVAL '24 hours'
+      `);
+      console.log(`[migration] Cleaned up ${delRes.rowCount || 0} old Discord messages.`);
+      await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_cleanup_old_discord_history_v1', 'done') ON CONFLICT DO NOTHING`);
+    }
+
     // 初期チャンネルの作成
     const channelRes = await client.query('SELECT COUNT(*) FROM channels');
     if (parseInt(channelRes.rows[0].count, 10) === 0) {

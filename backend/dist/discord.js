@@ -669,7 +669,7 @@ async function handleDiscordMessage(msg) {
         return;
     await processDiscordMessage(msg, targets, false);
 }
-// Bot ダウンタイム中などに未取得だった Discord メッセージを遡って同期
+// Bot ダウンタイム中などに未取得だった Discord メッセージを遡って同期 (古いメッセージは除外)
 async function syncDiscordHistory(opts) {
     if (!client || !connected || !deps)
         return { syncedMessages: 0, checkedChannels: 0 };
@@ -690,7 +690,10 @@ async function syncDiscordHistory(opts) {
         arr.push(b);
         byDiscordCh.set(b.discordChannelId, arr);
     }
-    const fetchLimit = Math.min(Math.max(opts?.limit || 50, 10), 100);
+    // 古いメッセージを同期しないよう、直近指定時間以内のみを対象にする (デフォルト2時間)
+    const maxAgeHours = opts?.maxAgeHours ?? 2;
+    const oldestAllowedTime = Date.now() - maxAgeHours * 60 * 60 * 1000;
+    const fetchLimit = Math.min(Math.max(opts?.limit || 20, 5), 50);
     let syncedMessages = 0;
     let checkedChannels = 0;
     for (const [discordChannelId, targets] of byDiscordCh.entries()) {
@@ -705,6 +708,9 @@ async function syncDiscordHistory(opts) {
             const sorted = Array.from(fetched.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
             for (const msg of sorted) {
                 if (msg.author.bot || msg.webhookId)
+                    continue;
+                // 古いメッセージ (2時間以上前) はスキップ
+                if (msg.createdTimestamp < oldestAllowedTime)
                     continue;
                 if (deps.isDiscordMessageSynced) {
                     const already = await deps.isDiscordMessageSynced(msg.id);
@@ -923,15 +929,15 @@ async function startDiscordBot(d) {
             if (deps?.onVoiceStatusUpdate) {
                 deps.onVoiceStatusUpdate(getDiscordVoiceStatus());
             }
-            // ダウンタイム中の未取得メッセージを自動でバックグラウンド取得
-            syncDiscordHistory({ limit: 50 }).catch(err => console.warn('[discord] startup history sync error:', err.message));
+            // ダウンタイム中の未取得メッセージを自動でバックグラウンド取得 (直近1時間以内のみ)
+            syncDiscordHistory({ limit: 10, maxAgeHours: 1 }).catch(err => console.warn('[discord] startup history sync error:', err.message));
         });
         c.on(discord_js_1.Events.ShardDisconnect, () => {
             connected = false;
         });
         c.on(discord_js_1.Events.ShardResume, () => {
             connected = true;
-            syncDiscordHistory({ limit: 50 }).catch(() => { });
+            syncDiscordHistory({ limit: 10, maxAgeHours: 1 }).catch(() => { });
         });
         c.on(discord_js_1.Events.ShardReady, () => {
             connected = true;
