@@ -59,6 +59,7 @@ export const BUILTIN_SHORTCODES: Record<string, string> = {
 
 export interface RenderOptions {
   usernames: Set<string>;
+  discordUsernames?: Set<string>;
   channels: Map<string, number>;
   customEmojis?: Map<string, string>;
   me?: string;
@@ -180,12 +181,14 @@ export function renderMessageText(content: string, opts: RenderOptions): React.R
     last = idx + token.length;
     if (token.startsWith('@')) {
       const name = token.slice(1);
-      const known = opts.usernames.has(name) || SPECIAL_MENTIONS.includes(name.toLowerCase());
+      const isDiscordUser = Boolean(opts.discordUsernames?.has(name));
+      const known = opts.usernames.has(name) || isDiscordUser || SPECIAL_MENTIONS.includes(name.toLowerCase());
       if (known) {
         const isMe = name === opts.me || name.toLowerCase() === 'everyone';
         out.push(
-          <span key={i++} className={`mention-pill ${isMe ? 'mention-me' : ''}`}>
+          <span key={i++} className={`mention-pill ${isMe ? 'mention-me' : isDiscordUser ? 'mention-discord' : ''}`}>
             {token}
+            {isDiscordUser && <span className="ml-0.5 text-[8px] font-mono px-0.5 rounded bg-indigo-500/30 text-indigo-200">DC</span>}
           </span>
         );
         continue;

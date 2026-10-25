@@ -292,6 +292,11 @@ button:not(:disabled):active {
   background: rgba(245, 158, 11, 0.22);
   color: #fcd34d;
 }
+.mention-pill.mention-discord {
+  background: rgba(99, 102, 241, 0.22);
+  color: #a5b4fc;
+  border: 1px solid rgba(99, 102, 241, 0.35);
+}
 .mention-pill.channel-pill:hover {
   background: rgba(56, 189, 248, 0.28);
   text-decoration: underline;
@@ -313,6 +318,8 @@ button:not(:disabled):active {
 .markdown-body > :first-child { margin-top: 0; }
 .markdown-body > :last-child { margin-bottom: 0; }
 .markdown-body p { margin: 0.5em 0; }
+.msg-row .markdown-body { line-height: 1.5; }
+.msg-row .markdown-body p { margin: 0.15em 0; }
 .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
   color: #fff;
   font-weight: 700;

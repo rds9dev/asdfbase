@@ -1898,6 +1898,67 @@ app.delete('/api/discord/bindings', authMiddleware, async (req, res) => {
         res.status(500).json({ error: err.message || '同期解除に失敗しました' });
     }
 });
+// サーバー内のすべてのチャンネルを一括で同期 (自動チャンネル作成 & バインド & 履歴同期)
+app.post('/api/discord/sync-all-channels', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const { guildId } = req.body || {};
+        if (!guildId)
+            return res.status(400).json({ error: 'guildId が指定されていません' });
+        const servers = await (0, discord_js_1.getDiscordServers)(true);
+        const targetServer = servers.find(s => s.id === guildId);
+        if (!targetServer)
+            return res.status(404).json({ error: '対象のDiscordサーバーが見つかりません' });
+        const existingChannels = (await db_js_1.pool.query(`SELECT id, name, server_id FROM channels`)).rows;
+        let createdCount = 0;
+        let boundCount = 0;
+        for (const tc of targetServer.textChannels) {
+            if (tc.boundAsdfChannelId)
+                continue; // すでにバインド済み
+            // 既存の同名チャンネルを探す (同じサーバーID優先)
+            let targetAsdfCh = existingChannels.find(c => c.server_id === guildId && c.name.toLowerCase() === tc.name.toLowerCase())
+                || existingChannels.find(c => c.name.toLowerCase() === tc.name.toLowerCase());
+            if (!targetAsdfCh) {
+                // 新規チャンネルを作成
+                const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM channels`);
+                const nextPos = maxPosRes.rows[0].next_pos;
+                const ins = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id) VALUES ($1, 'text', $2, $3) RETURNING *`, [tc.name, nextPos, guildId]);
+                targetAsdfCh = ins.rows[0];
+                existingChannels.push(targetAsdfCh);
+                broadcast({ type: 'CHANNEL_CREATED', payload: targetAsdfCh });
+                createdCount++;
+            }
+            else if (!targetAsdfCh.server_id) {
+                // server_id を付与
+                await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2`, [guildId, targetAsdfCh.id]);
+                targetAsdfCh.server_id = guildId;
+                broadcast({ type: 'CHANNEL_UPDATED', payload: targetAsdfCh });
+            }
+            await (0, discord_js_1.addDiscordBinding)(tc.id, targetAsdfCh.id, guildId);
+            boundCount++;
+        }
+        const updatedServers = await (0, discord_js_1.getDiscordServers)(true);
+        const updatedStatus = await (0, discord_js_1.getDiscordStatus)();
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: updatedStatus });
+        // バックグラウンドで過去履歴を自動取得
+        (0, discord_js_1.syncDiscordHistory)({ guildId, limit: 50 }).catch(err => console.warn('[discord] bulk sync history error:', err.message));
+        logAudit(req.user, 'discord_sync_all', 'discord', null, {
+            guildId,
+            guildName: targetServer.name,
+            createdCount,
+            boundCount,
+        });
+        res.json({
+            success: true,
+            createdCount,
+            boundCount,
+            servers: updatedServers,
+            status: updatedStatus,
+        });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message || '一括同期に失敗しました' });
+    }
+});
 // Bot ダウンタイム後の未取得メッセージ履歴の手動・自動同期
 app.post('/api/discord/sync-history', authMiddleware, async (req, res) => {
     try {
@@ -1919,15 +1980,26 @@ function jstNowLabel() {
 }
 const PERSONA_PROMPTS = {
     standard: '前置きや締めの挨拶は省き、要点だけを日本語で簡潔に答えてください。',
+    default: '前置きや締めの挨拶は省き、要点だけを日本語で簡潔に答えてください。',
     teacher: 'あなたは優しくて頼れる中学校の先生です。中学生にも直感的にわかるよう、具体例を交えて丁寧に噛み砕いて教えてください。',
+    'やさしく丁寧に教える先生': 'あなたは優しくて頼れる中学校の先生です。中学生にも直感的にわかるよう、具体例を交えて丁寧に噛み砕いて教えてください。',
     friend: 'あなたは親しい同級生の友達です。タメ口でフランクに、親しみやすくカジュアルな口調で話してください。',
-    logical: 'あなたは論理的で無駄を嫌うエキスパートです。結論ファーストで、根拠と構造を明確にして無駄なく回答してください。',
-    enthusiastic: 'あなたはポジティブで明るい応援サポーターです。相手を褒めつつテンション高めに楽しく回答してください。',
+    'フレンドリーな友達（タメ口）': 'あなたは親しい同級生の友達です。タメ口でフランクに、親しみやすくカジュアルな口調で話してください。',
+    logical: 'あなたは論理的でストイックなコーチです。結論ファーストで、根拠と構造を明確にして回答してください。',
+    coach: 'あなたは論理的でストイックなコーチです。結論ファーストで、根拠と構造を明確にして回答してください。',
+    '厳格で論理的なコーチ': 'あなたは論理的でストイックなコーチです。結論ファーストで、根拠と構造を明確にして回答してください。',
+    enthusiastic: 'あなたはポジティブで明るい応援団です。相手を全力で肯定し褒めつつテンション高めに楽しく回答してください。',
+    cheer: 'あなたはポジティブで明るい応援団です。相手を全力で肯定し褒めつつテンション高めに楽しく回答してください。',
+    'ハイテンションな応援団': 'あなたはポジティブで明るい応援団です。相手を全力で肯定し褒めつつテンション高めに楽しく回答してください。',
+    tsundere: 'あなたは少し素直になれないツンデレなキャラクターです。ぶっきらぼうで強がりな口調ですが、心の中では相手を思いやっており、内容は親切にしっかり教えてください。ツンツンしつつも最後は少しデレてください。',
+    'ツンデレ風': 'あなたは少し素直になれないツンデレなキャラクターです。ぶっきらぼうで強がりな口調ですが、心の中では相手を思いやっており、内容は親切にしっかり教えてください。ツンツンしつつも最後は少しデレてください。',
+    kansai: 'あなたは親しみやすい関西弁のキャラクターです。自然な関西弁でテンポよく親身に回答してください。ツッコミやボケを適度に交えて楽しく話してください。',
+    '関西弁': 'あなたは親しみやすい関西弁のキャラクターです。自然な関西弁でテンポよく親身に回答してください。ツッコミやボケを適度に交えて楽しく話してください。',
 };
 function aiSystemInstruction(username, context, allowWrite, persona = 'standard', customPersona = '') {
-    const personaInstruction = persona === 'custom' && customPersona.trim()
+    const personaInstruction = (persona === 'custom' || (!PERSONA_PROMPTS[persona] && customPersona.trim())) && customPersona.trim()
         ? `【性格・口調の指定】以下のキャラクター・口調・ルールになりきって回答してください:\n${customPersona.trim().slice(0, 1000)}`
-        : (PERSONA_PROMPTS[persona] || PERSONA_PROMPTS.standard);
+        : (PERSONA_PROMPTS[persona] || (customPersona.trim() ? `【性格・口調の指定】\n${customPersona.trim().slice(0, 1000)}` : PERSONA_PROMPTS.standard));
     return [
         'あなたは中学生向けワークスペース「asdfbase」のAIアシスタントです。',
         `現在は ${jstNowLabel()} (日本時間)、話している相手は ${username} です。「明日」「来週の金曜」などはこの日時を基準に YYYY-MM-DD に直してください。`,
@@ -3506,6 +3578,9 @@ server.listen(PORT, async () => {
         await db_js_1.pool.query(`UPDATE users SET status = 'offline'`);
         await ensureNoteSlots();
         await ensureDefaultCustomEmojis();
+        // 既存の general 等の未割り当てチャンネルをデフォルトDiscordサーバー (2年団) に所属させる
+        const defaultGuildId = process.env.DISCORD_GUILD_ID?.split(',')[0]?.trim() || '1524703392927191100';
+        await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE server_id IS NULL OR server_id = ''`, [defaultGuildId]).catch(() => { });
     }
     catch (err) {
         console.error('DB Init failed:', err);
@@ -3516,7 +3591,7 @@ server.listen(PORT, async () => {
             setSetting,
             listAsdfChannels: async () => (await db_js_1.pool.query(`SELECT id, name, type, server_id FROM channels ORDER BY position ASC, id ASC`)).rows,
             assignChannelServer: async (asdfChannelId, guildId) => {
-                const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 AND LOWER(name) != 'general' RETURNING *`, [guildId, asdfChannelId]);
+                const upd = await db_js_1.pool.query(`UPDATE channels SET server_id = $1 WHERE id = $2 RETURNING *`, [guildId, asdfChannelId]);
                 if (upd.rows[0])
                     broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
             },

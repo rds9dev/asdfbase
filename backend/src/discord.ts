@@ -393,7 +393,9 @@ export interface DiscordTextChannelInfo {
   id: string;
   name: string;
   parentName: string | null;
+  type?: number;
   boundAsdfChannelId: number | null;
+  boundAsdfChannelName?: string | null;
 }
 
 export interface DiscordServerInfo {
@@ -498,20 +500,41 @@ export async function getDiscordServers(includeUnapproved = false): Promise<Disc
       }
     }
 
-    // テキストチャンネル一覧 (簡単紐付け用)
+    // テキスト & アナウンスチャンネル一覧 (簡単紐付け・サーバー別同期用)
     const textChannels: DiscordTextChannelInfo[] = [];
-    for (const channel of guild.channels.cache.values()) {
-      // GuildText (0) or GuildAnnouncement (5)
-      if ((channel as any).type === 0 || (channel as any).type === 5) {
+    let channelCollection: any = guild.channels.cache;
+    try {
+      channelCollection = await guild.channels.fetch();
+    } catch {
+      channelCollection = guild.channels.cache;
+    }
+    const asdfChannels = deps?.listAsdfChannels ? await deps.listAsdfChannels().catch(() => []) : [];
+    const asdfMap = new Map(asdfChannels.map(c => [c.id, c.name]));
+
+    for (const channel of channelCollection.values()) {
+      if (!channel) continue;
+      // GuildText (0) or GuildAnnouncement (5) or isTextBased
+      const chType = (channel as any).type;
+      if (chType === 0 || chType === 5 || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
         const binding = bindings.find(b => b.discordChannelId === channel.id);
+        const boundChId = binding ? binding.asdfChannelId : null;
         textChannels.push({
           id: channel.id,
           name: channel.name,
           parentName: (channel as any).parent?.name || null,
-          boundAsdfChannelId: binding ? binding.asdfChannelId : null,
+          type: chType,
+          boundAsdfChannelId: boundChId,
+          boundAsdfChannelName: boundChId ? (asdfMap.get(boundChId) || null) : null,
         });
       }
     }
+    // チャンネルを親カテゴリ名、名前順でソート
+    textChannels.sort((a, b) => {
+      const pA = a.parentName || '';
+      const pB = b.parentName || '';
+      if (pA !== pB) return pA.localeCompare(pB, 'ja');
+      return a.name.localeCompare(b.name, 'ja');
+    });
 
     // メンバー & オンライン状態
     let memberCollection = guild.members.cache;
@@ -882,13 +905,28 @@ export async function relayReactionToDiscord(discordChannelId: string, discordMe
     if (!ch || !('messages' in ch) || !isGuildAllowed((ch as any).guildId)) return;
     const msg = await (ch as any).messages.fetch(discordMessageId).catch(() => null);
     if (!msg) return;
+
+    const cleanName = emoji.replace(/^:+|:+$/g, '');
+    const rx = msg.reactions.resolve(emoji)
+      || msg.reactions.cache.find((r: any) =>
+          r.emoji.name === emoji ||
+          r.emoji.name === cleanName ||
+          r.emoji.identifier === emoji ||
+          r.emoji.toString() === emoji
+        );
+
     if (isRemove) {
-      const r = msg.reactions.resolve(emoji);
-      if (r && client.user) {
-        await r.users.remove(client.user.id).catch(() => {});
+      if (rx && client.user) {
+        await rx.users.remove(client.user.id).catch((err: any) => {
+          console.warn('[discord] failed to remove bot reaction:', err.message);
+        });
       }
     } else {
-      await msg.react(emoji).catch(() => {});
+      await msg.react(emoji).catch(async () => {
+        const guild = msg.guild;
+        const customEmoji = guild?.emojis.cache.find((e: any) => e.name === cleanName);
+        if (customEmoji) await msg.react(customEmoji).catch(() => {});
+      });
     }
   } catch (err: any) {
     console.warn('[discord] relayReaction failed:', err.message);
@@ -1031,11 +1069,13 @@ export async function startDiscordBot(d: DiscordDeps) {
     c.on(Events.MessageReactionAdd, async (reaction, user) => {
       try {
         if (user.bot) return;
-        const fullMsg = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+        const fullRx = reaction.partial ? await reaction.fetch().catch(() => reaction) : reaction;
+        const fullMsg = fullRx.message.partial ? await fullRx.message.fetch().catch(() => null) : fullRx.message;
         if (!fullMsg || !isGuildAllowed(fullMsg.guildId)) return;
-        const emoji = reaction.emoji.name;
+        const emoji = fullRx.emoji.name;
         if (!emoji || !deps?.ingestReaction) return;
-        await deps.ingestReaction(fullMsg.id, emoji, user.id, 'add');
+        const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
+        await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'add');
       } catch (err: any) {
         console.error('[discord] reactionAdd failed:', err.message);
       }
@@ -1043,11 +1083,13 @@ export async function startDiscordBot(d: DiscordDeps) {
     c.on(Events.MessageReactionRemove, async (reaction, user) => {
       try {
         if (user.bot) return;
-        const fullMsg = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+        const fullRx = reaction.partial ? await reaction.fetch().catch(() => reaction) : reaction;
+        const fullMsg = fullRx.message.partial ? await fullRx.message.fetch().catch(() => null) : fullRx.message;
         if (!fullMsg || !isGuildAllowed(fullMsg.guildId)) return;
-        const emoji = reaction.emoji.name;
+        const emoji = fullRx.emoji.name;
         if (!emoji || !deps?.ingestReaction) return;
-        await deps.ingestReaction(fullMsg.id, emoji, user.id, 'remove');
+        const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
+        await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'remove');
       } catch (err: any) {
         console.error('[discord] reactionRemove failed:', err.message);
       }

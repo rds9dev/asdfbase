@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { 
   Volume2,
   VolumeX,
@@ -617,6 +617,7 @@ export default function App() {
   const [boardTexts, setBoardTexts] = useState<any[]>([]);
   const [drawColor, setDrawColor] = useState<string>('#f59e0b');
   const [brushWidth, setBrushWidth] = useState<number>(3);
+  const [eraserWidth, setEraserWidth] = useState<number>(48);
   const [isDrawing, setIsDrawing] = useState(false);
   const [currentStrokePoints, setCurrentStrokePoints] = useState<{ x: number; y: number }[]>([]);
   const [boardMode, setBoardMode] = useState<'draw' | 'eraser' | 'text'>('draw');
@@ -1285,11 +1286,23 @@ export default function App() {
         setCalendarEvents(prev => prev.filter(e => e.id !== msg.payload.id));
       } else if (msg.type === 'BOARD_NEW_STROKE') {
         setBoardStrokes(prev => [...prev, msg.payload]);
+        if (canvasRef.current && activeTabRef.current === 'board') {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) drawStroke(ctx, msg.payload);
+        }
       } else if (msg.type === 'BOARD_NEW_TEXT') {
         setBoardTexts(prev => [...prev, msg.payload]);
+        if (canvasRef.current && activeTabRef.current === 'board') {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) drawText(ctx, msg.payload);
+        }
       } else if (msg.type === 'BOARD_CLEARED') {
         setBoardStrokes([]);
         setBoardTexts([]);
+        if (canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        }
       } else if (msg.type === 'CLIPBOARD_UPDATED') {
         setClipboardText(msg.payload.content);
         setClipboardUpdatedBy(msg.payload.updated_by);
@@ -2753,6 +2766,33 @@ export default function App() {
     }
   };
 
+  // サーバー内のすべてのチャンネルを一括で asdfbase と同期
+  const [isSyncingAllChannels, setIsSyncingAllChannels] = useState<boolean>(false);
+  const handleSyncAllChannels = async (guildId: string, guildName?: string) => {
+    if (!token || !guildId || isSyncingAllChannels) return;
+    setIsSyncingAllChannels(true);
+    try {
+      const res = await safeFetch('/api/discord/sync-all-channels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ guildId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '一括同期に失敗しました');
+      if (data.servers) setDiscordServers(data.servers);
+      if (data.status?.bindings) setDiscordBindings(data.status.bindings);
+      const chRes = await safeFetch('/api/channels', { headers: { Authorization: `Bearer ${token}` } });
+      const chData = await chRes.json().catch(() => null);
+      if (Array.isArray(chData)) setChannels(chData);
+      await loadIntegrations();
+      toast(`「${guildName || 'サーバー'}」の全チャンネル同期を開始しました (新規: ${data.createdCount}件, 紐付け: ${data.boundCount}件)`, { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message || '一括同期に失敗しました', { kind: 'error' });
+    } finally {
+      setIsSyncingAllChannels(false);
+    }
+  };
+
   // Discord 簡単チャンネル紐付け (admin/rds9 は即時、メンバーは承認申請)
   const handleRequestOrCreateDiscordBinding = async (opts: {
     guildId: string;
@@ -3529,7 +3569,7 @@ export default function App() {
     if (activeTab === 'board' && !isTimelapsePlaying) {
       redrawCanvas(boardStrokes, boardTexts);
     }
-  }, [activeTab, boardStrokes, boardTexts, isTimelapsePlaying]);
+  }, [activeTab, isTimelapsePlaying]);
 
   // 画面座標 → キャンバス内部座標 (1400x800)。表示サイズ・縦横比が端末ごとに違ってもズレないよう
   // object-contain の余白 (レターボックス) を考慮して変換する
@@ -3557,7 +3597,7 @@ export default function App() {
     ctx.save();
     if (boardMode === 'eraser') {
       ctx.globalCompositeOperation = 'destination-out';
-      ctx.lineWidth = brushWidth * 3;
+      ctx.lineWidth = eraserWidth;
     } else {
       ctx.strokeStyle = drawColor;
       ctx.lineWidth = width;
@@ -3581,7 +3621,7 @@ export default function App() {
     const p = getCanvasCoords(e);
     strokePointsRef.current = [p];
     setIsDrawing(true);
-    drawSegment(p, { x: p.x + 0.01, y: p.y + 0.01 }, brushWidth);
+    drawSegment(p, { x: p.x + 0.01, y: p.y + 0.01 }, boardMode === 'eraser' ? eraserWidth : brushWidth);
   };
 
   const handleCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -3596,7 +3636,7 @@ export default function App() {
       const last = pts[pts.length - 1];
       if (last && Math.abs(last.x - p.x) < 0.8 && Math.abs(last.y - p.y) < 0.8) continue;
       pts.push(p);
-      if (last) drawSegment(last, p, brushWidth);
+      if (last) drawSegment(last, p, boardMode === 'eraser' ? eraserWidth : brushWidth);
     }
   };
 
@@ -3619,7 +3659,7 @@ export default function App() {
         },
         body: JSON.stringify({
           color: boardMode === 'eraser' ? 'eraser' : drawColor,
-          width: boardMode === 'eraser' ? brushWidth * 3 : brushWidth,
+          width: boardMode === 'eraser' ? eraserWidth : brushWidth,
           points
         })
       });
@@ -3794,18 +3834,22 @@ export default function App() {
     }
   };
 
-  // general 以外のチャンネルは必ず Discord サーバーに振り分ける
+  const getMainServerId = (): string => {
+    const srv = discordServers.find(s => /2年|２年/.test(s.name || '')) || discordServers[0];
+    return srv?.id || '1524703392927191100';
+  };
+
+  // チャンネルを所属する Discord サーバーに振り分ける
   const resolveChannelServerId = (ch: ChannelItem): string => {
-    const chName = String(ch.name || '').toLowerCase();
-    if (chName === 'general') return 'all';
     if (ch.server_id) return ch.server_id;
     const b = discordBindings.find((x: any) => Number(x.asdfChannelId) === ch.id && x.guildId);
     if (b?.guildId) return b.guildId;
+    const chName = String(ch.name || '').toLowerCase();
     if (/rds9|bot/i.test(chName)) {
       const rds9Srv = discordServers.find(s => s.id === '1550475182643347466' || /rds9/i.test(s.name || ''));
       return rds9Srv?.id || '1550475182643347466';
     }
-    return discordServers[0]?.id || '1524703392927191100';
+    return getMainServerId();
   };
 
   useEffect(() => {
@@ -3962,16 +4006,43 @@ export default function App() {
   const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
   const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
 
+  const discordUsernames = useMemo(() => {
+    const s = new Set<string>();
+    for (const srv of discordServers) {
+      for (const m of (srv.members || [])) {
+        if (m.displayName) s.add(m.displayName);
+        if (m.username) s.add(m.username);
+      }
+    }
+    return s;
+  }, [discordServers]);
+
   // 補完候補
   const completionItems: { key: string; label: string; insert: string; sub?: string; avatar?: string | null; emojiUrl?: string }[] = (() => {
     if (!completion) return [];
     if (completion.kind === '@') {
-      const pool = [
+      const asdfPool = [
         { key: 'everyone', label: 'everyone', insert: '@everyone', sub: '全員に通知' },
         { key: 'gemini', label: 'gemini', insert: '@gemini', sub: 'AI に質問' },
-        ...onlineUsers.filter(u => u.id !== currentUser.id).map(u => ({ key: `u${u.id}`, label: u.username, insert: `@${u.username}`, avatar: u.avatar_url, sub: u.status === 'online' ? 'オンライン' : undefined })),
+        ...onlineUsers.filter(u => u.id !== currentUser.id).map(u => ({
+          key: `u${u.id}`,
+          label: u.username,
+          insert: `@${u.username}`,
+          avatar: u.avatar_url,
+          sub: u.status === 'online' ? 'asdfbase (オンライン)' : 'asdfbase メンバー',
+        })),
       ];
-      return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
+      const dcMembers = selectedServer?.members || [];
+      const dcPool: { key: string; label: string; insert: string; avatar?: string | null; sub?: string }[] = dcMembers.map((m: any) => ({
+        key: `dc-${m.id}`,
+        label: m.displayName || m.username,
+        insert: `@${m.displayName || m.username}`,
+        avatar: m.avatarUrl,
+        sub: `Discord (${m.status === 'online' ? 'オンライン' : m.status || 'メンバー'})`,
+      }));
+      const rankedAsdf = rankCandidates(asdfPool, completion.query, (x: any) => x.label).slice(0, 5);
+      const rankedDc = rankCandidates(dcPool, completion.query, (x: any) => x.label).slice(0, 5);
+      return [...rankedAsdf, ...rankedDc];
     }
     if (completion.kind === ':') {
       const customPool = customEmojisList.map(e => ({
@@ -4402,45 +4473,8 @@ export default function App() {
             {/* Channels Sidebar (左にサーバーレール + チャンネル一覧) */}
             {!isChannelsCollapsed && (
               <aside className="absolute md:static inset-y-0 left-0 z-40 w-80 md:w-72 lg:w-80 border-r border-stone-800 bg-[#0C0D10] flex flex-row shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
-                {/* 左端: Discord風 サーバーレール (プロキシ/ローカルキャッシュアイコン表示 & オンライン/VCバッジ) */}
+                {/* 左端: Discord風 サーバーレール (プロキシ/ローカルキャッシュアイコン表示 & VC/メンションバッジ) */}
                 <div className="w-12 border-r border-stone-800/80 bg-[#08090B] flex flex-col items-center py-2.5 gap-2 overflow-y-auto shrink-0 select-none">
-                  {(() => {
-                    const homeChs = channels.filter(c => c.type !== 'voice' && resolveChannelServerId(c) === 'all');
-                    const homeUnread = homeChs.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (unreadCounts[c.id] || 0)), 0);
-                    const homeMentions = homeChs.reduce((s, c) => s + (c.id === activeChannelId ? 0 : (mentionCounts[c.id] || 0)), 0);
-                    return (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSelectedServerId('all');
-                          if (homeChs.length > 0 && !homeChs.some(c => c.id === activeChannelId)) {
-                            setActiveChannelId(homeChs[0].id);
-                          }
-                        }}
-                        title="asdfbase ホーム (#general)"
-                        className={`relative w-9 h-9 rounded-2xl flex items-center justify-center font-['Space_Grotesk'] font-black text-sm transition ${
-                          selectedServerId === 'all'
-                            ? 'bg-amber-500 text-black rounded-xl shadow-[0_0_12px_rgba(245,158,11,0.35)]'
-                            : 'bg-[#14161C] text-stone-300 hover:bg-stone-800 hover:text-white hover:rounded-xl border border-stone-800'
-                        }`}
-                      >
-                        {selectedServerId === 'all' ? (
-                          <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-amber-400" />
-                        ) : homeUnread > 0 ? (
-                          <span className="absolute -left-1.5 w-1 h-2.5 rounded-r bg-white" />
-                        ) : null}
-                        <span>a.</span>
-                        {homeMentions > 0 && (
-                          <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center border border-[#08090B]">
-                            {homeMentions > 99 ? '99+' : homeMentions}
-                          </span>
-                        )}
-                      </button>
-                    );
-                  })()}
-
-                  <div className="w-6 h-px bg-stone-800 my-0.5 shrink-0" />
-
                   {discordServers.map((srv: any) => {
                     const isSelected = selectedServerId === srv.id;
                     const vcsList = Array.isArray(srv.voiceChannels) ? srv.voiceChannels : Array.isArray(srv.vcs) ? srv.vcs : [];
@@ -4458,7 +4492,7 @@ export default function App() {
                             setActiveChannelId(srvChannels[0].id);
                           }
                         }}
-                        title={`${srv.name} (${srv.onlineCount || 0}人オンライン / 全${srv.memberCount || 0}人${vcCount > 0 ? ` / VC ${vcCount}人` : ''})`}
+                        title={`${srv.name}${vcCount > 0 ? ` (VC ${vcCount}人)` : ''}`}
                         className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group ${
                           isSelected
                             ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
@@ -4493,14 +4527,6 @@ export default function App() {
                             🔊
                           </span>
                         ) : null}
-                        {srv.onlineCount > 0 && (
-                          <span
-                            className="absolute -bottom-1 -right-1 min-w-[15px] h-3.5 px-1 rounded-full bg-emerald-500 text-black text-[8px] font-extrabold leading-[14px] text-center border border-[#08090B]"
-                            title={`オンライン ${srv.onlineCount}人`}
-                          >
-                            {srv.onlineCount > 99 ? '99+' : srv.onlineCount}
-                          </span>
-                        )}
                       </button>
                     );
                   })}
@@ -4980,10 +5006,14 @@ export default function App() {
                       const created = new Date(m.created_at);
                       const prevCreated = prevMsg ? new Date(prevMsg.created_at) : null;
                       const isNewDay = !prevCreated || prevCreated.toDateString() !== created.toDateString();
+                      const isSamePerson = Boolean(
+                        (m.user_id && prevMsg?.user_id && m.user_id === prevMsg.user_id) ||
+                        (prevMsg && (prevMsg.sender_username || prevMsg.username) === senderName)
+                      );
                       // 同じ人が5分以内に連投した場合はアバター/名前を省略してまとめる
                       const isGrouped = Boolean(
                         prevMsg && !isNewDay && !isFirstUnread && !m.is_pinned && !prevMsg.is_pinned && !m.reply_to &&
-                        (prevMsg.sender_username || prevMsg.username) === senderName &&
+                        isSamePerson &&
                         created.getTime() - (prevCreated?.getTime() || 0) < 5 * 60 * 1000
                       );
                       const isMentioningMe = Boolean(
@@ -5042,7 +5072,7 @@ export default function App() {
                               msgLongPressRef.current = null;
                             }}
                             className={`msg-row flex items-start gap-2.5 sm:gap-3 group relative px-2 rounded-lg transition-colors hover:bg-white/[0.03] ${
-                              isGrouped ? 'py-0.5' : 'pt-2 pb-0.5 mt-1.5'
+                              isGrouped ? 'py-0' : 'pt-2 pb-0 mt-1'
                             } ${m.is_pinned ? 'bg-amber-500/5 border-l-2 border-amber-500/60' : ''} ${
                               isMentioningMe ? 'bg-amber-500/10 border-l-2 border-amber-400' : ''
                             } ${m.pending ? 'opacity-60' : ''} ${m.id > lastSeenAtMountRef.current || m.id < 0 ? 'anim-msg' : ''}`}
@@ -5166,6 +5196,7 @@ export default function App() {
                                           },
                                           token,
                                           customEmojis: customEmojisMap,
+                                          discordUsernames,
                                         }}
                                       />
                                     </div>
@@ -6470,17 +6501,33 @@ export default function App() {
                     )}
 
                     <span className="w-px h-4 bg-stone-800 mx-1" />
-                    {[2, 4, 8, 16].map(w => (
-                      <button
-                        key={w}
-                        onClick={() => setBrushWidth(w)}
-                        className={`px-2 py-0.5 rounded border transition ${
-                          brushWidth === w ? 'border-amber-400 text-amber-400' : 'border-stone-800 text-stone-500'
-                        }`}
-                      >
-                        {w}px
-                      </button>
-                    ))}
+                    {boardMode === 'eraser' ? (
+                      [16, 32, 64, 120].map(w => (
+                        <button
+                          key={w}
+                          onClick={() => setEraserWidth(w)}
+                          title={`消しゴムの太さ: ${w}px`}
+                          className={`px-2 py-0.5 rounded border text-xs transition ${
+                            eraserWidth === w ? 'border-amber-400 text-amber-400 font-bold bg-amber-500/10' : 'border-stone-800 text-stone-500 hover:text-stone-300'
+                          }`}
+                        >
+                          {w}px
+                        </button>
+                      ))
+                    ) : (
+                      [2, 4, 8, 16].map(w => (
+                        <button
+                          key={w}
+                          onClick={() => setBrushWidth(w)}
+                          title={`ペンの太さ: ${w}px`}
+                          className={`px-2 py-0.5 rounded border transition ${
+                            brushWidth === w ? 'border-amber-400 text-amber-400' : 'border-stone-800 text-stone-500'
+                          }`}
+                        >
+                          {w}px
+                        </button>
+                      ))
+                    )}
                   </div>
                 )}
 
@@ -7066,35 +7113,71 @@ export default function App() {
                         {integrations.bot?.guildName && <div className="text-stone-500">サーバー: {integrations.bot.guildName}</div>}
                         {integrations.bot?.intentWarning && <div className="text-amber-300">⚠ {integrations.bot.intentWarning}</div>}
                         {integrations.bot?.lastError && <div className="text-red-400">エラー: {integrations.bot.lastError}</div>}
-                        <div className="space-y-1">
-                          {(integrations.bot?.bindings || []).length === 0 ? (
-                            <div className="text-stone-500">同期中のチャンネルはありません</div>
+                        <div className="space-y-3">
+                          {discordServers.length === 0 ? (
+                            <div className="text-stone-500">参加中の Discord サーバーがありません</div>
                           ) : (
-                            integrations.bot.bindings.map((b: any) => (
-                              <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[#16181D] border border-stone-800">
-                                <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                                  <span className="text-indigo-300 font-bold">{b.discordGuildName ? `${b.discordGuildName} / ` : ''}#{b.discordChannelName}</span>
-                                  <span className="text-stone-600">⇔</span>
-                                  <span className="text-amber-300 font-bold">asdfbase #{b.asdfChannelName}</span>
-                                </div>
-                                {currentUser?.role === 'admin' && (
-                                  <div className="flex items-center gap-1 shrink-0">
-                                    <button
-                                      onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
-                                      className="px-2 py-1 rounded bg-stone-800 hover:bg-stone-700 text-stone-300 text-[10px]"
-                                    >
-                                      同期解除
-                                    </button>
-                                    <button
-                                      onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
-                                      className="px-2 py-1 rounded bg-red-950/50 hover:bg-red-900/50 border border-red-900 text-red-300 text-[10px]"
-                                    >
-                                      チャンネルごと削除
-                                    </button>
+                            discordServers.map((srv: any) => {
+                              const srvBindings = (integrations.bot?.bindings || []).filter((b: any) =>
+                                b.guildId === srv.id || b.discordGuildName === srv.name
+                              );
+                              return (
+                                <div key={srv.id} className="p-3.5 rounded-xl bg-[#16181D] border border-stone-800 space-y-2.5">
+                                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-800/80 pb-2">
+                                    <div className="flex items-center gap-2">
+                                      {srv.iconUrl ? (
+                                        <img src={toProxiedMediaUrl(srv.iconUrl, token)} alt="" className="w-5 h-5 rounded-lg object-cover" />
+                                      ) : (
+                                        <Server className="w-4 h-4 text-indigo-400" />
+                                      )}
+                                      <span className="font-bold text-white text-sm">{srv.name}</span>
+                                      <span className="text-[10px] text-stone-400">({srvBindings.length} チャンネル同期中)</span>
+                                    </div>
+                                    {currentUser?.role === 'admin' && (
+                                      <button
+                                        onClick={() => handleSyncAllChannels(srv.id, srv.name)}
+                                        disabled={isSyncingAllChannels}
+                                        className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-300 font-bold text-[11px] flex items-center gap-1 disabled:opacity-40"
+                                      >
+                                        <RefreshCw className={`w-3 h-3 ${isSyncingAllChannels ? 'animate-spin' : ''}`} />
+                                        全チャンネルを一括同期
+                                      </button>
+                                    )}
                                   </div>
-                                )}
-                              </div>
-                            ))
+                                  <div className="space-y-1.5">
+                                    {srvBindings.length === 0 ? (
+                                      <div className="text-stone-500 text-[11px] py-1">このサーバーで同期中のチャンネルはありません</div>
+                                    ) : (
+                                      srvBindings.map((b: any) => (
+                                        <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[#111214] border border-stone-800">
+                                          <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                                            <span className="text-indigo-300 font-bold">#{b.discordChannelName}</span>
+                                            <span className="text-stone-600">⇔</span>
+                                            <span className="text-amber-300 font-bold">asdfbase #{b.asdfChannelName}</span>
+                                          </div>
+                                          {currentUser?.role === 'admin' && (
+                                            <div className="flex items-center gap-1 shrink-0">
+                                              <button
+                                                onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
+                                                className="px-2 py-1 rounded bg-stone-800 hover:bg-stone-700 text-stone-300 text-[10px]"
+                                              >
+                                                同期解除
+                                              </button>
+                                              <button
+                                                onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
+                                                className="px-2 py-1 rounded bg-red-950/50 hover:bg-red-900/50 border border-red-900 text-red-300 text-[10px]"
+                                              >
+                                                チャンネルごと削除
+                                              </button>
+                                            </div>
+                                          )}
+                                        </div>
+                                      ))
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })
                           )}
                         </div>
                         <div className="flex flex-wrap gap-2">
@@ -7958,39 +8041,75 @@ export default function App() {
               )}
             </div>
 
-            {/* 現在のチャンネル同期一覧 & 解除 */}
-            {discordBindings.length > 0 && (
-              <div className="space-y-2 border-t border-stone-800 pt-3">
-                <div className="font-bold text-stone-300">現在同期中のチャンネル ({discordBindings.length})</div>
-                <div className="space-y-1.5">
-                  {discordBindings.map(b => (
-                    <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-[#16181D] border border-stone-800">
-                      <div className="min-w-0 flex items-center gap-2 flex-wrap">
-                        <span className="text-indigo-300 font-bold">{b.discordGuildName ? `${b.discordGuildName} / ` : ''}#{b.discordChannelName}</span>
-                        <span className="text-stone-500">⇔</span>
-                        <span className="text-amber-300 font-bold">asdfbase #{b.asdfChannelName}</span>
-                      </div>
-                      {currentUser.role === 'admin' && (
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
-                            className="px-2.5 py-1 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 text-[11px]"
-                          >
-                            同期解除
-                          </button>
-                          <button
-                            onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
-                            className="px-2.5 py-1 rounded-lg bg-red-950/50 hover:bg-red-900/60 border border-red-900 text-red-300 text-[11px]"
-                          >
-                            チャンネルごと削除
-                          </button>
+            {/* サーバーごとのチャンネル同期管理 & 一括同期 */}
+            <div className="space-y-3 border-t border-stone-800 pt-3">
+              <div className="font-bold text-stone-300">サーバーごとのチャンネル同期状況</div>
+              {discordServers.length === 0 ? (
+                <div className="text-stone-500 text-xs">接続中のサーバーがありません</div>
+              ) : (
+                discordServers.map((srv: any) => {
+                  const srvBindings = discordBindings.filter((b: any) =>
+                    b.guildId === srv.id || b.discordGuildName === srv.name
+                  );
+                  return (
+                    <div key={srv.id} className="p-3.5 rounded-xl bg-[#16181D] border border-stone-800 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-800/80 pb-2">
+                        <div className="flex items-center gap-2">
+                          {srv.iconUrl ? (
+                            <img src={toProxiedMediaUrl(srv.iconUrl, token)} alt="" className="w-5 h-5 rounded-lg object-cover" />
+                          ) : (
+                            <Server className="w-4 h-4 text-indigo-400" />
+                          )}
+                          <span className="font-bold text-white text-sm">{srv.name}</span>
+                          <span className="text-[10px] text-stone-400">({srvBindings.length} / {(srv.textChannels || []).length} チャンネル同期中)</span>
                         </div>
-                      )}
+                        {currentUser?.role === 'admin' && (
+                          <button
+                            onClick={() => handleSyncAllChannels(srv.id, srv.name)}
+                            disabled={isSyncingAllChannels}
+                            className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-300 font-bold text-[11px] flex items-center gap-1.5 disabled:opacity-40"
+                          >
+                            <RefreshCw className={`w-3 h-3 ${isSyncingAllChannels ? 'animate-spin' : ''}`} />
+                            このサーバーの全チャンネルを一括同期
+                          </button>
+                        )}
+                      </div>
+                      <div className="space-y-1.5">
+                        {srvBindings.length === 0 ? (
+                          <div className="text-stone-500 text-[11px] py-1">同期中のチャンネルはありません。「全チャンネルを一括同期」または上の簡単紐付けから追加できます。</div>
+                        ) : (
+                          srvBindings.map((b: any) => (
+                            <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[#111214] border border-stone-800">
+                              <div className="min-w-0 flex items-center gap-2 flex-wrap text-xs">
+                                <span className="text-indigo-300 font-bold">#{b.discordChannelName}</span>
+                                <span className="text-stone-600">⇔</span>
+                                <span className="text-amber-300 font-bold">asdfbase #{b.asdfChannelName}</span>
+                              </div>
+                              {currentUser?.role === 'admin' && (
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <button
+                                    onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
+                                    className="px-2 py-1 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-300 text-[10px]"
+                                  >
+                                    同期解除
+                                  </button>
+                                  <button
+                                    onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
+                                    className="px-2 py-1 rounded-lg bg-red-950/50 hover:bg-red-900/60 border border-red-900 text-red-300 text-[10px]"
+                                  >
+                                    削除
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          ))
+                        )}
+                      </div>
                     </div>
-                  ))}
-                </div>
-              </div>
-            )}
+                  );
+                })
+              )}
+            </div>
           </div>
         </div>
       )}

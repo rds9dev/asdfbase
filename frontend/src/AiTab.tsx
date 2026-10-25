@@ -40,13 +40,13 @@ interface PendingImage {
 }
 
 const PERSONA_OPTIONS = [
-  { id: 'default', label: '標準 (親切・簡潔)', short: '標準' },
-  { id: 'やさしく丁寧に教える先生', label: 'やさしい先生 (丁寧・わかりやすい)', short: '先生' },
-  { id: 'フレンドリーな友達（タメ口）', label: '友達・タメ口 (気軽・親しみやすい)', short: '友達' },
-  { id: '厳格で論理的なコーチ', label: '厳格コーチ (論理的・ストイック)', short: 'コーチ' },
-  { id: 'ハイテンションな応援団', label: 'ハイテンション応援団 (全力肯定)', short: '応援団' },
-  { id: 'ツンデレ風', label: 'ツンデレ', short: 'ツンデレ' },
-  { id: '関西弁', label: '関西弁', short: '関西弁' },
+  { id: 'standard', label: '標準 (親切・簡潔)', short: '標準' },
+  { id: 'teacher', label: 'やさしい先生 (丁寧・わかりやすい)', short: '先生' },
+  { id: 'friend', label: '友達・タメ口 (気軽・親しみやすい)', short: '友達' },
+  { id: 'coach', label: '厳格コーチ (論理的・ストイック)', short: 'コーチ' },
+  { id: 'cheer', label: 'ハイテンション応援団 (全力肯定)', short: '応援団' },
+  { id: 'tsundere', label: 'ツンデレ (ぶっきらぼう・心は親切)', short: 'ツンデレ' },
+  { id: 'kansai', label: '関西弁 (親しみやすい・テンポ良い)', short: '関西弁' },
   { id: 'custom', label: 'カスタム (自由入力)', short: 'カスタム' },
 ];
 
@@ -103,7 +103,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [messages, setMessages] = useState<AiMessage[]>(() => loadHistory(storageKey));
-  const [persona, setPersona] = useState<string>('default');
+  const [persona, setPersona] = useState<string>('standard');
   const [customPersona, setCustomPersona] = useState<string>('');
   const [showPersonaModal, setShowPersonaModal] = useState(false);
   const [editingThreadId, setEditingThreadId] = useState<number | null>(null);
@@ -347,8 +347,8 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
           images: sentImages.map(im => ({ mimeType: im.mimeType, data: im.data })),
           webSearch,
           modelMode,
-          persona: persona === 'custom' ? '' : persona === 'default' ? '' : persona,
-          customPersona: persona === 'custom' ? customPersona : customPersona,
+          persona,
+          customPersona,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -390,16 +390,16 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const clearHistory = async () => {
     if (messages.length === 0) return;
     const ok = await confirmDialog({
-      title: 'このスレッドの会話をクリアしますか？',
-      message: '現在開いているスレッドの会話履歴が消去されます。',
-      confirmLabel: 'クリアする',
+      title: 'このチャットを削除しますか？',
+      message: '現在開いているスレッドのチャット内容がすべて消去されます。',
+      confirmLabel: '削除する',
       danger: true,
     });
     if (!ok) return;
     setMessages([]);
     setReveal(null);
     await syncThreadToServer(activeThreadId, { messages: [] });
-    toast('会話をクリアしました', { kind: 'success' });
+    toast('チャットを削除しました', { kind: 'success' });
   };
 
   const activeThread = threads.find(t => t.id === activeThreadId);
@@ -597,10 +597,11 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
             <button
               onClick={clearHistory}
               disabled={messages.length === 0}
+              title="チャットを削除"
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-stone-800 bg-stone-900 text-stone-300 hover:text-red-300 hover:border-red-900/70 hover:bg-red-950/30 disabled:opacity-40"
             >
               <Trash2 className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">クリア</span>
+              <span className="hidden sm:inline">チャット削除</span>
             </button>
           </div>
         </div>
