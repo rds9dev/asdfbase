@@ -120,8 +120,11 @@ export function renderEmojiToken(
         title={`:${clean}:`}
         className={`${sizeClass} inline-block object-contain align-middle mx-0.5 select-none`}
         onError={(e) => {
-          // フォールバックでテキスト表示
-          (e.currentTarget as any).style.display = 'none';
+          const target = e.currentTarget;
+          const span = document.createElement('span');
+          span.textContent = unicode;
+          span.className = 'inline-block align-middle';
+          target.replaceWith(span);
         }}
       />
     );

@@ -4149,8 +4149,8 @@ export default function App() {
   const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
   const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
 
-  const canWriteActiveChannel = useMemo(() => {
-    if (currentUser.role === 'admin') return true;
+  const canWriteActiveChannel = (() => {
+    if (!currentUser || currentUser.role === 'admin') return true;
     if (!activeChannelObj) return true;
     const userRoles = [
       currentUser.role,
@@ -4182,9 +4182,9 @@ export default function App() {
     const writeRoles = Array.isArray(activeChannelObj.write_roles) ? activeChannelObj.write_roles : [];
     if (writeRoles.length === 0) return true;
     return writeRoles.some(r => userRoles.includes(r));
-  }, [currentUser, activeChannelObj]);
+  })();
 
-  const availableMemoSlots = useMemo(() => {
+  const availableMemoSlots = (() => {
     const list: { slot: number; title: string }[] = [];
     for (let i = 1; i <= 10; i++) {
       const slotObj = memoSlots.find(s => s.slot_index === i);
@@ -4194,7 +4194,7 @@ export default function App() {
       });
     }
     return list;
-  }, [memoSlots]);
+  })();
 
   // 補完候補
   const completionItems: { key: string; label: string; insert: string; sub?: string; avatar?: string | null; emojiUrl?: string }[] = (() => {
