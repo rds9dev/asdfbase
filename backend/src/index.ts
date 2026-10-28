@@ -11,8 +11,8 @@ import path from 'path';
 import fs from 'fs';
 import dns from 'dns';
 import { pool, initDb } from './db.js';
-import { askGemini, getAvailableKeyCount, runGeminiAgent, getAiUsageStats, type ModelMode } from './gemini.js';
-import { aiToolDeclarations, createAiToolRunner } from './aiTools.js';
+import { askGemini, getAvailableKeyCount, runGeminiAgent, getAiUsageStats, initAiUsageDb, onAiUsageUpdated, type ModelMode } from './gemini.js';
+import { aiToolDeclarations, createAiToolRunner, type DiffLine } from './aiTools.js';
 import type { Content } from '@google/genai';
 import {
   startDiscordBot, relayToDiscordBot, editRelayedOnDiscord, getDiscordStatus, getDiscordGuildStatus, refreshDiscordCommands, getBoundAsdfChannelIds,
@@ -196,11 +196,21 @@ export function logAudit(
   details: Record<string, any>,
   canRestore = false
 ) {
+  const uid = (user?.id && user.id > 0) ? user.id : null;
   pool.query(
     `INSERT INTO audit_logs (user_id, username, action, target_type, target_id, details, can_restore)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [user?.id || null, user?.username || 'system', action, targetType, targetId, JSON.stringify(details), canRestore]
-  ).catch(err => console.error('Audit log error:', err.message));
+    [uid, user?.username || 'system', action, targetType, targetId, JSON.stringify(details), canRestore]
+  ).catch(() => {
+    // 外部キー違反などの場合は user_id を null にしてフォールバック保存
+    if (uid !== null) {
+      pool.query(
+        `INSERT INTO audit_logs (user_id, username, action, target_type, target_id, details, can_restore)
+         VALUES (NULL, $1, $2, $3, $4, $5, $6)`,
+        [user?.username || 'system', action, targetType, targetId, JSON.stringify(details), canRestore]
+      ).catch(e => console.error('Audit log error:', e.message));
+    }
+  });
 }
 
 const UPLOAD_DIR = path.resolve('uploads');
@@ -618,19 +628,56 @@ async function getUserAllRoles(userId: number, fallbackRole = 'member'): Promise
   }
 }
 
-function checkChannelViewPermission(isAdmin: boolean, userRoles: string[], channel: any): boolean {
+export function checkDiscordChannelPermission(
+  isAdmin: boolean,
+  userRoles: string[],
+  channel: any,
+  action: 'view' | 'send' | 'attach' | 'manage' = 'send'
+): boolean {
   if (isAdmin) return true;
-  const viewRoles: string[] = Array.isArray(channel?.view_roles) ? channel.view_roles : [];
-  if (viewRoles.length === 0) return true;
-  return viewRoles.some(r => userRoles.includes(r));
+  const overwrites = Array.isArray(channel?.permissions_overwrites) ? channel.permissions_overwrites : [];
+
+  // 1. ロール固有の deny チェック (拒絶最優先)
+  for (const ow of overwrites) {
+    if (ow.role_id !== 'everyone' && userRoles.includes(ow.role_id) && Array.isArray(ow.deny) && ow.deny.includes(action)) {
+      return false;
+    }
+  }
+  // 2. ロール固有の allow チェック
+  for (const ow of overwrites) {
+    if (ow.role_id !== 'everyone' && userRoles.includes(ow.role_id) && Array.isArray(ow.allow) && ow.allow.includes(action)) {
+      return true;
+    }
+  }
+  // 3. @everyone の deny チェック
+  const everyoneOw = overwrites.find((o: any) => o.role_id === 'everyone');
+  if (everyoneOw && Array.isArray(everyoneOw.deny) && everyoneOw.deny.includes(action)) {
+    return false;
+  }
+  if (everyoneOw && Array.isArray(everyoneOw.allow) && everyoneOw.allow.includes(action)) {
+    return true;
+  }
+  // 4. 後方互換フォールバック (従来の view_roles / write_roles)
+  if (action === 'view') {
+    const viewRoles: string[] = Array.isArray(channel?.view_roles) ? channel.view_roles : [];
+    if (viewRoles.length === 0) return true;
+    return viewRoles.some((r: string) => userRoles.includes(r));
+  }
+  if (action === 'send') {
+    const writeRoles: string[] = Array.isArray(channel?.write_roles) ? channel.write_roles : [];
+    if (writeRoles.length === 0) return true;
+    return writeRoles.some((r: string) => userRoles.includes(r));
+  }
+  return true;
+}
+
+function checkChannelViewPermission(isAdmin: boolean, userRoles: string[], channel: any): boolean {
+  return checkDiscordChannelPermission(isAdmin, userRoles, channel, 'view');
 }
 
 function checkChannelWritePermission(isAdmin: boolean, userRoles: string[], channel: any): boolean {
-  if (isAdmin) return true;
   if (!checkChannelViewPermission(isAdmin, userRoles, channel)) return false;
-  const writeRoles: string[] = Array.isArray(channel?.write_roles) ? channel.write_roles : [];
-  if (writeRoles.length === 0) return true;
-  return writeRoles.some(r => userRoles.includes(r));
+  return checkDiscordChannelPermission(isAdmin, userRoles, channel, 'send');
 }
 
 // Channels API
@@ -687,7 +734,7 @@ app.post('/api/channels', authMiddleware, adminOnly, async (req: AuthRequest, re
 app.put('/api/channels/:id', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const { name, server_id, view_roles, write_roles } = req.body;
+    const { name, server_id, view_roles, write_roles, permissions_overwrites } = req.body;
     const curRes = await pool.query(`SELECT * FROM channels WHERE id = $1`, [id]);
     if (curRes.rows.length === 0) {
       return res.status(404).json({ error: 'チャンネルが見つかりません' });
@@ -704,10 +751,13 @@ app.put('/api/channels/:id', authMiddleware, adminOnly, async (req: AuthRequest,
     const nextServerId = server_id !== undefined ? (server_id ? String(server_id).trim() : null) : cur.server_id;
     const nextViewRoles = Array.isArray(view_roles) ? view_roles.map(String) : (cur.view_roles || []);
     const nextWriteRoles = Array.isArray(write_roles) ? write_roles.map(String) : (cur.write_roles || []);
+    const nextOverwrites = permissions_overwrites !== undefined
+      ? JSON.stringify(Array.isArray(permissions_overwrites) ? permissions_overwrites : [])
+      : JSON.stringify(cur.permissions_overwrites || []);
 
     const result = await pool.query(
-      `UPDATE channels SET name = $1, server_id = $2, view_roles = $3, write_roles = $4 WHERE id = $5 RETURNING *`,
-      [cleanName, nextServerId, JSON.stringify(nextViewRoles), JSON.stringify(nextWriteRoles), id]
+      `UPDATE channels SET name = $1, server_id = $2, view_roles = $3, write_roles = $4, permissions_overwrites = $5 WHERE id = $6 RETURNING *`,
+      [cleanName, nextServerId, JSON.stringify(nextViewRoles), JSON.stringify(nextWriteRoles), nextOverwrites, id]
     );
     const updatedChannel = result.rows[0];
     broadcast({ type: 'CHANNEL_UPDATED', payload: updatedChannel });
@@ -1786,7 +1836,162 @@ app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-// AI利用枠・統計取得 (5枠ローテーション & PTリセット)
+// ---------------- 非同期 AI ジョブ (Render タイムアウト & プロキシ対策) ----------------
+interface AiJob {
+  id: string;
+  userId: number;
+  threadId: number | null;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  progress: string;
+  result?: {
+    reply: string;
+    steps: any[];
+    modelUsed?: string;
+  };
+  error?: string;
+  createdAt: number;
+}
+
+const aiJobs = new Map<string, AiJob>();
+
+// 1時間以上経過した古いジョブを定期削除
+setInterval(() => {
+  const cutoff = Date.now() - 3600000;
+  for (const [id, job] of aiJobs.entries()) {
+    if (job.createdAt < cutoff) aiJobs.delete(id);
+  }
+}, 600000);
+
+app.post('/api/ai/jobs', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { messages, contextData, threadId, systemInstruction } = req.body;
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'messages is required' });
+    }
+
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const job: AiJob = {
+      id: jobId,
+      userId: req.user!.id,
+      threadId: threadId ? Number(threadId) : null,
+      status: 'pending',
+      progress: '処理を開始中...',
+      createdAt: Date.now(),
+    };
+    aiJobs.set(jobId, job);
+
+    // 即座に 202 Accepted を返却して HTTP タイムアウトを回避
+    res.status(202).json({ ok: true, jobId });
+
+    // バックグラウンドで AI 実行開始
+    (async () => {
+      try {
+        job.status = 'running';
+        const dynamicReferences: Record<string, any> = {};
+        const lastUserMsg = messages[messages.length - 1];
+        if (lastUserMsg && lastUserMsg.role === 'user') {
+          const text = String(lastUserMsg.content || '');
+          const memoMatches = Array.from(text.matchAll(/#memo-(\d+)/g));
+          for (const m of memoMatches) {
+            const slot = Number(m[1]);
+            const r = await pool.query(`SELECT slot_index, title, content, mode, updated_at FROM notes WHERE slot_index = $1`, [slot]);
+            if (r.rows[0]) dynamicReferences[`memo_${slot}`] = r.rows[0];
+          }
+        }
+
+        const mergedContext = {
+          ...(contextData || {}),
+          ...(Object.keys(dynamicReferences).length > 0 ? { dynamic_fetched_references: dynamicReferences } : {})
+        };
+
+        const images: { mimeType: string; data: string }[] = (Array.isArray(req.body.images) ? req.body.images : [])
+          .filter((im: any) => typeof im?.data === 'string' && /^image\/(png|jpeg|webp|gif)$/.test(im?.mimeType) && im.data.length < 7_000_000)
+          .slice(0, 4);
+
+        const history: Content[] = messages.slice(-30).map((m: any, i: number, arr: any[]) => {
+          const parts: NonNullable<Content['parts']> = [{ text: String(m.content || '').slice(0, 20000) || '(画像)' }];
+          if (i === arr.length - 1 && m.role === 'user') {
+            for (const im of images) parts.push({ inlineData: { mimeType: im.mimeType, data: im.data } });
+          }
+          return { role: m.role === 'model' ? 'model' : 'user', parts };
+        });
+
+        const allowWrite = req.body.allowActions !== false;
+        const modelMode: ModelMode = req.body.modelMode === 'thinking' ? 'thinking' : 'fast';
+        const persona: string = typeof req.body.persona === 'string' ? req.body.persona : 'standard';
+        const customPersona: string = typeof req.body.customPersona === 'string' ? req.body.customPersona : '';
+        const forceWebSearch = req.body.webSearch === true;
+
+        const runTool = createAiToolRunner({
+          pool,
+          baseUrl: `http://127.0.0.1:${PORT}`,
+          authHeader: String(req.headers.authorization),
+          userId: req.user!.id,
+          username: req.user!.username,
+          allowWrite,
+        });
+
+        const { text, steps, modelUsed } = await runGeminiAgent({
+          history,
+          mode: modelMode,
+          tools: aiToolDeclarations(allowWrite),
+          runTool,
+          forceFirstTool: forceWebSearch ? 'web_search' : undefined,
+          systemInstruction: systemInstruction || aiSystemInstruction(req.user!.username, mergedContext, allowWrite, persona, customPersona),
+          onProgress: (pMsg) => {
+            job.progress = pMsg;
+            publish({
+              type: 'AI_JOB_PROGRESS',
+              payload: { jobId, message: pMsg, threadId: job.threadId },
+            }, { targetUserId: req.user!.id });
+          },
+        });
+
+        if (steps.some(st => st.write && st.ok)) {
+          logAudit(req.user!, 'ai_action', 'ai', null, { message: `AI が操作を実行: ${steps.filter(st => st.write && st.ok).map(st => st.label).join(' / ')}` });
+        }
+
+        job.status = 'completed';
+        job.result = { reply: text, steps, modelUsed };
+
+        publish({
+          type: 'AI_JOB_COMPLETED',
+          payload: {
+            jobId,
+            threadId: job.threadId,
+            reply: text,
+            steps,
+            modelUsed,
+          },
+        }, { targetUserId: req.user!.id });
+
+      } catch (err: any) {
+        console.error('[AI Job Error]', err);
+        job.status = 'failed';
+        job.error = err.message || 'AI 応答に失敗しました';
+        publish({
+          type: 'AI_JOB_FAILED',
+          payload: {
+            jobId,
+            threadId: job.threadId,
+            error: job.error,
+          },
+        }, { targetUserId: req.user!.id });
+      }
+    })();
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'ジョブの開始に失敗しました' });
+  }
+});
+
+app.get('/api/ai/jobs/:jobId', authMiddleware, (req: AuthRequest, res) => {
+  const job = aiJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+  if (job.userId !== req.user!.id && req.user!.role !== 'admin') {
+    return res.status(403).json({ error: '権限がありません' });
+  }
+  res.json(job);
+});
 app.get('/api/ai/usage', authMiddleware, (_req, res) => {
   res.json(getAiUsageStats());
 });
@@ -3958,6 +4163,11 @@ server.listen(PORT, async () => {
   console.log(`[asdfbase-backend] Server listening on http://127.0.0.1:${PORT}`);
   try {
     await initDb();
+    await pool.query(`ALTER TABLE channels ADD COLUMN IF NOT EXISTS permissions_overwrites JSONB DEFAULT '[]'`).catch(() => {});
+    await initAiUsageDb(pool);
+    onAiUsageUpdated(() => {
+      broadcast({ type: 'AI_USAGE_UPDATED', payload: getAiUsageStats() });
+    });
     // 再起動直後は全員オフライン扱いにし、接続/アクセスで復帰させる
     await pool.query(`UPDATE users SET status = 'offline'`);
     await ensureNoteSlots();
@@ -4021,6 +4231,10 @@ server.listen(PORT, async () => {
         }
         const [attached] = await attachReplies([{ ...saved, sender_username: username }]);
         broadcast({ type: 'NEW_MESSAGE', payload: attached });
+        // Discord から届いたメッセージで @gemini または Bot メンションがあれば AI 返信を起動
+        if (/@gemini\b/i.test(String(content || '')) || /<@!?\d+>/.test(String(content || ''))) {
+          replyAsGemini(asdfChannelId, attached);
+        }
       },
       ingestEdit: async (discordMessageId, content) => {
         const rows = (await pool.query(

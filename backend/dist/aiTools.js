@@ -1,5 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.generateLineDiff = generateLineDiff;
 exports.aiToolDeclarations = aiToolDeclarations;
 exports.createAiToolRunner = createAiToolRunner;
 // AI が asdfbase のデータを読んだり、頼まれた操作を実行するためのツール群
@@ -7,6 +8,48 @@ exports.createAiToolRunner = createAiToolRunner;
 const genai_1 = require("@google/genai");
 const schedule_js_1 = require("./schedule.js");
 const webSearch_js_1 = require("./webSearch.js");
+function generateLineDiff(oldText, newText) {
+    const oldLines = (oldText || '').split('\n');
+    const newLines = (newText || '').split('\n');
+    const m = oldLines.length;
+    const n = newLines.length;
+    // 行数が多すぎる場合は簡易プレビュー
+    if (m > 500 || n > 500) {
+        return [
+            ...oldLines.slice(0, 100).map(t => ({ type: 'del', text: t })),
+            ...newLines.slice(0, 100).map(t => ({ type: 'add', text: t })),
+        ];
+    }
+    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = 0; i < m; i++) {
+        for (let j = 0; j < n; j++) {
+            if (oldLines[i] === newLines[j]) {
+                dp[i + 1][j + 1] = dp[i][j] + 1;
+            }
+            else {
+                dp[i + 1][j + 1] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+            }
+        }
+    }
+    let i = m, j = n;
+    const trace = [];
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+            trace.push({ type: 'same', text: oldLines[i - 1] });
+            i--;
+            j--;
+        }
+        else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+            trace.push({ type: 'add', text: newLines[j - 1] });
+            j--;
+        }
+        else if (i > 0 && (j === 0 || dp[i][j - 1] < dp[i - 1][j])) {
+            trace.push({ type: 'del', text: oldLines[i - 1] });
+            i--;
+        }
+    }
+    return trace.reverse();
+}
 const DAY = ['日', '月', '火', '水', '木', '金', '土'];
 const SCHEDULE_LABELS = { normal: '通常時程', short: '短縮時程', s_short: 'S短時程' };
 const STATUS_LABELS = {
@@ -200,6 +243,80 @@ const WRITE_TOOLS = [
                 text: { type: genai_1.Type.STRING },
             },
             required: ['slot', 'text'],
+        },
+    },
+    {
+        name: 'write_note',
+        description: 'メモの新規作成または本文・タイトルの書き換え。修正・要約・コード編集時に使う。変更前後の差分がユーザーにプレビューされます。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                slot: { type: genai_1.Type.INTEGER, description: 'メモ番号 (1〜10、またはユーザー専用番号)' },
+                title: { type: genai_1.Type.STRING, description: 'メモのタイトル (省略時は既存のまま)' },
+                content: { type: genai_1.Type.STRING, description: '新しいメモの本文全文' },
+                mode: { type: genai_1.Type.STRING, enum: ['markdown', 'plain', 'monaco'], description: 'エディタモード' },
+            },
+            required: ['slot', 'content'],
+        },
+    },
+    {
+        name: 'set_homework_done',
+        description: '宿題の完了状態を切り替える (例: 「数学の宿題終わった」)。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                homework_id: { type: genai_1.Type.INTEGER, description: '宿題ID' },
+                done: { type: genai_1.Type.BOOLEAN, description: 'true=完了、false=未完了' },
+            },
+            required: ['homework_id', 'done'],
+        },
+    },
+    {
+        name: 'delete_homework',
+        description: '宿題を削除する。頼まれたときだけ使う。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                homework_id: { type: genai_1.Type.INTEGER },
+            },
+            required: ['homework_id'],
+        },
+    },
+    {
+        name: 'record_test_score',
+        description: 'テストの点数を記録・登録する (中間・期末・学年末・診断)。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                exam_type: { type: genai_1.Type.STRING, enum: ['midterm', 'final', 'yearend', 'diagnostic'] },
+                subject: { type: genai_1.Type.STRING, description: '国語 数学 英語 理科 社会 音楽 美術 保健体育 技術 家庭 など' },
+                score: { type: genai_1.Type.INTEGER, description: '0〜100点' },
+                class_average: { type: genai_1.Type.INTEGER, description: '平均点 (任意)' },
+            },
+            required: ['exam_type', 'subject', 'score'],
+        },
+    },
+    {
+        name: 'send_channel_message',
+        description: '指定チャンネルにメッセージを代理送信する。ユーザーがチャットへの連絡・投稿を頼んだときだけ使う。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                channel: { type: genai_1.Type.STRING, description: 'チャンネル名 (例: 雑談, 連絡)' },
+                message: { type: genai_1.Type.STRING, description: '送信するメッセージ本文' },
+            },
+            required: ['channel', 'message'],
+        },
+    },
+    {
+        name: 'delete_calendar_event',
+        description: 'カレンダーの予定を削除する。頼まれたときだけ使う。',
+        parameters: {
+            type: genai_1.Type.OBJECT,
+            properties: {
+                event_id: { type: genai_1.Type.INTEGER, description: '予定ID' },
+            },
+            required: ['event_id'],
         },
     },
 ];
@@ -453,11 +570,102 @@ function createAiToolRunner(ctx) {
             if (!text)
                 throw new Error('追記する文章が空です');
             const current = String(note.content || '');
+            const newContent = current ? `${current.replace(/\s+$/, '')}\n\n${text}` : text;
             await api(`/api/notes/${note.slot_index}`, {
                 method: 'PUT',
-                body: { title: note.title, content: current ? `${current.replace(/\s+$/, '')}\n\n${text}` : text, mode: note.mode },
+                body: { title: note.title, content: newContent, mode: note.mode },
             });
-            return { label: `メモ #${note.slot_index}「${note.title || '無題'}」に追記`, result: { ok: true } };
+            return {
+                label: `メモ #${note.slot_index}「${note.title || '無題'}」に追記`,
+                result: { ok: true },
+                diff: {
+                    target: `メモ #${note.slot_index}「${note.title || '無題'}」`,
+                    slot: note.slot_index,
+                    oldText: current,
+                    newText: newContent,
+                    lines: generateLineDiff(current, newContent),
+                },
+            };
+        },
+        async write_note(args) {
+            const slot = Number(args.slot);
+            const rows = await api('/api/notes');
+            const note = rows.find(n => n.slot_index === slot);
+            const oldContent = note ? String(note.content || '') : '';
+            const newContent = String(args.content || '');
+            const title = args.title ? String(args.title).slice(0, 100) : (note?.title || `メモ #${slot}`);
+            const mode = args.mode || note?.mode || 'markdown';
+            const lines = generateLineDiff(oldContent, newContent);
+            await api(`/api/notes/${slot}`, {
+                method: 'PUT',
+                body: { title, content: newContent, mode },
+            });
+            return {
+                label: `メモ #${slot}「${title}」を更新`,
+                result: { ok: true, slot, title },
+                diff: {
+                    target: `メモ #${slot}「${title}」`,
+                    slot,
+                    oldText: oldContent,
+                    newText: newContent,
+                    lines,
+                },
+            };
+        },
+        async set_homework_done(args) {
+            const hwId = Number(args.homework_id);
+            const done = Boolean(args.done);
+            await api(`/api/homework/${hwId}/done`, {
+                method: 'PUT',
+                body: { done },
+            });
+            return {
+                label: `宿題 #${hwId} を「${done ? '完了' : '未完了'}」に設定`,
+                result: { ok: true, homework_id: hwId, done },
+            };
+        },
+        async delete_homework(args) {
+            const hwId = Number(args.homework_id);
+            await api(`/api/homework/${hwId}`, { method: 'DELETE' });
+            return { label: `宿題 #${hwId} を削除`, result: { ok: true, homework_id: hwId } };
+        },
+        async record_test_score(args) {
+            const score = Math.max(0, Math.min(100, Number(args.score)));
+            await api('/api/test-scores', {
+                method: 'POST',
+                body: {
+                    examType: args.exam_type,
+                    subject: args.subject,
+                    score,
+                    classAverage: args.class_average !== undefined ? Number(args.class_average) : undefined,
+                },
+            });
+            const examLabel = EXAM_LABELS[args.exam_type] || args.exam_type;
+            return {
+                label: `${examLabel}テスト ${args.subject}: ${score}点を記録`,
+                result: { ok: true, exam: examLabel, subject: args.subject, score },
+            };
+        },
+        async send_channel_message(args) {
+            const ch = await findChannel(args.channel);
+            if (!ch)
+                throw new Error(`チャンネル「${args.channel}」が見つかりません`);
+            const content = String(args.message || '').trim();
+            if (!content)
+                throw new Error('メッセージが空です');
+            await api(`/api/channels/${ch.id}/messages`, {
+                method: 'POST',
+                body: { content },
+            });
+            return {
+                label: `#${ch.name} へメッセージを送信: ${content.slice(0, 30)}...`,
+                result: { ok: true, channel: ch.name },
+            };
+        },
+        async delete_calendar_event(args) {
+            const id = Number(args.event_id);
+            await api(`/api/calendar/${id}`, { method: 'DELETE' });
+            return { label: `カレンダー予定 #${id} を削除`, result: { ok: true, event_id: id } };
         },
     };
     return async function run(name, args) {
@@ -467,8 +675,10 @@ function createAiToolRunner(ctx) {
             return { step: { name, label: `${name} (使えません)`, ok: false, write }, response: { error: 'このツールは使えません' } };
         }
         try {
-            const { label, result } = await handler(args || {});
-            return { step: { name, label, ok: true, write }, response: { result } };
+            const res = await handler(args || {});
+            const { label, result } = res;
+            const diff = res.diff;
+            return { step: { name, label, ok: true, write, diff }, response: { result } };
         }
         catch (err) {
             return { step: { name, label: `${name}: ${err.message}`, ok: false, write }, response: { error: err.message } };

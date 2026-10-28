@@ -14,11 +14,68 @@ export interface AiToolContext {
   allowWrite: boolean;
 }
 
+export interface DiffLine {
+  type: 'same' | 'add' | 'del';
+  text: string;
+}
+
+export function generateLineDiff(oldText: string, newText: string): DiffLine[] {
+  const oldLines = (oldText || '').split('\n');
+  const newLines = (newText || '').split('\n');
+  const m = oldLines.length;
+  const n = newLines.length;
+
+  // 行数が多すぎる場合は簡易プレビュー
+  if (m > 500 || n > 500) {
+    return [
+      ...oldLines.slice(0, 100).map(t => ({ type: 'del' as const, text: t })),
+      ...newLines.slice(0, 100).map(t => ({ type: 'add' as const, text: t })),
+    ];
+  }
+
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
+  for (let i = 0; i < m; i++) {
+    for (let j = 0; j < n; j++) {
+      if (oldLines[i] === newLines[j]) {
+        dp[i + 1][j + 1] = dp[i][j] + 1;
+      } else {
+        dp[i + 1][j + 1] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  let i = m, j = n;
+  const trace: DiffLine[] = [];
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      trace.push({ type: 'same', text: oldLines[i - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      trace.push({ type: 'add', text: newLines[j - 1] });
+      j--;
+    } else if (i > 0 && (j === 0 || dp[i][j - 1] < dp[i - 1][j])) {
+      trace.push({ type: 'del', text: oldLines[i - 1] });
+      i--;
+    }
+  }
+
+  return trace.reverse();
+}
+
 export interface AiToolStep {
   name: string;
   label: string;
   ok: boolean;
   write: boolean;
+  diff?: {
+    target: string;
+    slot?: number;
+    oldText: string;
+    newText: string;
+    lines: DiffLine[];
+  };
 }
 
 const DAY = ['日', '月', '火', '水', '木', '金', '土'];
@@ -217,6 +274,80 @@ const WRITE_TOOLS: FunctionDeclaration[] = [
         text: { type: Type.STRING },
       },
       required: ['slot', 'text'],
+    },
+  },
+  {
+    name: 'write_note',
+    description: 'メモの新規作成または本文・タイトルの書き換え。修正・要約・コード編集時に使う。変更前後の差分がユーザーにプレビューされます。',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        slot: { type: Type.INTEGER, description: 'メモ番号 (1〜10、またはユーザー専用番号)' },
+        title: { type: Type.STRING, description: 'メモのタイトル (省略時は既存のまま)' },
+        content: { type: Type.STRING, description: '新しいメモの本文全文' },
+        mode: { type: Type.STRING, enum: ['markdown', 'plain', 'monaco'], description: 'エディタモード' },
+      },
+      required: ['slot', 'content'],
+    },
+  },
+  {
+    name: 'set_homework_done',
+    description: '宿題の完了状態を切り替える (例: 「数学の宿題終わった」)。',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        homework_id: { type: Type.INTEGER, description: '宿題ID' },
+        done: { type: Type.BOOLEAN, description: 'true=完了、false=未完了' },
+      },
+      required: ['homework_id', 'done'],
+    },
+  },
+  {
+    name: 'delete_homework',
+    description: '宿題を削除する。頼まれたときだけ使う。',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        homework_id: { type: Type.INTEGER },
+      },
+      required: ['homework_id'],
+    },
+  },
+  {
+    name: 'record_test_score',
+    description: 'テストの点数を記録・登録する (中間・期末・学年末・診断)。',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        exam_type: { type: Type.STRING, enum: ['midterm', 'final', 'yearend', 'diagnostic'] },
+        subject: { type: Type.STRING, description: '国語 数学 英語 理科 社会 音楽 美術 保健体育 技術 家庭 など' },
+        score: { type: Type.INTEGER, description: '0〜100点' },
+        class_average: { type: Type.INTEGER, description: '平均点 (任意)' },
+      },
+      required: ['exam_type', 'subject', 'score'],
+    },
+  },
+  {
+    name: 'send_channel_message',
+    description: '指定チャンネルにメッセージを代理送信する。ユーザーがチャットへの連絡・投稿を頼んだときだけ使う。',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        channel: { type: Type.STRING, description: 'チャンネル名 (例: 雑談, 連絡)' },
+        message: { type: Type.STRING, description: '送信するメッセージ本文' },
+      },
+      required: ['channel', 'message'],
+    },
+  },
+  {
+    name: 'delete_calendar_event',
+    description: 'カレンダーの予定を削除する。頼まれたときだけ使う。',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        event_id: { type: Type.INTEGER, description: '予定ID' },
+      },
+      required: ['event_id'],
     },
   },
 ];
@@ -491,11 +622,109 @@ export function createAiToolRunner(ctx: AiToolContext) {
       const text = String(args.text || '').trim();
       if (!text) throw new Error('追記する文章が空です');
       const current = String(note.content || '');
+      const newContent = current ? `${current.replace(/\s+$/, '')}\n\n${text}` : text;
       await api(`/api/notes/${note.slot_index}`, {
         method: 'PUT',
-        body: { title: note.title, content: current ? `${current.replace(/\s+$/, '')}\n\n${text}` : text, mode: note.mode },
+        body: { title: note.title, content: newContent, mode: note.mode },
       });
-      return { label: `メモ #${note.slot_index}「${note.title || '無題'}」に追記`, result: { ok: true } };
+      return {
+        label: `メモ #${note.slot_index}「${note.title || '無題'}」に追記`,
+        result: { ok: true },
+        diff: {
+          target: `メモ #${note.slot_index}「${note.title || '無題'}」`,
+          slot: note.slot_index,
+          oldText: current,
+          newText: newContent,
+          lines: generateLineDiff(current, newContent),
+        },
+      };
+    },
+
+    async write_note(args) {
+      const slot = Number(args.slot);
+      const rows: any[] = await api('/api/notes');
+      const note = rows.find(n => n.slot_index === slot);
+      const oldContent = note ? String(note.content || '') : '';
+      const newContent = String(args.content || '');
+      const title = args.title ? String(args.title).slice(0, 100) : (note?.title || `メモ #${slot}`);
+      const mode = args.mode || note?.mode || 'markdown';
+
+      const lines = generateLineDiff(oldContent, newContent);
+
+      await api(`/api/notes/${slot}`, {
+        method: 'PUT',
+        body: { title, content: newContent, mode },
+      });
+
+      return {
+        label: `メモ #${slot}「${title}」を更新`,
+        result: { ok: true, slot, title },
+        diff: {
+          target: `メモ #${slot}「${title}」`,
+          slot,
+          oldText: oldContent,
+          newText: newContent,
+          lines,
+        },
+      };
+    },
+
+    async set_homework_done(args) {
+      const hwId = Number(args.homework_id);
+      const done = Boolean(args.done);
+      await api(`/api/homework/${hwId}/done`, {
+        method: 'PUT',
+        body: { done },
+      });
+      return {
+        label: `宿題 #${hwId} を「${done ? '完了' : '未完了'}」に設定`,
+        result: { ok: true, homework_id: hwId, done },
+      };
+    },
+
+    async delete_homework(args) {
+      const hwId = Number(args.homework_id);
+      await api(`/api/homework/${hwId}`, { method: 'DELETE' });
+      return { label: `宿題 #${hwId} を削除`, result: { ok: true, homework_id: hwId } };
+    },
+
+    async record_test_score(args) {
+      const score = Math.max(0, Math.min(100, Number(args.score)));
+      await api('/api/test-scores', {
+        method: 'POST',
+        body: {
+          examType: args.exam_type,
+          subject: args.subject,
+          score,
+          classAverage: args.class_average !== undefined ? Number(args.class_average) : undefined,
+        },
+      });
+      const examLabel = EXAM_LABELS[args.exam_type] || args.exam_type;
+      return {
+        label: `${examLabel}テスト ${args.subject}: ${score}点を記録`,
+        result: { ok: true, exam: examLabel, subject: args.subject, score },
+      };
+    },
+
+    async send_channel_message(args) {
+      const ch = await findChannel(args.channel);
+      if (!ch) throw new Error(`チャンネル「${args.channel}」が見つかりません`);
+      const content = String(args.message || '').trim();
+      if (!content) throw new Error('メッセージが空です');
+      await api(`/api/channels/${ch.id}/messages`, {
+        method: 'POST',
+        body: { content },
+      });
+      return {
+        label: `#${ch.name} へメッセージを送信: ${content.slice(0, 30)}...`,
+        result: { ok: true, channel: ch.name },
+      };
+    },
+
+    async delete_calendar_event(args) {
+      const id = Number(args.event_id);
+      await api(`/api/calendar/${id}`, { method: 'DELETE' });
+      return { label: `カレンダー予定 #${id} を削除`, result: { ok: true, event_id: id } };
     },
   };
 
@@ -506,8 +735,10 @@ export function createAiToolRunner(ctx: AiToolContext) {
       return { step: { name, label: `${name} (使えません)`, ok: false, write }, response: { error: 'このツールは使えません' } };
     }
     try {
-      const { label, result } = await handler(args || {});
-      return { step: { name, label, ok: true, write }, response: { result } };
+      const res = await handler(args || {});
+      const { label, result } = res;
+      const diff = (res as any).diff;
+      return { step: { name, label, ok: true, write, diff }, response: { result } };
     } catch (err: any) {
       return { step: { name, label: `${name}: ${err.message}`, ok: false, write }, response: { error: err.message } };
     }

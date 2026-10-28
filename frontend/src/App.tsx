@@ -134,6 +134,12 @@ interface RoleDefinition {
   system?: boolean;
 }
 
+export interface PermissionOverwrite {
+  role_id: string;
+  allow: string[];
+  deny: string[];
+}
+
 interface ChannelItem {
   id: number;
   name: string;
@@ -142,6 +148,7 @@ interface ChannelItem {
   server_id?: string | null;
   view_roles?: string[];
   write_roles?: string[];
+  permissions_overwrites?: PermissionOverwrite[];
 }
 
 interface Message {
@@ -425,10 +432,21 @@ export default function App() {
     { id: 'member', name: 'メンバー', color: '#64748b', system: true },
   ]);
   const [channelPermModal, setChannelPermModal] = useState<ChannelItem | null>(null);
+  const [channelSettingsTab, setChannelSettingsTab] = useState<'overview' | 'permissions'>('overview');
+  const [selectedPermRoleId, setSelectedPermRoleId] = useState<string>('everyone');
+  const [isAiJobRunning, setIsAiJobRunning] = useState<boolean>(false);
+  const [hasUnreadAiResult, setHasUnreadAiResult] = useState<boolean>(false);
+  const [aiJobProgressText, setAiJobProgressText] = useState<string | null>(null);
   const [showRoleManagerModal, setShowRoleManagerModal] = useState<boolean>(false);
   const [newRoleIdInput, setNewRoleIdInput] = useState<string>('');
   const [newRoleNameInput, setNewRoleNameInput] = useState<string>('');
   const [newRoleColorInput, setNewRoleColorInput] = useState<string>('#10b981');
+
+  useEffect(() => {
+    if (activeTab === 'ai') {
+      setHasUnreadAiResult(false);
+    }
+  }, [activeTab]);
 
   // Markdown プレビュー & エディタのスクロール同期用 Ref
   const memoTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1391,10 +1409,25 @@ export default function App() {
         const { id, userId, done, doneCount } = msg.payload;
         setHomework(prev => prev.map(h => (h.id === id ? { ...h, done_count: doneCount, my_done: userId === currentUserRef.current?.id ? done : h.my_done } : h)));
       } else if (msg.type === 'NOTE_CONTENT_SYNC') {
-        if (msg.payload.slotIndex === selectedSlotIndexRef.current) {
-          setMemoContent(msg.payload.content);
-          if (msg.payload.title) setMemoTitle(msg.payload.title);
+        const { slotIndex, content, title } = msg.payload;
+        setMemoSlots(prev => prev.map(s => s.slot_index === slotIndex ? { ...s, content, title: title || s.title } : s));
+        if (slotIndex === selectedSlotIndexRef.current && !memoDirtyRef.current) {
+          setMemoContent(content);
+          if (title) setMemoTitle(title);
         }
+      } else if (msg.type === 'AI_JOB_PROGRESS') {
+        setAiJobProgressText(msg.payload.message || '処理中…');
+      } else if (msg.type === 'AI_JOB_COMPLETED') {
+        setIsAiJobRunning(false);
+        setAiJobProgressText(null);
+        if (activeTabRef.current !== 'ai') {
+          setHasUnreadAiResult(true);
+          toast('AI の処理が完了しました', { kind: 'success' });
+        }
+      } else if (msg.type === 'AI_JOB_FAILED') {
+        setIsAiJobRunning(false);
+        setAiJobProgressText(null);
+        toast(`AI 処理エラー: ${msg.payload.error || '失敗しました'}`, { kind: 'error' });
       } else if (msg.type === 'USER_DELETED') {
         setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
       } else if (msg.type === 'USER_PREFERENCES_UPDATED') {
@@ -2004,6 +2037,11 @@ export default function App() {
   const tempMessageIdRef = useRef(-1);
 
   const postChatMessage = async (content: string, targetChannelId: number, clientNonce: string, replyToId?: number | null) => {
+    // 8秒タイムアウト監視 (送信中が長引いた場合に自動で再試行ボタンを表示)
+    const timer = setTimeout(() => {
+      setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === clientNonce && m.pending ? { ...m, pending: false, failed: true } : m)));
+    }, 8000);
+
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/channels/${targetChannelId}/messages`, {
         method: 'POST',
@@ -2013,12 +2051,14 @@ export default function App() {
         },
         body: JSON.stringify({ content, clientNonce, replyToId: replyToId || null })
       });
+      clearTimeout(timer);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const savedMessage: Message = await res.json();
       ingestNewMessageRef.current({ ...savedMessage, client_nonce: clientNonce });
       // WS経由で先に確定済みでも、残っている送信中表示を必ず消す
       setMessages(prev => mergeIncomingMessage(prev, { ...savedMessage, client_nonce: clientNonce }));
     } catch (err) {
+      clearTimeout(timer);
       console.error('Failed to send message:', err);
       setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === clientNonce ? { ...m, pending: false, failed: true } : m)));
     }
@@ -2953,6 +2993,7 @@ export default function App() {
           server_id: channelPermModal.server_id || null,
           view_roles: channelPermModal.view_roles || [],
           write_roles: channelPermModal.write_roles || [],
+          permissions_overwrites: channelPermModal.permissions_overwrites || [],
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -4108,6 +4149,53 @@ export default function App() {
   const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
   const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
 
+  const canWriteActiveChannel = useMemo(() => {
+    if (currentUser.role === 'admin') return true;
+    if (!activeChannelObj) return true;
+    const userRoles = [
+      currentUser.role,
+      ...(Array.isArray(currentUser.custom_roles) ? currentUser.custom_roles : []),
+    ].filter(Boolean);
+
+    const overwrites = Array.isArray(activeChannelObj.permissions_overwrites) ? activeChannelObj.permissions_overwrites : [];
+    // 1. ロール固有の deny チェック (拒絶最優先)
+    for (const ow of overwrites) {
+      if (ow.role_id !== 'everyone' && userRoles.includes(ow.role_id) && Array.isArray(ow.deny) && ow.deny.includes('send')) {
+        return false;
+      }
+    }
+    // 2. ロール固有の allow チェック
+    for (const ow of overwrites) {
+      if (ow.role_id !== 'everyone' && userRoles.includes(ow.role_id) && Array.isArray(ow.allow) && ow.allow.includes('send')) {
+        return true;
+      }
+    }
+    // 3. @everyone の deny チェック
+    const everyoneOw = overwrites.find((o: any) => o.role_id === 'everyone');
+    if (everyoneOw && Array.isArray(everyoneOw.deny) && everyoneOw.deny.includes('send')) {
+      return false;
+    }
+    if (everyoneOw && Array.isArray(everyoneOw.allow) && everyoneOw.allow.includes('send')) {
+      return true;
+    }
+    // 4. 後方互換フォールバック (write_roles)
+    const writeRoles = Array.isArray(activeChannelObj.write_roles) ? activeChannelObj.write_roles : [];
+    if (writeRoles.length === 0) return true;
+    return writeRoles.some(r => userRoles.includes(r));
+  }, [currentUser, activeChannelObj]);
+
+  const availableMemoSlots = useMemo(() => {
+    const list: { slot: number; title: string }[] = [];
+    for (let i = 1; i <= 10; i++) {
+      const slotObj = memoSlots.find(s => s.slot_index === i);
+      list.push({
+        slot: i,
+        title: slotObj?.title || `スロット ${i}`,
+      });
+    }
+    return list;
+  }, [memoSlots]);
+
   // 補完候補
   const completionItems: { key: string; label: string; insert: string; sub?: string; avatar?: string | null; emojiUrl?: string }[] = (() => {
     if (!completion) return [];
@@ -4243,6 +4331,15 @@ export default function App() {
                     <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-black text-[10px] font-bold leading-[18px] text-center" title="今日・明日までの宿題">
                       {urgentHomework}
                     </span>
+                  )}
+                  {tab.id === 'ai' && isAiJobRunning && (
+                    <span className="relative flex h-2 w-2" title="AI バックグラウンド処理中">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
+                    </span>
+                  )}
+                  {tab.id === 'ai' && !isAiJobRunning && hasUnreadAiResult && (
+                    <span className="w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.9)]" title="AI の応答が完了しました" />
                   )}
                 </button>
               );
@@ -4890,72 +4987,25 @@ export default function App() {
                                           </span>
                                         )}
 
-                                        {/* チャンネル操作: ホバー時のみ表示して通常時はチャンネル名の幅を広く確保 */}
-                                        <div className="hidden group-hover:flex items-center">
-                                          {binding && (
-                                            <button
-                                              type="button"
-                                              onClick={() => handleUnbindDiscordChannel({ asdfChannelId: ch.id, discordChannelId: binding.discordChannelId, label: `#${ch.name}` })}
-                                              className="p-0.5 hover:text-amber-400 text-indigo-400 mr-0.5"
-                                              title="Discord同期を解除"
-                                            >
-                                              <X className="w-3 h-3" />
-                                            </button>
-                                          )}
-                                          {currentUser?.role === 'admin' && (
-                                            <>
-                                              <button
-                                                type="button"
-                                                onClick={() => setChannelPermModal({
-                                                  ...ch,
-                                                  view_roles: Array.isArray(ch.view_roles) ? ch.view_roles : [],
-                                                  write_roles: Array.isArray(ch.write_roles) ? ch.write_roles : [],
-                                                })}
-                                                className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
-                                                title="チャンネルのロール・権限・サーバー設定 (admin専用)"
-                                              >
-                                                <Shield className="w-3 h-3" />
-                                              </button>
-                                              <button
-                                                type="button"
-                                                onClick={() => {
-                                                  setEditingChannel({ id: ch.id, name: ch.name });
-                                                  setEditChannelNameInput(ch.name);
-                                                }}
-                                                className="p-0.5 hover:text-amber-400 text-stone-500 mr-0.5"
-                                                title="チャンネル名を変更"
-                                              >
-                                                <Edit3 className="w-3 h-3" />
-                                              </button>
-                                            </>
-                                          )}
-                                          {currentUser?.role === 'admin' && idx > 0 && (
-                                            <button
-                                              onClick={e => handleMoveChannel(e, idx, 'up', textChannels)}
-                                              className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
-                                              title="上へ移動"
-                                            >
-                                              ▲
-                                            </button>
-                                          )}
-                                          {currentUser?.role === 'admin' && idx < textChannels.length - 1 && (
-                                            <button
-                                              onClick={e => handleMoveChannel(e, idx, 'down', textChannels)}
-                                              className="p-0.5 hover:text-amber-400 text-stone-500 text-[10px]"
-                                              title="下へ移動"
-                                            >
-                                              ▼
-                                            </button>
-                                          )}
-                                        </div>
-
-                                        {channels.length > 1 && (currentUser?.role === 'admin' || Boolean(binding) || Boolean(ch.server_id)) && (
+                                        {/* チャンネル設定: ホバー時のみ設定アイコン1つを表示してサイドバーを美しく */}
+                                        {(currentUser?.role === 'admin' || Boolean(binding)) && (
                                           <button
-                                            onClick={() => handleDeleteChannel(ch.id)}
-                                            className="hidden group-hover:inline-flex p-0.5 hover:text-red-400 rounded text-stone-500"
-                                            title="チャンネル削除"
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setChannelPermModal({
+                                                ...ch,
+                                                view_roles: Array.isArray(ch.view_roles) ? ch.view_roles : [],
+                                                write_roles: Array.isArray(ch.write_roles) ? ch.write_roles : [],
+                                                permissions_overwrites: Array.isArray(ch.permissions_overwrites) ? ch.permissions_overwrites : [],
+                                              });
+                                              setChannelSettingsTab('overview');
+                                              setSelectedPermRoleId('everyone');
+                                            }}
+                                            className="hidden group-hover:inline-flex p-1 text-stone-500 hover:text-white rounded-md hover:bg-stone-800 transition"
+                                            title="チャンネル設定 (名前・権限・並び順)"
                                           >
-                                            <Trash2 className="w-3 h-3" />
+                                            <Settings className="w-3.5 h-3.5" />
                                           </button>
                                         )}
                                       </div>
@@ -5361,13 +5411,17 @@ export default function App() {
                               )}
 
                               {m.pending && (
-                                <div className="text-[10px] text-stone-500 mt-0.5">送信中…</div>
+                                <div className="flex items-center gap-2 text-[10px] text-stone-500 mt-0.5">
+                                  <span>送信中…</span>
+                                  <button onClick={() => handleRetryMessage(m)} className="underline hover:text-amber-400">再試行</button>
+                                  <button onClick={() => handleDiscardFailedMessage(m)} className="underline hover:text-stone-300">取り消し</button>
+                                </div>
                               )}
                               {m.failed && (
-                                <div className="flex items-center gap-2 text-[11px] text-red-400 mt-0.5">
+                                <div className="flex items-center gap-2 text-[11px] text-red-400 mt-0.5 font-bold">
                                   <span>送信に失敗しました</span>
-                                  <button onClick={() => handleRetryMessage(m)} className="underline hover:text-red-300">再送</button>
-                                  <button onClick={() => handleDiscardFailedMessage(m)} className="underline text-stone-500 hover:text-stone-300">取り消す</button>
+                                  <button onClick={() => handleRetryMessage(m)} className="underline hover:text-red-300 bg-red-500/10 px-1.5 py-0.5 rounded border border-red-500/30">再試行</button>
+                                  <button onClick={() => handleDiscardFailedMessage(m)} className="underline text-stone-500 hover:text-stone-300 font-normal">取り消す</button>
                                 </div>
                               )}
 
@@ -5550,18 +5604,24 @@ export default function App() {
                   </div>
                 )}
 
-                <form
-                  onSubmit={handleSendMessage}
-                  onDragOver={e => {
-                    if (Array.from(e.dataTransfer.types).includes('Files')) e.preventDefault();
-                  }}
-                  onDrop={e => {
-                    const files = Array.from(e.dataTransfer.files);
-                    if (files.length === 0) return;
-                    e.preventDefault();
-                    addPendingImages(files);
-                  }}
-                >
+                {!canWriteActiveChannel ? (
+                  <div className="bg-[#14161C] border border-stone-800/90 rounded-2xl p-4 text-center text-xs text-stone-500 flex items-center justify-center gap-2.5 shadow-inner">
+                    <Lock className="w-4 h-4 text-amber-500/80 shrink-0" />
+                    <span>このチャンネルへのメッセージ送信権限がありません（閲覧のみ）</span>
+                  </div>
+                ) : (
+                  <form
+                    onSubmit={handleSendMessage}
+                    onDragOver={e => {
+                      if (Array.from(e.dataTransfer.types).includes('Files')) e.preventDefault();
+                    }}
+                    onDrop={e => {
+                      const files = Array.from(e.dataTransfer.files);
+                      if (files.length === 0) return;
+                      e.preventDefault();
+                      addPendingImages(files);
+                    }}
+                  >
                   {pendingImages.length > 0 && (
                     <div className="flex gap-2 px-1 pb-2 overflow-x-auto anim-fade">
                       {pendingImages.map(img => (
@@ -5830,6 +5890,7 @@ export default function App() {
                     </button>
                   </div>
                 </form>
+              )}
               </div>
             </section>
 
@@ -6252,9 +6313,54 @@ export default function App() {
             safeFetch={safeFetch}
             buildContext={buildAiContext}
             memo={{ slot: selectedSlotIndex, title: memoTitle, content: memoContent }}
-            onAppendToMemo={text => {
-              const next = memoContent ? `${memoContent}\n\n---\n${text}` : text;
-              handleMemoContentChange(next);
+            availableSlots={availableMemoSlots}
+            onAppendToMemo={async (text, targetSlot) => {
+              const slot = targetSlot ?? selectedSlotIndex;
+              if (slot === selectedSlotIndex) {
+                const next = memoContent ? `${memoContent}\n\n---\n${text}` : text;
+                handleMemoContentChange(next);
+                handleSaveMemo(slot, { title: memoTitle, content: next, mode: memoMode });
+              } else {
+                const existing = memoSlots.find(s => s.slot_index === slot);
+                const title = existing?.title || `スロット ${slot}`;
+                const mode = existing?.mode || 'markdown';
+                const curContent = existing?.content || '';
+                const next = curContent ? `${curContent}\n\n---\n${text}` : text;
+                await safeFetch(`/api/notes/${slot}`, {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({ title, content: next, mode }),
+                });
+                setMemoSlots(prev => prev.map(m => (m.slot_index === slot ? { ...m, title, content: next, mode } : m)));
+              }
+              toast(`スロット ${slot} のメモに追記しました`, { kind: 'success' });
+            }}
+            onApplyDiff={async (slot, newContent) => {
+              if (slot === selectedSlotIndex) {
+                handleMemoContentChange(newContent);
+                handleSaveMemo(slot, { title: memoTitle, content: newContent, mode: memoMode });
+              } else {
+                const existing = memoSlots.find(s => s.slot_index === slot);
+                const title = existing?.title || `スロット ${slot}`;
+                const mode = existing?.mode || 'markdown';
+                await safeFetch(`/api/notes/${slot}`, {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({ title, content: newContent, mode }),
+                });
+                setMemoSlots(prev => prev.map(m => (m.slot_index === slot ? { ...m, title, content: newContent, mode } : m)));
+              }
+              toast(`スロット ${slot} のメモに差分を適用しました`, { kind: 'success' });
+            }}
+            backgroundJobProgress={aiJobProgressText}
+            onJobStarted={() => {
+              setIsAiJobRunning(true);
+            }}
+            onJobFinished={() => {
+              setIsAiJobRunning(false);
+              if (activeTab !== 'ai') {
+                setHasUnreadAiResult(true);
+              }
             }}
           />
         </div>
@@ -7635,6 +7741,12 @@ export default function App() {
                     {urgentHomework}
                   </span>
                 )}
+                {tab.id === 'ai' && isAiJobRunning && (
+                  <span className="absolute top-0.5 left-1/2 ml-1.5 w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                )}
+                {tab.id === 'ai' && !isAiJobRunning && hasUnreadAiResult && (
+                  <span className="absolute top-0.5 left-1/2 ml-1.5 w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.8)]" />
+                )}
               </button>
             );
           })}
@@ -8262,139 +8374,305 @@ export default function App() {
         </div>
       )}
 
-      {/* チャンネルごとのロール権限 & サーバー紐付け設定モーダル (admin限定) */}
-      {channelPermModal && currentUser.role === 'admin' && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setChannelPermModal(null)}>
-          <form onSubmit={handleSaveChannelPermissions} onClick={e => e.stopPropagation()} className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
-            <div className="flex items-center justify-between border-b border-stone-800 pb-2.5">
-              <div className="font-bold text-white text-sm flex items-center gap-2">
-                <Lock className="w-4 h-4 text-amber-400" /> #{channelPermModal.name} の権限・サーバー設定
-              </div>
-              <button type="button" onClick={() => setChannelPermModal(null)} className="text-stone-500 hover:text-white">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+      {/* チャンネル設定モーダル (admin限定): 概要 & Discord風3ステート権限 */}
+      {channelPermModal && currentUser.role === 'admin' && (() => {
+        const overwrites: PermissionOverwrite[] = Array.isArray(channelPermModal.permissions_overwrites)
+          ? channelPermModal.permissions_overwrites
+          : [];
+        const currentOw = overwrites.find(o => o.role_id === selectedPermRoleId);
 
-            <div className="space-y-3">
-              <div>
-                <label className="block text-stone-400 font-bold mb-1">所属サーバー (左のサーバー欄での分類)</label>
-                <select
-                  value={channelPermModal.server_id || ''}
-                  onChange={e => setChannelPermModal(prev => prev ? { ...prev, server_id: e.target.value || null } : prev)}
-                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+        const getPermState = (perm: string): 'allow' | 'deny' | 'inherit' => {
+          if (currentOw) {
+            if (Array.isArray(currentOw.allow) && currentOw.allow.includes(perm)) return 'allow';
+            if (Array.isArray(currentOw.deny) && currentOw.deny.includes(perm)) return 'deny';
+          }
+          return 'inherit';
+        };
+
+        const updatePermState = (perm: string, nextState: 'allow' | 'deny' | 'inherit') => {
+          setChannelPermModal(prev => {
+            if (!prev) return prev;
+            const curOws = [...(Array.isArray(prev.permissions_overwrites) ? prev.permissions_overwrites : [])];
+            const existingIndex = curOws.findIndex(o => o.role_id === selectedPermRoleId);
+            let curOw = existingIndex >= 0 ? { ...curOws[existingIndex] } : { role_id: selectedPermRoleId, allow: [], deny: [] };
+
+            const newAllow = (curOw.allow || []).filter(p => p !== perm);
+            const newDeny = (curOw.deny || []).filter(p => p !== perm);
+
+            if (nextState === 'allow') newAllow.push(perm);
+            else if (nextState === 'deny') newDeny.push(perm);
+
+            curOw = { ...curOw, allow: newAllow, deny: newDeny };
+            if (existingIndex >= 0) curOws[existingIndex] = curOw;
+            else curOws.push(curOw);
+
+            // 互換性のため view_roles / write_roles も連動更新
+            let newViewRoles = [...(prev.view_roles || [])];
+            let newWriteRoles = [...(prev.write_roles || [])];
+            if (selectedPermRoleId !== 'everyone') {
+              if (perm === 'view') {
+                if (nextState === 'allow' && !newViewRoles.includes(selectedPermRoleId)) newViewRoles.push(selectedPermRoleId);
+                else if (nextState === 'deny' || nextState === 'inherit') newViewRoles = newViewRoles.filter(r => r !== selectedPermRoleId);
+              }
+              if (perm === 'send') {
+                if (nextState === 'allow' && !newWriteRoles.includes(selectedPermRoleId)) newWriteRoles.push(selectedPermRoleId);
+                else if (nextState === 'deny' || nextState === 'inherit') newWriteRoles = newWriteRoles.filter(r => r !== selectedPermRoleId);
+              }
+            }
+
+            return {
+              ...prev,
+              permissions_overwrites: curOws,
+              view_roles: newViewRoles,
+              write_roles: newWriteRoles,
+            };
+          });
+        };
+
+        const PERMS = [
+          { id: 'view', label: 'チャンネルの閲覧', desc: 'チャンネル一覧に表示し、メッセージ履歴の閲覧を許可' },
+          { id: 'send', label: 'メッセージの送信', desc: 'このチャンネルへの新規メッセージ送信や返信を許可' },
+          { id: 'attach', label: 'ファイルの添付', desc: '画像やファイルのアップロードを許可' },
+        ];
+
+        return (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setChannelPermModal(null)}>
+            <div onClick={e => e.stopPropagation()} className="w-full max-w-2xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl text-xs flex flex-col max-h-[85vh] overflow-hidden anim-pop">
+              {/* モーダルヘッダー */}
+              <div className="flex items-center justify-between px-5 py-3.5 border-b border-stone-800 shrink-0">
+                <div className="flex items-center gap-2">
+                  <Settings className="w-4 h-4 text-amber-400" />
+                  <span className="font-bold text-white text-sm">#{channelPermModal.name} の設定</span>
+                </div>
+                <button type="button" onClick={() => setChannelPermModal(null)} className="text-stone-500 hover:text-white">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* タブバー */}
+              <div className="flex items-center gap-1 px-5 pt-3 border-b border-stone-800 shrink-0 bg-[#0E0F12]">
+                <button
+                  type="button"
+                  onClick={() => setChannelSettingsTab('overview')}
+                  className={`px-3 py-2 border-b-2 font-bold transition flex items-center gap-1.5 ${
+                    channelSettingsTab === 'overview'
+                      ? 'border-amber-400 text-amber-400'
+                      : 'border-transparent text-stone-400 hover:text-stone-200'
+                  }`}
                 >
-                  <option value="">指定なし (すべてに表示)</option>
-                  {discordServers.map(srv => {
-                    const gid = srv.id || srv.guildId;
-                    return <option key={gid} value={gid}>{srv.name}</option>;
-                  })}
-                </select>
+                  <Hash className="w-3.5 h-3.5" /> 概要
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setChannelSettingsTab('permissions')}
+                  className={`px-3 py-2 border-b-2 font-bold transition flex items-center gap-1.5 ${
+                    channelSettingsTab === 'permissions'
+                      ? 'border-amber-400 text-amber-400'
+                      : 'border-transparent text-stone-400 hover:text-stone-200'
+                  }`}
+                >
+                  <Lock className="w-3.5 h-3.5" /> 権限 (Discord風)
+                </button>
               </div>
 
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-stone-400 font-bold">閲覧できるロール (未選択なら全員閲覧可能)</label>
-                  <button
-                    type="button"
-                    onClick={() => setChannelPermModal(prev => prev ? { ...prev, view_roles: [] } : prev)}
-                    className="text-[10px] text-amber-400 hover:underline"
-                  >
-                    全員に開放
-                  </button>
-                </div>
-                <div className="flex flex-wrap gap-1.5 p-2.5 rounded-xl bg-[#16181D] border border-stone-800">
-                  {roleDefs.map(r => {
-                    const currentView = channelPermModal.view_roles || [];
-                    const active = currentView.includes(r.id);
-                    return (
+              {/* タブコンテンツ */}
+              <div className="flex-1 overflow-y-auto p-5">
+                {channelSettingsTab === 'overview' ? (
+                  <div className="space-y-4 max-w-lg">
+                    <div>
+                      <label className="block text-stone-300 font-bold mb-1.5">チャンネル名</label>
+                      <input
+                        type="text"
+                        value={channelPermModal.name}
+                        onChange={e => setChannelPermModal(prev => prev ? { ...prev, name: e.target.value.toLowerCase().replace(/\s+/g, '-') } : prev)}
+                        className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-500"
+                        placeholder="channel-name"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-stone-300 font-bold mb-1.5">所属サーバー (左のサーバー欄での分類)</label>
+                      <select
+                        value={channelPermModal.server_id || ''}
+                        onChange={e => setChannelPermModal(prev => prev ? { ...prev, server_id: e.target.value || null } : prev)}
+                        className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                      >
+                        <option value="">指定なし (すべてに表示)</option>
+                        {discordServers.map(srv => {
+                          const gid = srv.id || srv.guildId;
+                          return <option key={gid} value={gid}>{srv.name}</option>;
+                        })}
+                      </select>
+                      <p className="mt-1 text-[11px] text-stone-500">選択したDiscordサーバーのアイコンを選んだ時のみ、このチャンネルが表示されます。</p>
+                    </div>
+
+                    <div className="pt-4 border-t border-stone-800">
+                      <div className="font-bold text-red-400 mb-1">危険な操作</div>
+                      <p className="text-[11px] text-stone-500 mb-2.5">チャンネルを削除すると、投稿された全メッセージと関連データが完全に消去されます。</p>
                       <button
-                        key={r.id}
                         type="button"
                         onClick={() => {
-                          setChannelPermModal(prev => {
-                            if (!prev) return prev;
-                            const cur = prev.view_roles || [];
-                            const next = active ? cur.filter((x: string) => x !== r.id) : [...cur, r.id];
-                            return { ...prev, view_roles: next };
-                          });
+                          const id = channelPermModal.id;
+                          setChannelPermModal(null);
+                          handleDeleteChannel(id);
                         }}
-                        className={`px-2.5 py-1 rounded-lg border font-bold transition flex items-center gap-1.5 ${
-                          active
-                            ? 'bg-amber-500/20 border-amber-500 text-amber-300'
-                            : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-stone-200'
+                        className="px-3 py-2 rounded-xl bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 font-bold transition flex items-center gap-1.5"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" /> このチャンネルを削除
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col sm:flex-row gap-4 h-full min-h-[300px]">
+                    {/* 左カラム: ロール一覧 */}
+                    <div className="w-full sm:w-44 shrink-0 space-y-1 sm:border-r border-stone-800 sm:pr-3">
+                      <div className="text-[10px] text-stone-500 font-bold uppercase tracking-wider mb-2">ロール / メンバー</div>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedPermRoleId('everyone')}
+                        className={`w-full px-2.5 py-1.5 rounded-lg text-left font-bold transition flex items-center gap-2 ${
+                          selectedPermRoleId === 'everyone'
+                            ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                            : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/60'
                         }`}
                       >
-                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.color }} />
-                        <span>{r.name}</span>
+                        <span className="w-2 h-2 rounded-full bg-stone-400" />
+                        <span>@everyone</span>
                       </button>
-                    );
-                  })}
-                </div>
+
+                      {roleDefs.map(r => (
+                        <button
+                          key={r.id}
+                          type="button"
+                          onClick={() => setSelectedPermRoleId(r.id)}
+                          className={`w-full px-2.5 py-1.5 rounded-lg text-left font-bold transition flex items-center gap-2 ${
+                            selectedPermRoleId === r.id
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                              : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/60'
+                          }`}
+                        >
+                          <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: r.color }} />
+                          <span className="truncate">{r.name}</span>
+                        </button>
+                      ))}
+
+                      <div className="pt-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setChannelPermModal(null);
+                            setShowRoleManagerModal(true);
+                          }}
+                          className="w-full text-left text-[11px] text-amber-400 hover:underline pt-2 block"
+                        >
+                          + ロール設定を開く
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 右カラム: 権限 3ステートトグル */}
+                    <div className="flex-1 space-y-3 sm:pl-2">
+                      <div className="flex items-center justify-between pb-2 border-b border-stone-800">
+                        <span className="font-bold text-stone-200">
+                          {selectedPermRoleId === 'everyone' ? '@everyone の権限' : `${roleDefs.find(r => r.id === selectedPermRoleId)?.name || selectedPermRoleId} の権限`}
+                        </span>
+                        <div className="flex items-center gap-3 text-[10px] text-stone-500">
+                          <span className="flex items-center gap-1"><span className="text-red-400 font-bold">✕</span> 拒否</span>
+                          <span className="flex items-center gap-1"><span className="text-stone-400 font-bold">/</span> 継承</span>
+                          <span className="flex items-center gap-1"><span className="text-emerald-400 font-bold">✓</span> 許可</span>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        {PERMS.map(p => {
+                          const state = getPermState(p.id);
+                          return (
+                            <div key={p.id} className="p-3 rounded-xl bg-[#16181D] border border-stone-800/80 flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="font-bold text-stone-200">{p.label}</div>
+                                <div className="text-[11px] text-stone-500 leading-tight">{p.desc}</div>
+                              </div>
+                              {/* 3ステートボタングループ */}
+                              <div className="inline-flex rounded-lg border border-stone-700/80 p-0.5 bg-[#0C0D10] shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => updatePermState(p.id, 'deny')}
+                                  title="拒否 (明示的に禁止)"
+                                  className={`px-2 py-1 rounded text-xs font-bold transition flex items-center justify-center ${
+                                    state === 'deny'
+                                      ? 'bg-red-500/30 text-red-400 shadow-sm border border-red-500/50'
+                                      : 'text-stone-500 hover:text-stone-300'
+                                  }`}
+                                >
+                                  ✕
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updatePermState(p.id, 'inherit')}
+                                  title="継承 (デフォルトに従う)"
+                                  className={`px-2 py-1 rounded text-xs font-bold transition flex items-center justify-center ${
+                                    state === 'inherit'
+                                      ? 'bg-stone-700 text-stone-200 shadow-sm border border-stone-600'
+                                      : 'text-stone-500 hover:text-stone-300'
+                                  }`}
+                                >
+                                  /
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updatePermState(p.id, 'allow')}
+                                  title="許可 (明示的に許可)"
+                                  className={`px-2 py-1 rounded text-xs font-bold transition flex items-center justify-center ${
+                                    state === 'allow'
+                                      ? 'bg-emerald-500/30 text-emerald-400 shadow-sm border border-emerald-500/50'
+                                      : 'text-stone-500 hover:text-stone-300'
+                                  }`}
+                                >
+                                  ✓
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-stone-400 font-bold">書き込みできるロール (未選択なら全員送信可能)</label>
+              {/* モーダルフッター */}
+              <div className="flex items-center justify-between px-5 py-3 border-t border-stone-800 shrink-0 bg-[#0E0F12]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setChannelPermModal(null);
+                    setShowRoleManagerModal(true);
+                  }}
+                  className="text-amber-400 hover:underline text-[11px]"
+                >
+                  ロールの作成・メンバー割り当てを開く →
+                </button>
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setChannelPermModal(prev => prev ? { ...prev, write_roles: [] } : prev)}
-                    className="text-[10px] text-amber-400 hover:underline"
+                    onClick={() => setChannelPermModal(null)}
+                    className="px-3.5 py-1.5 rounded-xl border border-stone-700 hover:bg-stone-800 text-stone-300 font-bold transition"
                   >
-                    全員に開放
+                    キャンセル
                   </button>
-                </div>
-                <div className="flex flex-wrap gap-1.5 p-2.5 rounded-xl bg-[#16181D] border border-stone-800">
-                  {roleDefs.map(r => {
-                    const currentWrite = channelPermModal.write_roles || [];
-                    const active = currentWrite.includes(r.id);
-                    return (
-                      <button
-                        key={r.id}
-                        type="button"
-                        onClick={() => {
-                          setChannelPermModal(prev => {
-                            if (!prev) return prev;
-                            const cur = prev.write_roles || [];
-                            const next = active ? cur.filter((x: string) => x !== r.id) : [...cur, r.id];
-                            return { ...prev, write_roles: next };
-                          });
-                        }}
-                        className={`px-2.5 py-1 rounded-lg border font-bold transition flex items-center gap-1.5 ${
-                          active
-                            ? 'bg-amber-500/20 border-amber-500 text-amber-300'
-                            : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-stone-200'
-                        }`}
-                      >
-                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.color }} />
-                        <span>{r.name}</span>
-                      </button>
-                    );
-                  })}
+                  <button
+                    type="button"
+                    onClick={handleSaveChannelPermissions}
+                    className="px-4 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold transition"
+                  >
+                    設定を保存
+                  </button>
                 </div>
               </div>
             </div>
-
-            <div className="flex items-center justify-between pt-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setChannelPermModal(null);
-                  setShowRoleManagerModal(true);
-                }}
-                className="text-amber-400 hover:underline text-[11px]"
-              >
-                ロールの作成・メンバー割り当てを開く →
-              </button>
-              <button
-                type="submit"
-                className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold transition"
-              >
-                権限を保存
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
+          </div>
+        );
+      })()}
 
       {/* ロール管理・メンバー割り当てモーダル (admin限定) */}
       {showRoleManagerModal && currentUser.role === 'admin' && (

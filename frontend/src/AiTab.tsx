@@ -10,6 +10,13 @@ interface AiStep {
   label: string;
   ok: boolean;
   write: boolean;
+  diff?: {
+    target: string;
+    slot?: number;
+    oldText: string;
+    newText: string;
+    lines: Array<{ type: 'same' | 'add' | 'del'; text: string }>;
+  };
 }
 
 interface AiMessage {
@@ -37,6 +44,94 @@ interface PendingImage {
   mimeType: string;
   data: string;
   thumb: string;
+}
+
+export interface AvailableMemoSlot {
+  slot: number;
+  title: string;
+}
+
+export interface AiTabProps {
+  active: boolean;
+  userId: number;
+  token: string;
+  safeFetch: (input: string, init?: RequestInit) => Promise<Response>;
+  buildContext: () => object;
+  memo: { slot: number; title: string; content: string };
+  availableSlots?: AvailableMemoSlot[];
+  onAppendToMemo: (text: string, targetSlot?: number) => void;
+  onApplyDiff?: (slot: number, newContent: string) => void;
+  backgroundJobProgress?: string | null;
+  onJobStarted?: () => void;
+  onJobFinished?: () => void;
+}
+
+function DiffViewer({
+  diff,
+  onApply,
+}: {
+  diff: NonNullable<AiStep['diff']>;
+  onApply?: (slot: number, newContent: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const [applied, setApplied] = useState(false);
+
+  return (
+    <div className="mt-2.5 rounded-xl border border-stone-800 bg-[#0F1013] overflow-hidden text-xs">
+      <div className="px-3 py-2 bg-stone-900/80 border-b border-stone-800 flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={() => setOpen(v => !v)}
+          className="flex items-center gap-1.5 font-mono text-[11px] text-stone-300 hover:text-white font-bold"
+        >
+          <span>{open ? '▼' : '▶'}</span>
+          <span>変更差分 (Diff): {diff.target}</span>
+        </button>
+        <div className="flex items-center gap-1.5">
+          {onApply && diff.slot && !applied && (
+            <button
+              type="button"
+              onClick={() => {
+                onApply(diff.slot!, diff.newText);
+                setApplied(true);
+                toast(`メモ #${diff.slot} に差分を適用しました`, { kind: 'success' });
+              }}
+              className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] flex items-center gap-1 transition shadow"
+            >
+              <Check className="w-3 h-3" />
+              差分を適用
+            </button>
+          )}
+          {applied && (
+            <span className="text-[10px] font-bold text-emerald-400 flex items-center gap-1">
+              <Check className="w-3 h-3" /> 適用済み
+            </span>
+          )}
+        </div>
+      </div>
+      {open && (
+        <div className="p-2 font-mono text-[11px] leading-relaxed max-h-64 overflow-y-auto space-y-0.5 divide-y divide-stone-900/40">
+          {diff.lines.map((l, i) => (
+            <div
+              key={i}
+              className={`px-2 py-0.5 rounded flex items-start gap-2 ${
+                l.type === 'add'
+                  ? 'bg-emerald-950/40 text-emerald-300 border-l-2 border-emerald-500'
+                  : l.type === 'del'
+                  ? 'bg-red-950/40 text-red-300 border-l-2 border-red-500 line-through opacity-80'
+                  : 'text-stone-400'
+              }`}
+            >
+              <span className="select-none font-bold shrink-0 w-3 text-center opacity-60">
+                {l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' '}
+              </span>
+              <span className="break-all whitespace-pre-wrap">{l.text || ' '}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 const PERSONA_OPTIONS = [
@@ -75,16 +170,6 @@ async function shrinkImage(file: File): Promise<{ mimeType: string; data: string
   return { mimeType: 'image/jpeg', data: full.split(',')[1], thumb };
 }
 
-interface AiTabProps {
-  active: boolean;
-  userId: number;
-  token: string;
-  safeFetch: (input: string, init?: RequestInit) => Promise<Response>;
-  buildContext: () => object;
-  memo: { slot: number; title: string; content: string };
-  onAppendToMemo: (text: string) => void;
-}
-
 const MAX_HISTORY = 200;
 const timeNow = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -97,7 +182,20 @@ function loadHistory(key: string): AiMessage[] {
   }
 }
 
-export default function AiTab({ active, userId, token, safeFetch, buildContext, memo, onAppendToMemo }: AiTabProps) {
+export default function AiTab({
+  active,
+  userId,
+  token,
+  safeFetch,
+  buildContext,
+  memo,
+  availableSlots,
+  onAppendToMemo,
+  onApplyDiff,
+  backgroundJobProgress,
+  onJobStarted,
+  onJobFinished,
+}: AiTabProps) {
   const storageKey = `asdf_ai_history_${userId}`;
   const [threads, setThreads] = useState<AiThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
@@ -117,6 +215,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
   const [showUsageModal, setShowUsageModal] = useState(false);
   // 「Web検索」ボタン: 押した時はこの質問で必ず検索する (押さなくても AI が必要と判断すれば検索する)
   const [forceWebSearch, setForceWebSearch] = useState(false);
+  const [appendMenuMsgId, setAppendMenuMsgId] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   // 少しずつ表示中のメッセージ
   const [reveal, setReveal] = useState<{ id: number; shown: number } | null>(null);
@@ -289,7 +388,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
     if (reveal) scrollToBottom(false);
   }, [reveal]);
 
-  // 返信を少しずつ表示
+  // 返信を少しずつ表示 (CPU負荷軽減のため70msデバウンス)
   useEffect(() => {
     if (!reveal) return;
     const msg = messages.find(m => m.id === reveal.id);
@@ -297,8 +396,8 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
       setReveal(null);
       return;
     }
-    const step = Math.max(2, Math.ceil(msg.content.length / 90));
-    const t = setTimeout(() => setReveal(r => (r && r.id === msg.id ? { ...r, shown: r.shown + step } : r)), 16);
+    const step = Math.max(12, Math.ceil(msg.content.length / 25));
+    const t = setTimeout(() => setReveal(r => (r && r.id === msg.id ? { ...r, shown: r.shown + step } : r)), 70);
     return () => clearTimeout(t);
   }, [reveal, messages]);
 
@@ -337,8 +436,11 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
         ? text.replace(/\s+/g, ' ').slice(0, 26)
         : currentThread?.title;
 
+    onJobStarted?.();
+
     try {
-      const res = await safeFetch('/api/ai/chat', {
+      // 1. まず非同期ジョブ API (タイムアウト対策) を試行
+      const jobRes = await safeFetch('/api/ai/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
@@ -349,13 +451,68 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
           modelMode,
           persona,
           customPersona,
+          threadId: activeThreadId,
         }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.reply) throw new Error(data.error || 'AI の応答に失敗しました');
+
+      let finalReply = '';
+      let finalSteps: AiStep[] | undefined = undefined;
+
+      if (jobRes.status === 202) {
+        const { jobId } = await jobRes.json();
+        // ジョブ完了までポーリング監視 (最大180秒)
+        let done = false;
+        let attempts = 0;
+        while (!done && attempts < 90) {
+          await new Promise(r => setTimeout(r, 2000));
+          attempts++;
+          try {
+            const checkRes = await safeFetch(`/api/ai/jobs/${jobId}`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (checkRes.ok) {
+              const jobData = await checkRes.json();
+              if (jobData.status === 'completed') {
+                finalReply = jobData.result?.reply || '';
+                finalSteps = jobData.result?.steps;
+                done = true;
+                break;
+              } else if (jobData.status === 'failed') {
+                throw new Error(jobData.error || 'AI の処理に失敗しました');
+              }
+            }
+          } catch (e: any) {
+            if (attempts > 60) throw e;
+          }
+        }
+        if (!done) throw new Error('AI の応答がタイムアウトしました');
+      } else {
+        // フォールバック: 通常の同期 chat
+        const res = await safeFetch('/api/ai/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            messages: next.filter(m => !m.error).slice(-30).map(m => ({ role: m.role, content: m.content })),
+            contextData: buildContext(),
+            images: sentImages.map(im => ({ mimeType: im.mimeType, data: im.data })),
+            webSearch,
+            modelMode,
+            persona,
+            customPersona,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.reply) throw new Error(data.error || 'AI の応答に失敗しました');
+        finalReply = data.reply;
+        finalSteps = Array.isArray(data.steps) && data.steps.length ? data.steps : undefined;
+      }
+
       const reply: AiMessage = {
-        id: Date.now() + 1, role: 'model', content: data.reply, timestamp: timeNow(),
-        steps: Array.isArray(data.steps) && data.steps.length ? data.steps : undefined,
+        id: Date.now() + 1,
+        role: 'model',
+        content: finalReply,
+        timestamp: timeNow(),
+        steps: finalSteps,
       };
       if (reply.steps?.some(st => st.write && st.ok)) toast('AI が操作を実行しました', { kind: 'success' });
       const finalMessages = [...next, reply].slice(-MAX_HISTORY);
@@ -384,6 +541,7 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
       });
     } finally {
       setLoading(false);
+      onJobFinished?.();
     }
   };
 
@@ -798,17 +956,50 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
                         {isRevealing && <span className="ai-caret" />}
                       </div>
+                      {/* Diff (変更差分) プレビュー */}
+                      {msg.steps?.map((st, i) => st.diff ? (
+                        <DiffViewer key={i} diff={st.diff} onApply={onApplyDiff} />
+                      ) : null)}
                       {!isRevealing && (
-                        <div className="mt-2.5 pt-2 border-t border-stone-800/80 flex flex-wrap gap-1.5 text-[11px]">
+                        <div className="mt-2.5 pt-2 border-t border-stone-800/80 flex flex-wrap items-center gap-1.5 text-[11px] relative">
                           <button
-                            onClick={() => {
-                              onAppendToMemo(msg.content);
-                              toast(`メモ #${memo.slot} の末尾に追記しました`, { kind: 'success' });
-                            }}
+                            type="button"
+                            onClick={() => setAppendMenuMsgId(prev => prev === msg.id ? null : msg.id)}
                             className="btn-chip"
                           >
                             <Plus className="w-3 h-3 text-amber-400" /> メモに追記
                           </button>
+                          {appendMenuMsgId === msg.id && (
+                            <div className="absolute top-full left-0 mt-1 z-30 bg-[#16181D] border border-stone-800 rounded-xl p-1.5 shadow-2xl min-w-[200px] space-y-0.5 anim-pop">
+                              <div className="text-[10px] text-stone-500 font-bold px-2 py-1">追記先メモを選択</div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  onAppendToMemo(msg.content, memo.slot);
+                                  toast(`メモ #${memo.slot} に追記しました`, { kind: 'success' });
+                                  setAppendMenuMsgId(null);
+                                }}
+                                className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-stone-800 text-stone-200 text-xs flex items-center justify-between"
+                              >
+                                <span>現在のメモ (#{memo.slot})</span>
+                                <span className="text-[10px] text-amber-400 font-bold">現在</span>
+                              </button>
+                              {availableSlots?.filter(s => s.slot !== memo.slot).map(s => (
+                                <button
+                                  key={s.slot}
+                                  type="button"
+                                  onClick={() => {
+                                    onAppendToMemo(msg.content, s.slot);
+                                    toast(`メモ #${s.slot}「${s.title}」に追記しました`, { kind: 'success' });
+                                    setAppendMenuMsgId(null);
+                                  }}
+                                  className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-stone-800 text-stone-300 text-xs truncate"
+                                >
+                                  #{s.slot} {s.title || '無題'}
+                                </button>
+                              ))}
+                            </div>
+                          )}
                           <button
                             onClick={() => {
                               navigator.clipboard.writeText(msg.content);
@@ -831,9 +1022,9 @@ export default function AiTab({ active, userId, token, safeFetch, buildContext, 
               <div className="w-7 h-7 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0">
                 <Bot className="w-4 h-4" />
               </div>
-              <div className="bg-[#14161C] border border-stone-800/80 rounded-2xl px-4 py-3 flex items-center gap-2 text-xs text-stone-500">
+              <div className="bg-[#14161C] border border-stone-800/80 rounded-2xl px-4 py-3 flex items-center gap-2 text-xs text-stone-400">
                 <span className="typing-dots"><i /><i /><i /></span>
-                調べています…
+                {backgroundJobProgress || '調べています…'}
               </div>
             </div>
           )}

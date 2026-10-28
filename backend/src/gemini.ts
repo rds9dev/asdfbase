@@ -1,5 +1,6 @@
 import { GoogleGenAI, FunctionCallingConfigMode, type Content, type FunctionDeclaration, type GenerateContentResponse } from '@google/genai';
 import dotenv from 'dotenv';
+import type { Pool } from 'pg';
 
 dotenv.config();
 
@@ -18,7 +19,7 @@ export const MODEL_SPECS: Record<ModelMode, ModelSpec> = {
   fast: {
     id: 'gemini-3.5-flash-lite',
     name: '高速モード (gemini-3.5-flash-lite)',
-    fallbacks: ['gemini-flash-lite-latest', 'gemini-2.0-flash', 'gemini-1.5-flash'],
+    fallbacks: ['gemini-flash-lite-latest'],
     rpmLimit: 30,
     tpmLimit: 10_000_000,
     rpdLimit: 1500,
@@ -26,7 +27,7 @@ export const MODEL_SPECS: Record<ModelMode, ModelSpec> = {
   thinking: {
     id: 'gemini-3.8-flash',
     name: '思考モード (gemini-3.8-flash)',
-    fallbacks: ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
+    fallbacks: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest'],
     rpmLimit: 15,
     tpmLimit: 3_000_000,
     rpdLimit: 1500,
@@ -186,7 +187,66 @@ export function pickSlot(mode: ModelMode): { slotIndex: number; key: string } | 
   return { slotIndex: bestIdx, key: slotKeys[bestIdx]! };
 }
 
-// 利用実績の記録
+// 利用実績の記録と通知
+let usageDbPool: Pool | null = null;
+let usageUpdateListeners: (() => void)[] = [];
+
+export function onAiUsageUpdated(fn: () => void) {
+  usageUpdateListeners.push(fn);
+}
+
+export async function initAiUsageDb(pool: Pool) {
+  usageDbPool = pool;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ai_usage_stats (
+        id SERIAL PRIMARY KEY,
+        slot_index INT NOT NULL,
+        mode VARCHAR(32) NOT NULL,
+        pt_date VARCHAR(16) NOT NULL,
+        today_requests INT NOT NULL DEFAULT 0,
+        today_tokens INT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(slot_index, mode, pt_date)
+      )
+    `);
+
+    // DB から当日の利用量を読み込み
+    const todayPt = getPtDateString();
+    const rows = (await pool.query(
+      `SELECT slot_index, mode, today_requests, today_tokens FROM ai_usage_stats WHERE pt_date = $1`,
+      [todayPt]
+    )).rows;
+
+    for (const r of rows) {
+      const idx = Number(r.slot_index);
+      const m = r.mode as ModelMode;
+      if (usageTracker[idx] && usageTracker[idx][m]) {
+        usageTracker[idx][m].ptDate = todayPt;
+        usageTracker[idx][m].todayRequests = Number(r.today_requests || 0);
+        usageTracker[idx][m].todayTokens = Number(r.today_tokens || 0);
+      }
+    }
+  } catch (err: any) {
+    console.error('[Gemini] initAiUsageDb error:', err.message);
+  }
+}
+
+async function persistUsage(slotIndex: number, mode: ModelMode) {
+  if (!usageDbPool) return;
+  const usage = usageTracker[slotIndex]?.[mode];
+  if (!usage) return;
+  try {
+    await usageDbPool.query(
+      `INSERT INTO ai_usage_stats (slot_index, mode, pt_date, today_requests, today_tokens, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (slot_index, mode, pt_date)
+       DO UPDATE SET today_requests = EXCLUDED.today_requests, today_tokens = EXCLUDED.today_tokens, updated_at = NOW()`,
+      [slotIndex, mode, usage.ptDate, usage.todayRequests, usage.todayTokens]
+    );
+  } catch (_) {}
+}
+
 export function recordUsage(slotIndex: number, mode: ModelMode, tokens: number) {
   const now = Date.now();
   const usage = usageTracker[slotIndex]?.[mode];
@@ -195,6 +255,11 @@ export function recordUsage(slotIndex: number, mode: ModelMode, tokens: number) 
   usage.window.push({ timestamp: now, tokens: Math.max(tokens, 1) });
   usage.todayRequests += 1;
   usage.todayTokens += Math.max(tokens, 1);
+
+  persistUsage(slotIndex, mode);
+  for (const listener of usageUpdateListeners) {
+    try { listener(); } catch (_) {}
+  }
 }
 
 // 利用状況まとめの取得
@@ -285,8 +350,8 @@ export function compactHistory(history: Content[], maxRecentTurns = 6): Content[
 
 // ---------------- Gemini API 呼出 ----------------
 export async function askGemini(prompt: string, systemInstruction?: string, mode: ModelMode = 'fast'): Promise<string> {
-  const chosen = pickSlot(mode);
-  if (!chosen) {
+  const activeKeys = getAvailableKeyCount();
+  if (activeKeys === 0) {
     return '【Gemini連携】APIキーが設定されていません。.env に GEMINI_API_KEY_1 などを登録してください。';
   }
 
@@ -294,25 +359,37 @@ export async function askGemini(prompt: string, systemInstruction?: string, mode
   const models = [spec.id, ...spec.fallbacks];
   let lastError: any = null;
 
-  for (const model of models) {
-    try {
-      const client = new GoogleGenAI({ apiKey: chosen.key });
-      const response = await client.models.generateContent({
-        model,
-        contents: prompt,
-        config: systemInstruction ? { systemInstruction } : undefined,
-      });
+  // マルチスロット試行 (スロット数分巡回)
+  for (let slotTry = 0; slotTry < Math.max(activeKeys, 1); slotTry++) {
+    const chosen = pickSlot(mode);
+    if (!chosen) continue;
 
-      const tokens = response.usageMetadata?.totalTokenCount || Math.ceil((prompt.length + (response.text?.length || 0)) / 2);
-      recordUsage(chosen.slotIndex, mode, tokens);
+    for (const model of models) {
+      try {
+        const client = new GoogleGenAI({ apiKey: chosen.key });
+        const response = await client.models.generateContent({
+          model,
+          contents: prompt,
+          config: systemInstruction ? { systemInstruction } : undefined,
+        });
 
-      if (response.text) {
-        return response.text;
+        const tokens = response.usageMetadata?.totalTokenCount || Math.ceil((prompt.length + (response.text?.length || 0)) / 2);
+        recordUsage(chosen.slotIndex, mode, tokens);
+
+        if (response.text) {
+          return response.text;
+        }
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[Gemini askGemini] Slot ${chosen.slotIndex + 1} Model ${model} failed: ${err.message || err}`);
+        // 503 (Spikes in demand) や 429 の場合は別スロットへ即切り替え
+        if (String(err?.message || '').includes('503') || String(err?.message || '').includes('429')) {
+          break; // 次のスロットへ
+        }
       }
-    } catch (err: any) {
-      lastError = err;
-      console.warn(`[Gemini askGemini] Slot ${chosen.slotIndex + 1} Model ${model} failed: ${err.message || err}`);
     }
+    // 少し待機してリトライ
+    await new Promise(r => setTimeout(r, 200));
   }
 
   return `AI呼び出しエラー: すべてのAPIキーまたはモデルでの呼び出しに失敗しました (${lastError?.message || '不明なエラー'})`;
@@ -352,6 +429,12 @@ export interface AgentStep {
   label: string;
   ok: boolean;
   write: boolean;
+  diff?: {
+    target: string;
+    oldText: string;
+    newText: string;
+    lines: Array<{ type: 'same' | 'add' | 'del'; text: string }>;
+  };
 }
 
 export interface AgentInput {
@@ -362,6 +445,7 @@ export interface AgentInput {
   maxSteps?: number;
   forceFirstTool?: string;
   mode?: ModelMode;
+  onProgress?: (message: string) => void;
 }
 
 async function generateWithFallback(
@@ -372,34 +456,40 @@ async function generateWithFallback(
 ): Promise<GenerateContentResponse> {
   const spec = MODEL_SPECS[mode];
   const models = [spec.id, ...spec.fallbacks];
-
-  let chosenSlot = pinned.key && pinned.slotIndex !== undefined
-    ? { slotIndex: pinned.slotIndex, key: pinned.key }
-    : pickSlot(mode);
-
-  if (!chosenSlot) {
-    throw new Error('APIキーが設定されていません');
-  }
+  const activeKeys = getAvailableKeyCount();
 
   let lastError: any = null;
 
-  for (const model of (pinned.model ? [pinned.model, ...models.filter(m => m !== pinned.model)] : models)) {
-    try {
-      const client = new GoogleGenAI({ apiKey: chosenSlot.key });
-      const response = await client.models.generateContent({ model, contents, config });
+  for (let slotTry = 0; slotTry < Math.max(activeKeys, 1); slotTry++) {
+    const chosenSlot = (slotTry === 0 && pinned.key && pinned.slotIndex !== undefined)
+      ? { slotIndex: pinned.slotIndex, key: pinned.key }
+      : pickSlot(mode);
 
-      pinned.slotIndex = chosenSlot.slotIndex;
-      pinned.key = chosenSlot.key;
-      pinned.model = model;
+    if (!chosenSlot) continue;
 
-      const tokens = response.usageMetadata?.totalTokenCount || 800;
-      recordUsage(chosenSlot.slotIndex, mode, tokens);
+    for (const model of (pinned.model ? [pinned.model, ...models.filter(m => m !== pinned.model)] : models)) {
+      try {
+        const client = new GoogleGenAI({ apiKey: chosenSlot.key });
+        const response = await client.models.generateContent({ model, contents, config });
 
-      return response;
-    } catch (err: any) {
-      lastError = err;
-      console.warn(`[Gemini agent] Slot ${chosenSlot.slotIndex + 1} Model ${model} failed: ${err.message || err}`);
+        pinned.slotIndex = chosenSlot.slotIndex;
+        pinned.key = chosenSlot.key;
+        pinned.model = model;
+
+        const tokens = response.usageMetadata?.totalTokenCount || 800;
+        recordUsage(chosenSlot.slotIndex, mode, tokens);
+
+        return response;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[Gemini agent] Slot ${chosenSlot.slotIndex + 1} Model ${model} failed: ${err.message || err}`);
+        // 503 または 429 は別スロットへ
+        if (String(err?.message || '').includes('503') || String(err?.message || '').includes('429')) {
+          break;
+        }
+      }
     }
+    await new Promise(r => setTimeout(r, 250));
   }
 
   throw new Error(lastError?.message || 'すべてのAPIキーまたはモデルでの呼び出しに失敗しました');
@@ -428,6 +518,8 @@ export async function runGeminiAgent(input: AgentInput): Promise<{ text: string;
         ? { ...config, toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.ANY, allowedFunctionNames: [input.forceFirstTool] } } }
         : config;
 
+    input.onProgress?.(round === 0 ? 'AIが考え中...' : `ツールを実行中 (${round}/${maxSteps})...`);
+
     const response = await generateWithFallback(contents, roundConfig, pinned, mode);
     const calls = response.functionCalls || [];
     if (calls.length === 0) {
@@ -437,6 +529,7 @@ export async function runGeminiAgent(input: AgentInput): Promise<{ text: string;
     if (modelContent) contents.push(modelContent);
     const parts: NonNullable<Content['parts']> = [];
     for (const call of calls) {
+      input.onProgress?.(`ツール「${call.name}」を実行中...`);
       const { step, response: toolResponse } = await input.runTool(call.name || '', call.args || {});
       steps.push(step);
       parts.push({ functionResponse: { id: call.id, name: call.name, response: toolResponse } });

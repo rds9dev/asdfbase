@@ -78,6 +78,18 @@ export function resolveEmojiUrl(name: string, customEmojis?: Map<string, string>
   return null;
 }
 
+export function getTwemojiUrl(unicode: string): string {
+  const codePoints: string[] = [];
+  for (let i = 0; i < unicode.length; i++) {
+    const cp = unicode.codePointAt(i);
+    if (cp && cp !== 0xfe0f) {
+      codePoints.push(cp.toString(16));
+      if (cp > 0xffff) i++;
+    }
+  }
+  return `https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/${codePoints.join('-')}.svg`;
+}
+
 export function renderEmojiToken(
   token: string,
   customEmojis?: Map<string, string>,
@@ -99,10 +111,19 @@ export function renderEmojiToken(
   }
   const unicode = BUILTIN_SHORTCODES[clean];
   if (unicode) {
+    const twemojiUrl = getTwemojiUrl(unicode);
     return (
-      <span key={key} title={`:${clean}:`} className="inline-block align-middle">
-        {unicode}
-      </span>
+      <img
+        key={key}
+        src={twemojiUrl}
+        alt={unicode}
+        title={`:${clean}:`}
+        className={`${sizeClass} inline-block object-contain align-middle mx-0.5 select-none`}
+        onError={(e) => {
+          // フォールバックでテキスト表示
+          (e.currentTarget as any).style.display = 'none';
+        }}
+      />
     );
   }
   return null;
@@ -363,9 +384,24 @@ export function SmartMarkdown({
               </a>
             );
           },
+          blockquote: ({ children }) => (
+            <div className="my-1.5 pl-3 pr-2.5 py-1.5 border-l-4 border-indigo-500/80 bg-[#16181F]/90 rounded-r-lg text-stone-200 text-xs sm:text-[13px] leading-relaxed shadow-sm">
+              {children}
+            </div>
+          ),
           img: ({ src, alt }) => {
             const proxied = toProxiedMediaUrl(src || '', opts.token || '');
-            return <img src={proxied} alt={alt || ''} className="max-h-72 rounded-lg my-1 object-contain border border-stone-800" />;
+            return (
+              <span className="relative my-1 inline-block max-w-full align-middle">
+                <img
+                  src={proxied}
+                  alt={alt || ''}
+                  loading="lazy"
+                  className="max-h-72 w-auto rounded-lg object-contain border border-stone-800 bg-stone-900/60 transition-opacity duration-200"
+                  style={{ minHeight: '48px', minWidth: '48px' }}
+                />
+              </span>
+            );
           },
         }}
       >
