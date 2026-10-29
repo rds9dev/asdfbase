@@ -98,7 +98,7 @@ import { RealtimeClient, type RealtimeStatus, type ConcreteTransport } from './r
 import { UiHost, HoverCard, Modal, confirmDialog, toast } from './ui';
 import {
   DEFAULT_CONFIG, SCHEDULE_LABELS, DAY_LABELS, MAX_PERIODS, SUBJECTS, CLASS_NUMBERS,
-  computeSchoolStatus, daySlots, periodCountFor, closingFor,
+  computeSchoolStatus, daySlots, periodCountFor, closingFor, getJapaneseHoliday,
   type ScheduleType, type ScheduleDef, type TimetableConfig, type TimetableItem,
 } from './schedule';
 import {
@@ -437,6 +437,8 @@ export default function App() {
   const [isAiJobRunning, setIsAiJobRunning] = useState<boolean>(false);
   const [hasUnreadAiResult, setHasUnreadAiResult] = useState<boolean>(false);
   const [aiJobProgressText, setAiJobProgressText] = useState<string | null>(null);
+  const initialConnectionGraceRef = useRef<number>(Date.now() + 4000);
+  const lastAiToastTimeRef = useRef<number>(0);
   const [showRoleManagerModal, setShowRoleManagerModal] = useState<boolean>(false);
   const [newRoleIdInput, setNewRoleIdInput] = useState<string>('');
   const [newRoleNameInput, setNewRoleNameInput] = useState<string>('');
@@ -468,6 +470,9 @@ export default function App() {
   // モバイル メニューシート & スラッシュコマンド補完
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
+  const [showAllOfflineMembers, setShowAllOfflineMembers] = useState(false);
+  const [showCodeZoneModal, setShowCodeZoneModal] = useState(false);
+  const [selectedUserForCodeZone, setSelectedUserForCodeZone] = useState<number | ''>('');
 
   // アカウント同期設定のサーバー保存 (デバウンス)
   // ※ 接続設定 (方式・ポーリング間隔・プロキシ/直結経路) は端末ごとに異なる環境用のためアカウント同期せず端末ローカルに保持
@@ -746,6 +751,7 @@ export default function App() {
   const memoDirtyRef = useRef(false);
   // チャンネルを開いた時点の最新ID。これより新しいメッセージだけ登場アニメーション
   const lastSeenAtMountRef = useRef(Number.MAX_SAFE_INTEGER);
+  const animatedMessageIdsRef = useRef<Set<number | string>>(new Set());
 
   // React の描画確定後 (2フレーム後) に最下部へ。smooth は手動ボタン用
   const scheduleScrollToBottom = (smooth = false) => {
@@ -1276,7 +1282,13 @@ export default function App() {
       } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
         setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
       } else if (msg.type === 'NOTE_UPDATED') {
-        setMemoSlots(prev => prev.map(n => n.slot_index === msg.payload.slot_index ? { ...n, ...msg.payload, assigned_username: msg.payload.assigned_username || (n as any).assigned_username } : n));
+        setMemoSlots(prev => {
+          const exists = prev.some(n => n.slot_index === msg.payload.slot_index);
+          if (exists) {
+            return prev.map(n => n.slot_index === msg.payload.slot_index ? { ...n, ...msg.payload, assigned_username: msg.payload.assigned_username || (n as any).assigned_username } : n);
+          }
+          return [...prev, msg.payload].sort((a, b) => a.slot_index - b.slot_index);
+        });
         // 自分の保存の反映は無視 (保存中に打った文字が巻き戻らないように)
         const isOwnSave = msg.sender && msg.sender === currentUserRef.current?.username;
         if (msg.payload.slot_index === selectedSlotIndexRef.current && !isOwnSave && !memoDirtyRef.current) {
@@ -1284,6 +1296,16 @@ export default function App() {
           setMemoContent(msg.payload.content);
           setMemoMode(msg.payload.mode);
           setMemoAssignedUser(msg.payload.assigned_user_id);
+        }
+      } else if (msg.type === 'NOTE_DELETED') {
+        const deletedSlot = msg.payload.slot_index;
+        setMemoSlots(prev => prev.filter(n => n.slot_index !== deletedSlot));
+        if (selectedSlotIndexRef.current === deletedSlot) {
+          setSelectedSlotIndex(1);
+          const first = memoSlots.find(n => n.slot_index === 1);
+          setMemoTitle(first?.title || 'メモ 1');
+          setMemoContent(first?.content || '');
+          setMemoMode(first?.mode || 'markdown');
         }
       } else if (msg.type === 'USER_STATUS_CHANGED') {
         setOnlineUsers(prev => {
@@ -1422,12 +1444,21 @@ export default function App() {
         setAiJobProgressText(null);
         if (activeTabRef.current !== 'ai') {
           setHasUnreadAiResult(true);
-          toast('AI の処理が完了しました', { kind: 'success' });
+          const now = Date.now();
+          // 接続直後のリプレイ時および短時間の重複通知を抑止
+          if (now > initialConnectionGraceRef.current && now - lastAiToastTimeRef.current > 5000) {
+            lastAiToastTimeRef.current = now;
+            toast('AI の処理が完了しました', { kind: 'success' });
+          }
         }
       } else if (msg.type === 'AI_JOB_FAILED') {
         setIsAiJobRunning(false);
         setAiJobProgressText(null);
-        toast(`AI 処理エラー: ${msg.payload.error || '失敗しました'}`, { kind: 'error' });
+        const now = Date.now();
+        if (now > initialConnectionGraceRef.current && now - lastAiToastTimeRef.current > 5000) {
+          lastAiToastTimeRef.current = now;
+          toast(`AI 処理エラー: ${msg.payload.error || '失敗しました'}`, { kind: 'error' });
+        }
       } else if (msg.type === 'USER_DELETED') {
         setOnlineUsers(prev => prev.filter(u => u.id !== msg.payload.userId));
       } else if (msg.type === 'USER_PREFERENCES_UPDATED') {
@@ -1803,6 +1834,7 @@ export default function App() {
     setHasNewerMessages(false);
     hasNewerRef.current = false;
     lastSeenAtMountRef.current = Number.MAX_SAFE_INTEGER;
+    animatedMessageIdsRef.current.clear();
     const jump = pendingJumpRef.current;
     if (jump && jump.channelId === channelId) {
       pendingJumpRef.current = null;
@@ -4797,85 +4829,16 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 選択中のDiscordサーバーの人数・オンライン・VC・喋ってる人サマリー */}
-                  {selectedServer && (() => {
-                    const vcsList = Array.isArray(selectedServer.voiceChannels)
-                      ? selectedServer.voiceChannels.filter((v: any) => (v.members?.length || 0) > 0)
-                      : Array.isArray(selectedServer.vcs)
-                        ? selectedServer.vcs.filter((v: any) => (v.members?.length || 0) > 0)
-                        : [];
-                    const membersList = Array.isArray(selectedServer.members)
-                      ? selectedServer.members
-                      : Array.isArray(selectedServer.onlineMembers)
-                        ? selectedServer.onlineMembers
-                        : [];
-                    return (
-                      <div className="mb-2 p-2 rounded-xl bg-[#12141B] border border-indigo-500/25 text-[11px] space-y-1.5 shrink-0">
-                        <div className="flex items-center justify-between text-stone-300">
-                          <span className="flex items-center gap-1">
-                            <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                            <b className="text-emerald-300">{selectedServer.onlineCount || 0}</b> オンライン
-                          </span>
-                          <span className="text-stone-400">全 <b>{selectedServer.memberCount || 0}</b> 人</span>
-                        </div>
-                        {vcsList.length > 0 && (
-                          <div className="space-y-1 pt-1 border-t border-stone-800/80">
-                            {vcsList.map((vc: any) => (
-                              <div key={vc.id || vc.channelId} className="space-y-0.5">
-                                <div className="text-[10px] font-bold text-indigo-300 flex items-center gap-1">
-                                  <Volume2 className="w-3 h-3 animate-pulse" /> {vc.name || vc.channelName} ({vc.members?.length || 0})
-                                </div>
-                                <div className="flex flex-wrap gap-1">
-                                  {(vc.members || []).map((m: any) => {
-                                    const mName = m.displayName || m.name || m.username;
-                                    const isMuted = m.selfMute || m.serverMute || m.muted;
-                                    return (
-                                      <span
-                                        key={m.id}
-                                        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] border ${
-                                          m.speaking
-                                            ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold'
-                                            : 'bg-stone-900 border-stone-800 text-stone-300'
-                                        }`}
-                                        title={`${mName}${m.speaking ? ' (発話中/マイクON)' : isMuted ? ' (ミュート)' : ''}${m.streaming ? ' [画面共有中]' : ''}`}
-                                      >
-                                        {m.avatarUrl ? (
-                                          <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
-                                        ) : (
-                                          <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
-                                        )}
-                                        <span className="max-w-[80px] truncate">{mName}</span>
-                                        {m.speaking ? <Mic className="w-2.5 h-2.5 text-emerald-400" /> : isMuted ? <MicOff className="w-2.5 h-2.5 text-stone-500" /> : null}
-                                      </span>
-                                    );
-                                  })}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        {membersList.length > 0 && (
-                          <div className="pt-1 border-t border-stone-800/80">
-                            <div className="flex flex-wrap gap-1 max-h-14 overflow-y-auto">
-                              {membersList.slice(0, 18).map((m: any) => {
-                                const mName = m.displayName || m.name || m.username;
-                                return (
-                                  <span
-                                    key={m.id}
-                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-stone-900/90 border border-stone-800 text-[10px] text-stone-300"
-                                    title={`${mName} (${m.status})`}
-                                  >
-                                    <span className={`w-1.5 h-1.5 rounded-full ${m.status === 'online' ? 'bg-emerald-400' : m.status === 'idle' ? 'bg-amber-400' : 'bg-red-400'}`} />
-                                    <span className="max-w-[72px] truncate">{mName}</span>
-                                  </span>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })()}
+                  {/* 選択中のDiscordサーバーの人数・オンラインサマリー (VCは右側サイドバーに集約) */}
+                  {selectedServer && (
+                    <div className="mb-2 p-2 rounded-xl bg-[#12141B] border border-indigo-500/25 text-[11px] flex items-center justify-between text-stone-300 shrink-0">
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                        <b className="text-emerald-300">{selectedServer.onlineCount || 0}</b> オンライン
+                      </span>
+                      <span className="text-stone-400">全 <b>{selectedServer.memberCount || 0}</b> 人</span>
+                    </div>
+                  )}
 
                   {/* チャンネル一覧: Discord のカテゴリごとにグループ化 & 折りたたみ表示 */}
                   <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-0.5">
@@ -5219,6 +5182,12 @@ export default function App() {
                       );
                       const timeLabel = created.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+                      const msgKey = m.client_nonce || m.id;
+                      const isNewIncoming = (m.id > lastSeenAtMountRef.current || m.id < 0) && !animatedMessageIdsRef.current.has(msgKey);
+                      if (isNewIncoming) {
+                        animatedMessageIdsRef.current.add(msgKey);
+                      }
+
                       return (
                         <React.Fragment key={m.client_nonce || m.id}>
                           {isNewDay && (
@@ -5273,7 +5242,7 @@ export default function App() {
                               isGrouped ? 'py-0' : 'pt-2 pb-0 mt-1'
                             } ${m.is_pinned ? 'bg-amber-500/5 border-l-2 border-amber-500/60' : ''} ${
                               isMentioningMe ? 'bg-amber-500/10 border-l-2 border-amber-400' : ''
-                            } ${m.pending ? 'opacity-60' : ''} ${m.id > lastSeenAtMountRef.current || m.id < 0 ? 'anim-msg' : ''}`}
+                            } ${m.pending ? 'opacity-60' : ''} ${isNewIncoming ? 'anim-msg' : ''}`}
                           >
                             {isGrouped ? (
                               <div className="w-9 shrink-0 text-[10px] text-stone-600 text-right pt-1 opacity-0 group-hover:opacity-100 select-none">
@@ -5937,17 +5906,30 @@ export default function App() {
                 )}
 
                 {(['online', 'away', 'offline'] as const).map(group => {
-                  const members = onlineUsers.filter(u =>
+                  const allMembers = onlineUsers.filter(u =>
                     group === 'offline' ? (u.status !== 'online' && u.status !== 'away') : u.status === group
                   );
-                  if (members.length === 0) return null;
+                  if (allMembers.length === 0) return null;
+                  const isOfflineGroup = group === 'offline';
+                  const displayMembers = isOfflineGroup && !showAllOfflineMembers ? allMembers.slice(0, 30) : allMembers;
+                  const hasMore = isOfflineGroup && allMembers.length > 30;
+
                   return (
                     <div key={group} className="mb-3">
-                      <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold">
-                        {group === 'online' ? 'オンライン' : group === 'away' ? '離席中' : 'オフライン'} — {members.length}
+                      <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold flex items-center justify-between">
+                        <span>{group === 'online' ? 'オンライン' : group === 'away' ? '離席中' : 'オフライン'} — {allMembers.length}</span>
+                        {isOfflineGroup && hasMore && (
+                          <button
+                            type="button"
+                            onClick={() => setShowAllOfflineMembers(v => !v)}
+                            className="text-[10px] text-amber-400 hover:underline font-normal normal-case"
+                          >
+                            {showAllOfflineMembers ? '折りたたむ' : `もっと見る (+${allMembers.length - 30})`}
+                          </button>
+                        )}
                       </div>
                       <div className="space-y-0.5">
-                        {members.map(u => (
+                        {displayMembers.map(u => (
                           <button
                             key={u.id}
                             type="button"
@@ -5973,6 +5955,15 @@ export default function App() {
                           </button>
                         ))}
                       </div>
+                      {isOfflineGroup && hasMore && !showAllOfflineMembers && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllOfflineMembers(true)}
+                          className="w-full mt-1 py-1 text-center text-[11px] text-stone-500 hover:text-amber-400 hover:bg-stone-800/40 rounded-lg transition"
+                        >
+                          他 {allMembers.length - 30} 人を表示…
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -6021,34 +6012,88 @@ export default function App() {
                 {/* スロット11以降: メンバー専用Monacoエディタ */}
                 <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold flex items-center justify-between shrink-0 border-t border-stone-800/80 pt-3">
                   <span>専用コードゾーン</span>
-                  <Code className="w-3.5 h-3.5 text-stone-500" />
+                  <div className="flex items-center gap-1">
+                    {currentUser.role === 'admin' && (
+                      <button
+                        type="button"
+                        onClick={() => setShowCodeZoneModal(true)}
+                        className="p-1 text-stone-400 hover:text-amber-400 hover:bg-stone-800 rounded transition"
+                        title="コードゾーンを管理・追加"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                    <Code className="w-3.5 h-3.5 text-stone-500" />
+                  </div>
                 </div>
                 <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1">
                   {memoSlots.filter(s => s.slot_index >= 11).map(slot => {
                     const isMySlot = slot.assigned_user_id === currentUser?.id;
                     const assignedName = (slot as any).assigned_username || `ユーザー${slot.assigned_user_id || ''}`;
                     return (
-                      <button
+                      <div
                         key={slot.slot_index}
-                        onClick={() => selectMemoSlot(slot)}
-                        className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-mono text-left border ${
+                        className={`group w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-mono border transition ${
                           selectedSlotIndex === slot.slot_index
                             ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 shadow-sm'
                             : 'bg-[#111214] border-stone-800/80 text-stone-400 hover:text-stone-100 hover:border-stone-600 hover:bg-stone-900'
                         }`}
                       >
-                        <div className="flex items-center gap-2 truncate min-w-0">
+                        <button
+                          type="button"
+                          onClick={() => selectMemoSlot(slot)}
+                          className="flex items-center gap-2 truncate min-w-0 flex-1 text-left"
+                        >
                           <Avatar name={assignedName} url={slot.assigned_user_id ? userById.get(slot.assigned_user_id)?.avatar_url : null} size="w-5 h-5 text-[10px]" />
                           <span className="truncate font-bold text-white">{assignedName}</span>
+                        </button>
+                        <div className="flex items-center gap-1 shrink-0 ml-2">
+                          {isMySlot ? (
+                            <span className="text-[9px] bg-emerald-950/60 border border-emerald-800/80 text-emerald-300 px-1.5 rounded">あなた</span>
+                          ) : (
+                            <Lock className="w-3 h-3 text-stone-600" />
+                          )}
+                          {currentUser.role === 'admin' && (
+                            <button
+                              type="button"
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                const ok = await confirmDialog({
+                                  title: `コードゾーン #${slot.slot_index} を削除しますか？`,
+                                  message: `${assignedName} に割り当てられた専用コードゾーンを削除します。保存されているコード内容は完全に消去されます。`,
+                                  confirmLabel: '削除する',
+                                  danger: true,
+                                });
+                                if (!ok) return;
+                                try {
+                                  const res = await safeFetch(`/api/notes/code-zones/${slot.slot_index}`, {
+                                    method: 'DELETE',
+                                    headers: { Authorization: `Bearer ${token}` },
+                                  });
+                                  if (!res.ok) {
+                                    const err = await res.json().catch(() => ({}));
+                                    throw new Error(err.error || '削除失敗');
+                                  }
+                                  toast('専用コードゾーンを削除しました', { kind: 'success' });
+                                } catch (err: any) {
+                                  toast(`削除エラー: ${err.message}`, { kind: 'error' });
+                                }
+                              }}
+                              className="opacity-0 group-hover:opacity-100 p-1 text-stone-500 hover:text-red-400 hover:bg-red-950/40 rounded transition"
+                              title="このコードゾーンを削除 (管理者のみ)"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          )}
                         </div>
-                        {isMySlot ? (
-                          <span className="text-[9px] bg-emerald-950/60 border border-emerald-800/80 text-emerald-300 px-1.5 rounded shrink-0">あなた</span>
-                        ) : (
-                          <Lock className="w-3 h-3 text-stone-600 shrink-0" />
-                        )}
-                      </button>
+                      </div>
                     );
                   })}
+                  {memoSlots.filter(s => s.slot_index >= 11).length === 0 && (
+                    <div className="px-3 py-4 text-center text-[11px] text-stone-600">
+                      割り当てられたコードゾーンはありません
+                    </div>
+                  )}
                 </div>
               </div>
             </aside>
@@ -8788,6 +8833,83 @@ export default function App() {
       )}
 
       {/* お知らせ作成モーダル (admin限定) */}
+      {showCodeZoneModal && currentUser.role === 'admin' && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setShowCodeZoneModal(false)}>
+          <div onClick={e => e.stopPropagation()} className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
+            <div className="flex items-center justify-between border-b border-stone-800 pb-2.5">
+              <div className="font-bold text-white text-sm flex items-center gap-2">
+                <Code className="w-4 h-4 text-amber-400" /> 専用コードゾーンの作成・割り当て
+              </div>
+              <button onClick={() => setShowCodeZoneModal(false)} className="text-stone-500 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-stone-400 leading-relaxed">
+              ユーザーを選択して「作成」を押すと、そのユーザー専用のMonacoエディタ（コードゾーン）が作成されます。
+            </p>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-stone-300 font-bold mb-1.5">割り当て先ユーザー</label>
+                <select
+                  value={selectedUserForCodeZone}
+                  onChange={e => setSelectedUserForCodeZone(e.target.value === '' ? '' : Number(e.target.value))}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                >
+                  <option value="">ユーザーを選択してください</option>
+                  {onlineUsers.map(u => {
+                    const hasZone = memoSlots.some(s => s.slot_index >= 11 && s.assigned_user_id === u.id);
+                    return (
+                      <option key={u.id} value={u.id} disabled={hasZone}>
+                        {u.username} {hasZone ? '(作成済み)' : ''}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowCodeZoneModal(false)}
+                  className="px-3.5 py-1.5 rounded-xl border border-stone-700 hover:bg-stone-800 text-stone-300 font-bold transition"
+                >
+                  閉じる
+                </button>
+                <button
+                  type="button"
+                  disabled={selectedUserForCodeZone === ''}
+                  onClick={async () => {
+                    if (selectedUserForCodeZone === '') return;
+                    try {
+                      const res = await safeFetch('/api/notes/code-zones', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                        body: JSON.stringify({ targetUserId: selectedUserForCodeZone }),
+                      });
+                      if (!res.ok) {
+                        const err = await res.json().catch(() => ({}));
+                        throw new Error(err.error || '作成失敗');
+                      }
+                      toast('専用コードゾーンを作成しました', { kind: 'success' });
+                      setShowCodeZoneModal(false);
+                      setSelectedUserForCodeZone('');
+                    } catch (err: any) {
+                      toast(`エラー: ${err.message}`, { kind: 'error' });
+                    }
+                  }}
+                  className="px-4 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold transition disabled:opacity-40"
+                >
+                  コードゾーンを作成
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* お知らせ作成モーダル (admin限定) */}
       {isNewAnnouncementModalOpen && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
           <div className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
@@ -9038,25 +9160,39 @@ export default function App() {
                     <thead>
                       <tr className="bg-stone-900/80 border-b border-stone-800 text-stone-400">
                         <th className="py-2 px-2 w-20 border-r border-stone-800 font-bold">時限</th>
-                        {[1, 2, 3, 4, 5].map(day => (
-                          <th
-                            key={day}
-                            className={`py-1.5 px-2 border-r border-stone-800 last:border-r-0 font-bold ${
-                              nowForStatus.getDay() === day ? 'text-amber-300 bg-amber-500/10' : 'text-white'
-                            }`}
-                          >
-                            <div>{DAY_LABELS[day]}</div>
-                            <button
-                              onClick={() => handleToggleDayPeriods(day)}
-                              title="5限 / 6限 を切り替え"
-                              className={`mt-0.5 px-1.5 rounded text-[10px] font-bold border ${
-                                periodCountFor(ttConfig, day) === 5 ? 'bg-sky-500/15 border-sky-500/40 text-sky-300' : 'border-stone-700 text-stone-400 hover:text-white'
+                        {[1, 2, 3, 4, 5].map(day => {
+                          // 今週の各曜日の日付を計算して祝日判定
+                          const currentDow = nowForStatus.getDay();
+                          const diffDays = day - (currentDow === 0 ? 7 : currentDow);
+                          const colDate = new Date(nowForStatus.getFullYear(), nowForStatus.getMonth(), nowForStatus.getDate() + diffDays);
+                          const holidayName = getJapaneseHoliday(colDate);
+                          return (
+                            <th
+                              key={day}
+                              className={`py-1.5 px-2 border-r border-stone-800 last:border-r-0 font-bold ${
+                                nowForStatus.getDay() === day ? 'text-amber-300 bg-amber-500/10' : 'text-white'
                               }`}
                             >
-                              {periodCountFor(ttConfig, day)}限まで
-                            </button>
-                          </th>
-                        ))}
+                              <div className="flex items-center justify-center gap-1">
+                                <span>{DAY_LABELS[day]}</span>
+                                {holidayName && (
+                                  <span className="text-[9px] bg-red-950/70 text-red-300 px-1 rounded font-normal" title={holidayName}>
+                                    祝日
+                                  </span>
+                                )}
+                              </div>
+                              <button
+                                onClick={() => handleToggleDayPeriods(day)}
+                                title="5限 / 6限 を切り替え"
+                                className={`mt-0.5 px-1.5 rounded text-[10px] font-bold border ${
+                                  periodCountFor(ttConfig, day) === 5 ? 'bg-sky-500/15 border-sky-500/40 text-sky-300' : 'border-stone-700 text-stone-400 hover:text-white'
+                                }`}
+                              >
+                                {periodCountFor(ttConfig, day)}限まで
+                              </button>
+                            </th>
+                          );
+                        })}
                       </tr>
                     </thead>
                     <tbody>
@@ -9143,6 +9279,21 @@ export default function App() {
                             ttDetailDraft.subject === subj
                               ? 'bg-amber-500 text-black font-bold border-amber-400'
                               : 'bg-[#16181D] border-stone-800 text-stone-300 hover:text-white hover:border-stone-500'
+                          }`}
+                        >
+                          {subj}
+                        </button>
+                      ))}
+                      {/* 2時間続き・特別授業プリセット */}
+                      {['総合(2時間)', '学活(2時間)', '行事・集会', 'テスト', '特別授業'].map(subj => (
+                        <button
+                          type="button"
+                          key={subj}
+                          onClick={() => handlePresetSubject(subj)}
+                          className={`px-2 py-1 rounded border text-[11px] font-bold ${
+                            ttDetailDraft.subject === subj
+                              ? 'bg-indigo-500 text-white border-indigo-400'
+                              : 'bg-indigo-950/30 border-indigo-800/60 text-indigo-300 hover:text-white hover:border-indigo-500'
                           }`}
                         >
                           {subj}

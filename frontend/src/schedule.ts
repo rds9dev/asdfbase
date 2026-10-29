@@ -148,9 +148,71 @@ export function shortDateLabel(ymdStr: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}(${DAY_LABELS[d.getDay()]})`;
 }
 
-// 今日から見て何日後か (ローカル日付)
+// 日本の祝日判定 (内閣府「国民の祝日」ロジック)
 export function daysFromToday(ymdStr: string, now = new Date()): number {
   const d = new Date(`${ymdStr}T00:00:00`);
   const t = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   return Math.round((d.getTime() - t.getTime()) / 86400000);
+}
+
+export function getJapaneseHoliday(date: Date): string | null {
+  const y = date.getFullYear();
+  const m = date.getMonth() + 1;
+  const d = date.getDate();
+  const dow = date.getDay();
+
+  // 固定祝日
+  if (m === 1 && d === 1) return '元日';
+  if (m === 2 && d === 11) return '建国記念の日';
+  if (m === 2 && d === 23) return '天皇誕生日';
+  if (m === 4 && d === 29) return '昭和の日';
+  if (m === 5 && d === 3) return '憲法記念日';
+  if (m === 5 && d === 4) return 'みどりの日';
+  if (m === 5 && d === 5) return 'こどもの日';
+  if (m === 8 && d === 11) return '山の日';
+  if (m === 11 && d === 3) return '文化の日';
+  if (m === 11 && d === 23) return '勤労感謝の日';
+
+  // ハッピーマンデー (第2月曜 / 第3月曜)
+  const nthMonday = (targetN: number) => {
+    let count = 0;
+    for (let day = 1; day <= 31; day++) {
+      const cur = new Date(y, m - 1, day);
+      if (cur.getMonth() !== m - 1) break;
+      if (cur.getDay() === 1) {
+        count++;
+        if (count === targetN) return day;
+      }
+    }
+    return -1;
+  };
+
+  if (m === 1 && d === nthMonday(2)) return '成人の日';
+  if (m === 7 && d === nthMonday(3)) return '海の日';
+  if (m === 9 && d === nthMonday(3)) return '敬老の日';
+  if (m === 10 && d === nthMonday(2)) return 'スポーツの日';
+
+  // 春分の日 (簡易計算式: 2000-2099年対応)
+  if (m === 3) {
+    const shunbun = Math.floor(20.8431 + 0.242194 * (y - 1980) - Math.floor((y - 1980) / 4));
+    if (d === shunbun) return '春分の日';
+  }
+  // 秋分の日
+  if (m === 9) {
+    const shubun = Math.floor(23.2488 + 0.242194 * (y - 1980) - Math.floor((y - 1980) / 4));
+    if (d === shubun) return '秋分の日';
+    // 国民の休日 (敬老の日と秋分の日に挟まれた日)
+    const keiro = nthMonday(3);
+    if (shubun === keiro + 2 && d === keiro + 1) return '国民の休日';
+  }
+
+  // 振替休日判定: 日曜日の祝日の翌平日
+  if (dow !== 0) {
+    const yesterday = new Date(y, m - 1, d - 1);
+    if (yesterday.getDay() === 0 && getJapaneseHoliday(yesterday)) {
+      return '振替休日';
+    }
+  }
+
+  return null;
 }

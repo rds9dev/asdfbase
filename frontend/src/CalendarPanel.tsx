@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import { ChevronLeft, ChevronRight, Clock, Pencil, Plus, Trash2, X } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
+import { getJapaneseHoliday } from './schedule';
 
 export interface CalendarEvent {
   id: number;
@@ -47,10 +48,22 @@ export function CalendarHoverSummary({ now, events }: { now: Date; events: Calen
         {days.map(d => {
           const key = ymd(d);
           const inMonth = d.getMonth() === now.getMonth();
+          const holiday = getJapaneseHoliday(d);
           return (
             <span
               key={key}
-              className={`relative py-0.5 rounded tabular-nums ${key === today ? 'bg-amber-500 text-black font-bold' : inMonth ? 'text-stone-300' : 'text-stone-700'}`}
+              title={holiday || undefined}
+              className={`relative py-0.5 rounded tabular-nums ${
+                key === today
+                  ? 'bg-amber-500 text-black font-bold'
+                  : holiday || d.getDay() === 0
+                    ? 'text-red-400 font-medium'
+                    : d.getDay() === 6
+                      ? 'text-sky-400 font-medium'
+                      : inMonth
+                        ? 'text-stone-300'
+                        : 'text-stone-700'
+              }`}
             >
               {d.getDate()}
               {hasEvent.has(key) && key !== today && <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-amber-400" />}
@@ -183,6 +196,7 @@ export function CalendarPanel({ token, safeFetch, currentUser, events, loadRange
               const key = ymd(d);
               const list = byDate.get(key) || [];
               const inMonth = d.getMonth() === cursor.m;
+              const holiday = getJapaneseHoliday(d);
               return (
                 <button
                   key={key}
@@ -195,9 +209,24 @@ export function CalendarPanel({ token, safeFetch, currentUser, events, loadRange
                     key === selected ? 'border-amber-500 bg-amber-500/10' : 'border-stone-800/70 hover:border-stone-600 bg-[#16181D]/50'
                   } ${inMonth ? '' : 'opacity-40'}`}
                 >
-                  <span className={`self-start px-1 rounded tabular-nums ${key === today ? 'bg-amber-500 text-black font-bold' : d.getDay() === 0 ? 'text-red-400' : d.getDay() === 6 ? 'text-sky-400' : 'text-stone-300'}`}>
-                    {d.getDate()}
-                  </span>
+                  <div className="flex items-center gap-1">
+                    <span className={`self-start px-1 rounded tabular-nums ${
+                      key === today
+                        ? 'bg-amber-500 text-black font-bold'
+                        : holiday || d.getDay() === 0
+                          ? 'text-red-400 font-bold'
+                          : d.getDay() === 6
+                            ? 'text-sky-400 font-bold'
+                            : 'text-stone-300'
+                    }`}>
+                      {d.getDate()}
+                    </span>
+                    {holiday && (
+                      <span className="hidden sm:inline text-[9px] text-red-300 bg-red-950/60 px-1 rounded truncate max-w-[65px]" title={holiday}>
+                        {holiday}
+                      </span>
+                    )}
+                  </div>
                   {list.slice(0, 2).map(e => (
                     <span key={e.id} className="hidden sm:flex items-center gap-1 text-[10px] text-stone-300 min-w-0">
                       <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotFor(e.user_id)}`} />

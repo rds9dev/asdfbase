@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Bot, Check, Copy, Globe, Hash, Image as ImageIcon, Menu, MessageSquarePlus, Pencil, Plus, Search, Send, Sparkles, Trash2, UserCheck, Wrench, X, Zap, Brain, Activity } from 'lucide-react';
+import { Bot, Check, Copy, Globe, Hash, Image as ImageIcon, Menu, MessageSquarePlus, Pencil, Plus, Search, Send, Sparkles, Trash2, UserCheck, Wrench, X, Zap, Brain, Activity, RotateCcw } from 'lucide-react';
 import { confirmDialog, toast } from './ui';
 
 interface AiStep {
@@ -77,12 +77,12 @@ function DiffViewer({
   const [applied, setApplied] = useState(false);
 
   return (
-    <div className="mt-2.5 rounded-xl border border-stone-800 bg-[#0F1013] overflow-hidden text-xs">
-      <div className="px-3 py-2 bg-stone-900/80 border-b border-stone-800 flex items-center justify-between gap-2">
+    <div className="mt-2.5 rounded-xl border border-amber-500/30 bg-[#0F1013] overflow-hidden text-xs shadow-lg">
+      <div className="px-3 py-2 bg-gradient-to-r from-stone-900 via-[#15171E] to-stone-900 border-b border-stone-800 flex items-center justify-between gap-2">
         <button
           type="button"
           onClick={() => setOpen(v => !v)}
-          className="flex items-center gap-1.5 font-mono text-[11px] text-stone-300 hover:text-white font-bold"
+          className="flex items-center gap-1.5 font-mono text-[11px] text-amber-300 hover:text-white font-bold"
         >
           <span>{open ? '▼' : '▶'}</span>
           <span>変更差分 (Diff): {diff.target}</span>
@@ -96,16 +96,31 @@ function DiffViewer({
                 setApplied(true);
                 toast(`メモ #${diff.slot} に差分を適用しました`, { kind: 'success' });
               }}
-              className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] flex items-center gap-1 transition shadow"
+              className="px-3 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-bold text-[11px] flex items-center gap-1.5 transition shadow-[0_0_12px_rgba(16,185,129,0.3)] animate-pulse hover:animate-none"
             >
-              <Check className="w-3 h-3" />
-              差分を適用
+              <Check className="w-3.5 h-3.5 stroke-[3]" />
+              差分を適用する
             </button>
           )}
-          {applied && (
-            <span className="text-[10px] font-bold text-emerald-400 flex items-center gap-1">
-              <Check className="w-3 h-3" /> 適用済み
-            </span>
+          {onApply && diff.slot && applied && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-bold text-emerald-400 flex items-center gap-1">
+                <Check className="w-3 h-3" /> 適用済み
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  onApply(diff.slot!, diff.oldText);
+                  setApplied(false);
+                  toast(`メモ #${diff.slot} の差分を元に戻しました (Undo)`, { kind: 'success' });
+                }}
+                className="px-2 py-0.5 rounded bg-stone-800 hover:bg-stone-700 text-stone-300 hover:text-white text-[10px] font-bold flex items-center gap-1 transition border border-stone-700"
+                title="適用前の状態に戻す"
+              >
+                <RotateCcw className="w-3 h-3 text-amber-400" />
+                元に戻す (Undo)
+              </button>
+            </div>
           )}
         </div>
       </div>
@@ -147,7 +162,8 @@ const PERSONA_OPTIONS = [
 
 const SUGGESTIONS = [
   '今日の時間割と持ち物は？',
-  '締切が近い提出物を教えて',
+  '未提出・締切が近い提出物を要約してチェックして',
+  '現在のメモの内容を校正・改善して',
   '今週の予定をまとめて',
   'テストの点数から苦手な教科を分析して',
   '明日の天気は？',
@@ -199,6 +215,8 @@ export default function AiTab({
   const storageKey = `asdf_ai_history_${userId}`;
   const [threads, setThreads] = useState<AiThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  const activeThreadIdRef = useRef<number | null>(null);
+  activeThreadIdRef.current = activeThreadId;
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [messages, setMessages] = useState<AiMessage[]>(() => loadHistory(storageKey));
   const [persona, setPersona] = useState<string>('standard');
@@ -418,6 +436,7 @@ export default function AiTab({
     if ((!text && images.length === 0) || loading) return;
     const sentImages = images;
     const webSearch = forceWebSearch;
+    const targetThreadId = activeThreadId;
     const userMsg: AiMessage = {
       id: Date.now(), role: 'user', content: text || 'この画像について教えて', timestamp: timeNow(),
       thumbs: sentImages.length ? sentImages.map(im => im.thumb) : undefined,
@@ -430,7 +449,7 @@ export default function AiTab({
     if (inputRef.current) inputRef.current.style.height = 'auto';
     setLoading(true);
 
-    const currentThread = threads.find(t => t.id === activeThreadId);
+    const currentThread = threads.find(t => t.id === targetThreadId);
     const autoTitle =
       currentThread && (currentThread.title === '新しい会話' || !currentThread.title) && text
         ? text.replace(/\s+/g, ' ').slice(0, 26)
@@ -451,7 +470,7 @@ export default function AiTab({
           modelMode,
           persona,
           customPersona,
-          threadId: activeThreadId,
+          threadId: targetThreadId,
         }),
       });
 
@@ -516,9 +535,12 @@ export default function AiTab({
       };
       if (reply.steps?.some(st => st.write && st.ok)) toast('AI が操作を実行しました', { kind: 'success' });
       const finalMessages = [...next, reply].slice(-MAX_HISTORY);
-      setMessages(finalMessages);
-      setReveal({ id: reply.id, shown: 0 });
-      await syncThreadToServer(activeThreadId, {
+      if (activeThreadIdRef.current === targetThreadId) {
+        setMessages(finalMessages);
+        setReveal({ id: reply.id, shown: 0 });
+      }
+      setThreads(prev => prev.map(t => t.id === targetThreadId ? { ...t, messages: finalMessages, title: autoTitle || t.title } : t));
+      await syncThreadToServer(targetThreadId, {
         title: autoTitle,
         persona,
         custom_persona: customPersona,
@@ -534,8 +556,11 @@ export default function AiTab({
         error: true,
       };
       const finalMessages = [...next, errMsg].slice(-MAX_HISTORY);
-      setMessages(finalMessages);
-      await syncThreadToServer(activeThreadId, {
+      if (activeThreadIdRef.current === targetThreadId) {
+        setMessages(finalMessages);
+      }
+      setThreads(prev => prev.map(t => t.id === targetThreadId ? { ...t, messages: finalMessages, title: autoTitle || t.title } : t));
+      await syncThreadToServer(targetThreadId, {
         title: autoTitle,
         messages: finalMessages,
       });
@@ -1035,7 +1060,7 @@ export default function AiTab({
         <div className="max-w-4xl mx-auto space-y-2">
           {(
             <>
-              <div className="flex items-center gap-2 text-[11px] text-stone-500">
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-stone-500">
                 <button onClick={() => fileRef.current?.click()} disabled={images.length >= 4} className="btn-chip disabled:opacity-40">
                   <ImageIcon className="w-3 h-3 text-amber-400" /> 画像を添付
                 </button>
@@ -1050,6 +1075,24 @@ export default function AiTab({
                 >
                   <Globe className={`w-3 h-3 ${forceWebSearch ? 'text-sky-300' : 'text-amber-400'}`} /> Web検索{forceWebSearch ? ' ON' : ''}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => send('未提出や締切が近い提出物の要約とやるべきことをリストアップして')}
+                  className="btn-chip hover:text-amber-300"
+                  title="提出物の状態をAIが要約"
+                >
+                  <Sparkles className="w-3 h-3 text-amber-400" /> 提出物を要約
+                </button>
+                {memo.content.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => send(`現在のメモ (スロット #${memo.slot}: 「${memo.title || '無題'}」) の内容を校正・推敲して改善案や差分を提示して`)}
+                    className="btn-chip hover:text-amber-300"
+                    title="現在開いているメモをAIで校正"
+                  >
+                    <Wrench className="w-3 h-3 text-amber-400" /> メモ #{memo.slot} を校正
+                  </button>
+                )}
                 <input
                   ref={fileRef}
                   type="file"

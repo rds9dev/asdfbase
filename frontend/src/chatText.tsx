@@ -293,7 +293,7 @@ function decorateInlineChildren(children: React.ReactNode, opts: RenderOptions):
 }
 
 // チャットやメモで使える拡張Markdown (メンション・チャンネル・絵文字・目次アンカージャンプ対応)
-export function SmartMarkdown({
+export const SmartMarkdown = React.memo(function SmartMarkdown({
   content,
   opts,
   className = '',
@@ -412,7 +412,7 @@ export function SmartMarkdown({
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 // 入力欄の下に敷く「ハイライトだけの影」。文字は透明で、メンション部分にだけ色を付ける
 export function renderComposerHighlight(

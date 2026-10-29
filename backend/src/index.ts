@@ -2914,6 +2914,95 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
+// 管理者専用: 専用コードゾーンの作成（ユーザー割り当て）
+app.post('/api/notes/code-zones', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
+  try {
+    const { targetUserId } = req.body;
+    if (!targetUserId || typeof targetUserId !== 'number') {
+      return res.status(400).json({ error: 'targetUserId が必要です' });
+    }
+    const userRes = await pool.query(`SELECT id, username FROM users WHERE id = $1`, [targetUserId]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: '対象のユーザーが見つかりません' });
+    }
+    const targetUser = userRes.rows[0];
+
+    // すでに専用コードゾーンがあるか確認
+    const existing = await pool.query(`SELECT * FROM notes WHERE assigned_user_id = $1 AND slot_index >= 11`, [targetUserId]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'このユーザーの専用コードゾーンは既に存在します' });
+    }
+
+    // 空いている最小スロット (11以降) を探索
+    const usedSlotsRes = await pool.query(`SELECT slot_index FROM notes WHERE slot_index >= 11 ORDER BY slot_index ASC`);
+    const usedSlots = new Set(usedSlotsRes.rows.map(r => r.slot_index));
+    let newSlot = 11;
+    while (usedSlots.has(newSlot)) {
+      newSlot++;
+    }
+
+    const title = `${targetUser.username}の専用エディタ`;
+    const inserted = await pool.query(
+      `INSERT INTO notes (slot_index, title, content, mode, assigned_user_id)
+       VALUES ($1, $2, '', 'monaco', $3)
+       RETURNING *`,
+      [newSlot, title, targetUserId]
+    );
+
+    const createdNote = {
+      ...inserted.rows[0],
+      assigned_username: targetUser.username,
+    };
+
+    broadcast({
+      type: 'NOTE_UPDATED',
+      payload: createdNote,
+      sender: req.user!.username,
+    });
+    logAudit(req.user!, 'code_zone_create', 'note', newSlot, {
+      message: `管理者 ${req.user!.username} が ${targetUser.username} に専用コードゾーン #${newSlot} を割り当てました`,
+    });
+
+    res.json(createdNote);
+  } catch (err: any) {
+    console.error('Create code zone error:', err);
+    res.status(500).json({ error: err.message || '専用コードゾーンの作成に失敗しました' });
+  }
+});
+
+// 管理者専用: 専用コードゾーンの削除
+app.delete('/api/notes/code-zones/:slotIndex', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
+  try {
+    const slotIndex = parseInt(req.params.slotIndex, 10);
+    if (isNaN(slotIndex) || slotIndex < 11) {
+      return res.status(400).json({ error: 'スロット11以降の専用コードゾーンのみ削除可能です' });
+    }
+
+    const noteRes = await pool.query(`SELECT * FROM notes WHERE slot_index = $1`, [slotIndex]);
+    if (noteRes.rows.length === 0) {
+      return res.status(404).json({ error: '指定されたコードゾーンが見つかりません' });
+    }
+    const note = noteRes.rows[0];
+
+    await pool.query(`DELETE FROM note_history WHERE slot_index = $1`, [slotIndex]);
+    await pool.query(`DELETE FROM notes WHERE slot_index = $1`, [slotIndex]);
+
+    broadcast({
+      type: 'NOTE_DELETED',
+      payload: { slot_index: slotIndex },
+      sender: req.user!.username,
+    });
+    logAudit(req.user!, 'code_zone_delete', 'note', slotIndex, {
+      message: `管理者 ${req.user!.username} が専用コードゾーン #${slotIndex} を削除しました`,
+    });
+
+    res.json({ ok: true, slot_index: slotIndex });
+  } catch (err: any) {
+    console.error('Delete code zone error:', err);
+    res.status(500).json({ error: err.message || '専用コードゾーンの削除に失敗しました' });
+  }
+});
+
 // Audit Logs & Users List
 // action: 種類の前方一致 / user: ユーザーID または 'system' (操作者なし)
 function auditWhere(query: { action?: any; user?: any; beforeId?: any }) {
