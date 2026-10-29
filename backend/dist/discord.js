@@ -19,6 +19,7 @@ exports.relayToDiscordBot = relayToDiscordBot;
 exports.relayReactionToDiscord = relayReactionToDiscord;
 exports.relayPinToDiscord = relayPinToDiscord;
 exports.editRelayedOnDiscord = editRelayedOnDiscord;
+exports.deleteRelayedOnDiscord = deleteRelayedOnDiscord;
 exports.startDiscordBot = startDiscordBot;
 // Discord Bot 連携
 // - 許可されたサーバー (DISCORD_GUILD_ID) 以外では一切動作しない
@@ -444,7 +445,7 @@ async function getDiscordServers(includeUnapproved = false) {
             if (st !== 'offline' || voiceMemberIds.has(m.id))
                 onlineCount++;
         }
-        // オンラインまたはVC参加中のメンバーを優先して最大60名取得
+        // オンラインまたはVC参加中のメンバーを優先して取得 (オフライン含め最大300名)
         const sortedRaw = rawMemberList
             .filter(m => !m.user.bot || voiceMemberIds.has(m.id) || (m.presence?.status && m.presence.status !== 'offline'))
             .sort((a, b) => {
@@ -457,7 +458,7 @@ async function getDiscordServers(includeUnapproved = false) {
             const bSt = order[b.presence?.status || 'offline'] ?? 3;
             return aSt - bSt;
         })
-            .slice(0, 60);
+            .slice(0, 300);
         const members = await Promise.all(sortedRaw.map(async (m) => {
             const presence = m.presence;
             const status = (presence?.status || (voiceMemberIds.has(m.id) ? 'online' : 'offline'));
@@ -869,6 +870,28 @@ async function editRelayedOnDiscord(links, username, content) {
         }
     }
     return edited;
+}
+// asdfbase で削除されたメッセージを Discord 側でも削除
+async function deleteRelayedOnDiscord(links) {
+    if (!client || !connected || links.length === 0)
+        return false;
+    let deleted = false;
+    for (const l of links) {
+        try {
+            const ch = (await client.channels.fetch(l.discordChannelId));
+            if (!ch || !('messages' in ch) || !isGuildAllowed(ch.guildId))
+                continue;
+            const m = await ch.messages.fetch(l.discordMessageId).catch(() => null);
+            if (m && m.deletable) {
+                await m.delete();
+                deleted = true;
+            }
+        }
+        catch (err) {
+            console.error('[discord] delete relay failed:', err.message);
+        }
+    }
+    return deleted;
 }
 function createClient(_withMessageContent) {
     // 特権インテント (GuildMembers, GuildPresences, MessageContent) を全て有効化

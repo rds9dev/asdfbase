@@ -177,6 +177,19 @@ async function relayEdit(msg, username) {
         console.error('relayEdit error:', err.message);
     }
 }
+// 削除の Discord 反映: asdfbase で削除されたメッセージを Discord 側でも削除
+async function relayDelete(msgId) {
+    try {
+        const links = (await db_js_1.pool.query(`SELECT discord_channel_id, discord_message_id FROM discord_message_links WHERE asdf_message_id = $1`, [msgId])).rows.map(r => ({ discordChannelId: r.discord_channel_id, discordMessageId: r.discord_message_id }));
+        if (links.length > 0) {
+            await (0, discord_js_1.deleteRelayedOnDiscord)(links);
+            await db_js_1.pool.query(`DELETE FROM discord_message_links WHERE asdf_message_id = $1`, [msgId]);
+        }
+    }
+    catch (err) {
+        console.error('relayDelete error:', err.message);
+    }
+}
 // ---------------- Audit log ----------------
 function requestMeta(req) {
     const fwd = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -886,6 +899,7 @@ app.delete('/api/messages/:messageId', authMiddleware, async (req, res) => {
         }
         await db_js_1.pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
         broadcast({ type: 'MESSAGE_DELETED', payload: { messageId, channelId: msg.channel_id } });
+        relayDelete(messageId);
         logAudit(req.user, 'message_delete', 'message', messageId, {
             message: `メッセージ削除 (${msg.username} の投稿)`,
             channel_id: msg.channel_id,

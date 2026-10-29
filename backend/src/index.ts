@@ -15,7 +15,7 @@ import { askGemini, getAvailableKeyCount, runGeminiAgent, getAiUsageStats, initA
 import { aiToolDeclarations, createAiToolRunner, type DiffLine } from './aiTools.js';
 import type { Content } from '@google/genai';
 import {
-  startDiscordBot, relayToDiscordBot, editRelayedOnDiscord, getDiscordStatus, getDiscordGuildStatus, refreshDiscordCommands, getBoundAsdfChannelIds,
+  startDiscordBot, relayToDiscordBot, editRelayedOnDiscord, deleteRelayedOnDiscord, getDiscordStatus, getDiscordGuildStatus, refreshDiscordCommands, getBoundAsdfChannelIds,
   relayReactionToDiscord, relayPinToDiscord,
   getDiscordServers, addDiscordBinding, removeDiscordBinding, syncDiscordHistory, approveDiscordGuild, removeApprovedDiscordGuild,
 } from './discord.js';
@@ -176,6 +176,22 @@ async function relayEdit(msg: { id: number; channel_id: number; content: string 
     await postWebhook(url, { username: `[asdfbase] ${username}`, content: `${text} (編集済み)`.slice(0, 2000), allowed_mentions: { parse: [] } });
   } catch (err: any) {
     console.error('relayEdit error:', err.message);
+  }
+}
+
+// 削除の Discord 反映: asdfbase で削除されたメッセージを Discord 側でも削除
+async function relayDelete(msgId: number) {
+  try {
+    const links = (await pool.query(
+      `SELECT discord_channel_id, discord_message_id FROM discord_message_links WHERE asdf_message_id = $1`,
+      [msgId]
+    )).rows.map(r => ({ discordChannelId: r.discord_channel_id, discordMessageId: r.discord_message_id }));
+    if (links.length > 0) {
+      await deleteRelayedOnDiscord(links);
+      await pool.query(`DELETE FROM discord_message_links WHERE asdf_message_id = $1`, [msgId]);
+    }
+  } catch (err: any) {
+    console.error('relayDelete error:', err.message);
   }
 }
 
@@ -998,6 +1014,7 @@ app.delete('/api/messages/:messageId', authMiddleware, async (req: AuthRequest, 
 
     await pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
     broadcast({ type: 'MESSAGE_DELETED', payload: { messageId, channelId: msg.channel_id } });
+    relayDelete(messageId);
     logAudit(req.user!, 'message_delete', 'message', messageId, {
       message: `メッセージ削除 (${msg.username} の投稿)`,
       channel_id: msg.channel_id,

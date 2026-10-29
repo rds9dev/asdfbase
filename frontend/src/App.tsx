@@ -4829,16 +4829,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 選択中のDiscordサーバーの人数・オンラインサマリー (VCは右側サイドバーに集約) */}
-                  {selectedServer && (
-                    <div className="mb-2 p-2 rounded-xl bg-[#12141B] border border-indigo-500/25 text-[11px] flex items-center justify-between text-stone-300 shrink-0">
-                      <span className="flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                        <b className="text-emerald-300">{selectedServer.onlineCount || 0}</b> オンライン
-                      </span>
-                      <span className="text-stone-400">全 <b>{selectedServer.memberCount || 0}</b> 人</span>
-                    </div>
-                  )}
 
                   {/* チャンネル一覧: Discord のカテゴリごとにグループ化 & 折りたたみ表示 */}
                   <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-0.5">
@@ -5866,6 +5856,20 @@ export default function App() {
             {/* Right: Members Sidebar */}
             {!isMembersCollapsed && (
               <aside className="absolute lg:static inset-y-0 right-0 z-40 w-60 lg:w-56 border-l border-stone-800 bg-[#0C0D10] p-3 flex flex-col shrink-0 min-h-0 overflow-y-auto anim-slide-right lg:animate-none shadow-2xl lg:shadow-none">
+                {/* 選択中のDiscordサーバーの人数・オンラインサマリー (右メンバー一覧の拡張) */}
+                {selectedServer && (
+                  <div className="mb-3 p-2.5 rounded-xl bg-[#12141B] border border-indigo-500/25 shrink-0">
+                    <div className="flex items-center justify-between text-xs mb-1">
+                      <span className="font-bold text-stone-200 truncate" title={selectedServer.name}>{selectedServer.name}</span>
+                      <span className="text-[10px] text-stone-400">全 <b>{selectedServer.memberCount || selectedServer.members?.length || 0}</b> 人</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 font-medium">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block animate-pulse" />
+                      <span><b className="text-emerald-300">{selectedServer.onlineCount || 0}</b> オンライン</span>
+                    </div>
+                  </div>
+                )}
+
                 {/* Discord VC 参加者 */}
                 {discordVcs && discordVcs.length > 0 && (
                   <div className="mb-3 pb-3 border-b border-stone-800/80">
@@ -5905,68 +5909,190 @@ export default function App() {
                   </div>
                 )}
 
-                {(['online', 'away', 'offline'] as const).map(group => {
-                  const allMembers = onlineUsers.filter(u =>
-                    group === 'offline' ? (u.status !== 'online' && u.status !== 'away') : u.status === group
-                  );
-                  if (allMembers.length === 0) return null;
-                  const isOfflineGroup = group === 'offline';
-                  const displayMembers = isOfflineGroup && !showAllOfflineMembers ? allMembers.slice(0, 30) : allMembers;
-                  const hasMore = isOfflineGroup && allMembers.length > 30;
+                {/* メンバー一覧: Discordサーバー連携時はDiscordメンバー、それ以外はasdfbaseメンバーを表示 */}
+                {selectedServer && selectedServer.members && selectedServer.members.length > 0 ? (
+                  (() => {
+                    const onlineMembers = selectedServer.members.filter((m: any) => m.status && m.status !== 'offline');
+                    const offlineMembers = selectedServer.members.filter((m: any) => !m.status || m.status === 'offline');
+                    const hasMoreOffline = offlineMembers.length > 30;
+                    const displayOffline = showAllOfflineMembers ? offlineMembers : offlineMembers.slice(0, 30);
 
-                  return (
-                    <div key={group} className="mb-3">
-                      <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold flex items-center justify-between">
-                        <span>{group === 'online' ? 'オンライン' : group === 'away' ? '離席中' : 'オフライン'} — {allMembers.length}</span>
+                    return (
+                      <>
+                        {/* オンライングループ */}
+                        {onlineMembers.length > 0 && (
+                          <div className="mb-3">
+                            <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold">
+                              オンライン — {onlineMembers.length}
+                            </div>
+                            <div className="space-y-0.5">
+                              {onlineMembers.map((m: any) => {
+                                const name = m.displayName || m.username;
+                                const statusColor = m.status === 'online' ? 'bg-emerald-400' : m.status === 'idle' ? 'bg-amber-400' : 'bg-rose-400';
+                                return (
+                                  <button
+                                    key={m.id}
+                                    type="button"
+                                    onClick={() => {
+                                      const insert = `@${name} `;
+                                      setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
+                                      if (window.innerWidth < 1024) setIsMembersCollapsed(true);
+                                      requestAnimationFrame(() => chatInputRef.current?.focus());
+                                    }}
+                                    title={`@${name} をメンション`}
+                                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left text-stone-200"
+                                  >
+                                    <div className="relative shrink-0">
+                                      {m.avatarUrl ? (
+                                        <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-7 h-7 rounded-full object-cover" />
+                                      ) : (
+                                        <Avatar name={name} url={null} size="w-7 h-7 text-xs" />
+                                      )}
+                                      <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0C0D10] ${statusColor}`} />
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center gap-1 truncate">
+                                        <span className="truncate">{name}</span>
+                                        {m.isBot && <span className="text-[9px] px-1 rounded bg-indigo-500/20 text-indigo-300 font-mono shrink-0">BOT</span>}
+                                        {m.inVoice && <Volume2 className="w-3 h-3 text-emerald-400 shrink-0" />}
+                                      </div>
+                                      {m.activity && <div className="text-[10px] text-stone-500 truncate">{m.activity}</div>}
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* オフライングループ */}
+                        {offlineMembers.length > 0 && (
+                          <div className="mb-3">
+                            <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold flex items-center justify-between">
+                              <span>オフライン — {offlineMembers.length}</span>
+                              {hasMoreOffline && (
+                                <button
+                                  type="button"
+                                  onClick={() => setShowAllOfflineMembers(v => !v)}
+                                  className="text-[10px] text-amber-400 hover:underline font-normal normal-case"
+                                >
+                                  {showAllOfflineMembers ? '折りたたむ' : `もっと見る (+${offlineMembers.length - 30})`}
+                                </button>
+                              )}
+                            </div>
+                            <div className="space-y-0.5">
+                              {displayOffline.map((m: any) => {
+                                const name = m.displayName || m.username;
+                                return (
+                                  <button
+                                    key={m.id}
+                                    type="button"
+                                    onClick={() => {
+                                      const insert = `@${name} `;
+                                      setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
+                                      if (window.innerWidth < 1024) setIsMembersCollapsed(true);
+                                      requestAnimationFrame(() => chatInputRef.current?.focus());
+                                    }}
+                                    title={`@${name} をメンション`}
+                                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left text-stone-500"
+                                  >
+                                    <div className="relative shrink-0">
+                                      {m.avatarUrl ? (
+                                        <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-7 h-7 rounded-full object-cover grayscale opacity-60" />
+                                      ) : (
+                                        <Avatar name={name} url={null} size="w-7 h-7 text-xs" dim />
+                                      )}
+                                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0C0D10] bg-stone-600" />
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center gap-1 truncate">
+                                        <span className="truncate">{name}</span>
+                                        {m.isBot && <span className="text-[9px] px-1 rounded bg-stone-800 text-stone-500 font-mono shrink-0">BOT</span>}
+                                      </div>
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            {hasMoreOffline && (
+                              <button
+                                type="button"
+                                onClick={() => setShowAllOfflineMembers(v => !v)}
+                                className="w-full mt-2 py-1.5 text-center text-[11px] font-medium text-amber-400 hover:text-amber-300 hover:bg-stone-800/40 rounded-lg border border-stone-800/60 transition"
+                              >
+                                {showAllOfflineMembers ? '▲ 30人表示に折りたたむ' : `▼ 他 ${offlineMembers.length - 30} 人を表示 (もっと見る)`}
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()
+                ) : (
+                  /* selectedServer が無い場合は asdfbase ユーザーを表示 */
+                  (['online', 'away', 'offline'] as const).map(group => {
+                    const allMembers = onlineUsers.filter(u =>
+                      group === 'offline' ? (u.status !== 'online' && u.status !== 'away') : u.status === group
+                    );
+                    if (allMembers.length === 0) return null;
+                    const isOfflineGroup = group === 'offline';
+                    const displayMembers = isOfflineGroup && !showAllOfflineMembers ? allMembers.slice(0, 30) : allMembers;
+                    const hasMore = isOfflineGroup && allMembers.length > 30;
+
+                    return (
+                      <div key={group} className="mb-3">
+                        <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold flex items-center justify-between">
+                          <span>{group === 'online' ? 'オンライン' : group === 'away' ? '離席中' : 'オフライン'} — {allMembers.length}</span>
+                          {isOfflineGroup && hasMore && (
+                            <button
+                              type="button"
+                              onClick={() => setShowAllOfflineMembers(v => !v)}
+                              className="text-[10px] text-amber-400 hover:underline font-normal normal-case"
+                            >
+                              {showAllOfflineMembers ? '折りたたむ' : `もっと見る (+${allMembers.length - 30})`}
+                            </button>
+                          )}
+                        </div>
+                        <div className="space-y-0.5">
+                          {displayMembers.map(u => (
+                            <button
+                              key={u.id}
+                              type="button"
+                              onClick={() => {
+                                const insert = `@${u.username} `;
+                                setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
+                                if (window.innerWidth < 1024) setIsMembersCollapsed(true);
+                                requestAnimationFrame(() => chatInputRef.current?.focus());
+                              }}
+                              title={`@${u.username} をメンション`}
+                              className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left ${
+                                group === 'offline' ? 'text-stone-600' : 'text-stone-200'
+                              }`}
+                            >
+                              <div className="relative shrink-0">
+                                <Avatar name={u.username} url={u.avatar_url} size="w-7 h-7 text-xs" dim={group === 'offline'} />
+                                <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0C0D10] ${
+                                  group === 'online' ? 'bg-emerald-400' : group === 'away' ? 'bg-amber-400' : 'bg-stone-600'
+                                }`} />
+                              </div>
+                              <span className="truncate">{u.username}</span>
+                              {u.id === currentUser.id && <span className="ml-auto text-[10px] text-stone-500">あなた</span>}
+                            </button>
+                          ))}
+                        </div>
                         {isOfflineGroup && hasMore && (
                           <button
                             type="button"
                             onClick={() => setShowAllOfflineMembers(v => !v)}
-                            className="text-[10px] text-amber-400 hover:underline font-normal normal-case"
+                            className="w-full mt-2 py-1.5 text-center text-[11px] font-medium text-amber-400 hover:text-amber-300 hover:bg-stone-800/40 rounded-lg border border-stone-800/60 transition"
                           >
-                            {showAllOfflineMembers ? '折りたたむ' : `もっと見る (+${allMembers.length - 30})`}
+                            {showAllOfflineMembers ? '▲ 30人表示に折りたたむ' : `▼ 他 ${allMembers.length - 30} 人を表示 (もっと見る)`}
                           </button>
                         )}
                       </div>
-                      <div className="space-y-0.5">
-                        {displayMembers.map(u => (
-                          <button
-                            key={u.id}
-                            type="button"
-                            onClick={() => {
-                              const insert = `@${u.username} `;
-                              setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
-                              if (window.innerWidth < 1024) setIsMembersCollapsed(true);
-                              requestAnimationFrame(() => chatInputRef.current?.focus());
-                            }}
-                            title={`@${u.username} をメンション`}
-                            className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left ${
-                              group === 'offline' ? 'text-stone-600' : 'text-stone-200'
-                            }`}
-                          >
-                            <div className="relative shrink-0">
-                              <Avatar name={u.username} url={u.avatar_url} size="w-7 h-7 text-xs" dim={group === 'offline'} />
-                              <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0C0D10] ${
-                                group === 'online' ? 'bg-emerald-400' : group === 'away' ? 'bg-amber-400' : 'bg-stone-600'
-                              }`} />
-                            </div>
-                            <span className="truncate">{u.username}</span>
-                            {u.id === currentUser.id && <span className="ml-auto text-[10px] text-stone-500">あなた</span>}
-                          </button>
-                        ))}
-                      </div>
-                      {isOfflineGroup && hasMore && !showAllOfflineMembers && (
-                        <button
-                          type="button"
-                          onClick={() => setShowAllOfflineMembers(true)}
-                          className="w-full mt-1 py-1 text-center text-[11px] text-stone-500 hover:text-amber-400 hover:bg-stone-800/40 rounded-lg transition"
-                        >
-                          他 {allMembers.length - 30} 人を表示…
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
+                    );
+                  })
+                )}
               </aside>
             )}
           </div>

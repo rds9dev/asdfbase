@@ -561,7 +561,7 @@ export async function getDiscordServers(includeUnapproved = false): Promise<Disc
       if (st !== 'offline' || voiceMemberIds.has(m.id)) onlineCount++;
     }
 
-    // オンラインまたはVC参加中のメンバーを優先して最大60名取得
+    // オンラインまたはVC参加中のメンバーを優先して取得 (オフライン含め最大300名)
     const sortedRaw = rawMemberList
       .filter(m => !m.user.bot || voiceMemberIds.has(m.id) || (m.presence?.status && m.presence.status !== 'offline'))
       .sort((a, b) => {
@@ -573,7 +573,7 @@ export async function getDiscordServers(includeUnapproved = false): Promise<Disc
         const bSt = order[b.presence?.status || 'offline'] ?? 3;
         return aSt - bSt;
       })
-      .slice(0, 60);
+      .slice(0, 300);
 
     const members: DiscordMemberInfo[] = await Promise.all(
       sortedRaw.map(async m => {
@@ -988,6 +988,26 @@ export async function editRelayedOnDiscord(links: RelayedMessage[], username: st
     }
   }
   return edited;
+}
+
+// asdfbase で削除されたメッセージを Discord 側でも削除
+export async function deleteRelayedOnDiscord(links: RelayedMessage[]): Promise<boolean> {
+  if (!client || !connected || links.length === 0) return false;
+  let deleted = false;
+  for (const l of links) {
+    try {
+      const ch = (await client.channels.fetch(l.discordChannelId)) as TextBasedChannel | null;
+      if (!ch || !('messages' in ch) || !isGuildAllowed((ch as any).guildId)) continue;
+      const m = await (ch as any).messages.fetch(l.discordMessageId).catch(() => null);
+      if (m && m.deletable) {
+        await m.delete();
+        deleted = true;
+      }
+    } catch (err: any) {
+      console.error('[discord] delete relay failed:', err.message);
+    }
+  }
+  return deleted;
 }
 
 function createClient(_withMessageContent: boolean) {
