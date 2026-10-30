@@ -79,7 +79,7 @@ export interface AiToolStep {
 }
 
 const DAY = ['日', '月', '火', '水', '木', '金', '土'];
-const SCHEDULE_LABELS: Record<ScheduleType, string> = { normal: '通常時程', short: '短縮時程', s_short: 'S短時程' };
+const SCHEDULE_LABELS: Record<ScheduleType, string> = { normal: '通常時程', short: '短縮時程', s_short: 'S短時程', special: '特別時程' };
 const STATUS_LABELS: Record<string, string> = {
   unstarted: '未着手', in_progress: '進行中', submitted: '提出済み', resubmit: '再提出', passed: '合格',
 };

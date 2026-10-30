@@ -20,42 +20,100 @@ export const BUILTIN_SHORTCODES: Record<string, string> = {
   cross_mark: '❌',
   thumbsup: '👍',
   '+1': '👍',
+  thumbsdown: '👎',
+  '-1': '👎',
   heart: '❤️',
+  sparkling_heart: '💖',
+  broken_heart: '💔',
   joy: '😂',
+  rofl: '🤣',
+  smile: '😄',
+  grin: '😁',
+  sweat_smile: '😅',
+  laughing: '😆',
+  wink: '😉',
+  blush: '😊',
+  innocent: '😇',
+  heart_eyes: '😍',
+  kissing_heart: '😘',
+  yum: '😋',
+  stuck_out_tongue: '😛',
+  sunglasses: '😎',
+  smirk: '😏',
+  unamused: '😒',
+  pleading_face: '🥺',
+  melting_face: '🫠',
+  salute: '🫡',
+  face_with_peeking_eye: '🫣',
+  face_holding_back_tears: '🥹',
+  thinking: '🤔',
+  eyes: '👀',
   open_mouth: '😮',
+  screaming: '😱',
   sob: '😢',
+  cry: '😭',
   pray: '🙏',
   fire: '🔥',
   sparkles: '✨',
   tada: '🎉',
   '100': '💯',
-  eyes: '👀',
-  thinking: '🤔',
   muscle: '💪',
   clap: '👏',
+  wave: '👋',
+  ok_hand: '👌',
+  point_up: '☝️',
+  point_right: '👉',
+  point_left: '👈',
+  v: '✌️',
+  handshake: '🤝',
+  skull: '💀',
+  skull_and_crossbones: '☠️',
+  clown: '🤡',
+  ghost: '👻',
+  alien: '👽',
+  robot: '🤖',
+  poop: '💩',
+  shit: '💩',
+  party: '🥳',
+  partying_face: '🥳',
+  cool: '😎',
+  nerd: '🤓',
+  yawning_face: '🥱',
+  sleeping: '😴',
+  hot_face: '🥵',
+  cold_face: '🥶',
+  exploding_head: '🤯',
+  angry: '😠',
+  rage: '😡',
+  crown: '👑',
+  gem: '💎',
   rocket: '🚀',
   star: '⭐',
   warning: '⚠️',
   zzz: '💤',
-  wave: '👋',
-  ok_hand: '👌',
-  salute: '🫡',
-  skull: '💀',
-  party: '🥳',
-  cool: '😎',
-  sweat_smile: '😅',
-  cry: '😭',
-  angry: '😠',
-  poop: '💩',
-  crown: '👑',
-  gem: '💎',
   book: '📚',
   pencil: '✏️',
   bulb: '💡',
   bell: '🔔',
   mega: '📣',
+  loudspeaker: '📢',
   swimmer: '🏊',
+  swim: '🏊',
 };
+
+// メッセージ本文が絵文字のみ（1〜3個）で構成されているか判定 (ジャンボ絵文字用)
+export function isOnlyEmojis(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  const shortcodeRe = /^(:[a-zA-Z0-9_-]{2,32}:\s*){1,3}$/;
+  if (shortcodeRe.test(trimmed)) return true;
+  const emojiRegex = /^(\p{Extended_Pictographic}|\p{Emoji_Presentation}|\uFE0F|\u200D|\s){1,10}$/u;
+  if (emojiRegex.test(trimmed)) {
+    const chars = Array.from(trimmed.replace(/\s+/g, ''));
+    return chars.length >= 1 && chars.length <= 6;
+  }
+  return false;
+}
 
 export interface RenderOptions {
   usernames: Set<string>;
@@ -71,9 +129,12 @@ export interface RenderOptions {
   token?: string;
 }
 
-export function resolveEmojiUrl(name: string, customEmojis?: Map<string, string>): string | null {
+export function resolveEmojiUrl(name: string, customEmojis?: Map<string, string>, token = ''): string | null {
   const clean = name.replace(/^:+|:+$/g, '').toLowerCase();
-  if (customEmojis?.has(clean)) return customEmojis.get(clean)!;
+  if (customEmojis?.has(clean)) {
+    const raw = customEmojis.get(clean)!;
+    return toProxiedMediaUrl(raw, token);
+  }
   if (clean === 'swim') return '/uploads/emoji-swim.svg';
   return null;
 }
@@ -94,10 +155,11 @@ export function renderEmojiToken(
   token: string,
   customEmojis?: Map<string, string>,
   key?: React.Key,
-  sizeClass = 'w-5 h-5'
+  sizeClass = 'w-5 h-5',
+  authToken = ''
 ): React.ReactNode | null {
   const clean = token.replace(/^:+|:+$/g, '').toLowerCase();
-  const customUrl = resolveEmojiUrl(clean, customEmojis);
+  const customUrl = resolveEmojiUrl(clean, customEmojis, authToken);
   if (customUrl) {
     return (
       <img
@@ -174,6 +236,15 @@ export function toProxiedMediaUrl(url: string, token = ''): string {
   return url;
 }
 
+// Discord アイコン (公式ロゴ SVG)
+export function DiscordIcon({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden="true">
+      <path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .078-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .079.009c.12.099.246.198.373.292a.077.077 0 0 1-.007.127 12.3 12.3 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z" />
+    </svg>
+  );
+}
+
 // Discord から来たメッセージの名前の後ろに付けるバッジ
 export function DiscordBadge({ className = '' }: { className?: string }) {
   return (
@@ -181,9 +252,7 @@ export function DiscordBadge({ className = '' }: { className?: string }) {
       title="Discord から送信"
       className={`inline-flex items-center gap-0.5 px-1 py-px rounded bg-[#5865F2] text-white text-[9px] font-bold leading-none align-middle select-none ${className}`}
     >
-      <svg viewBox="0 0 24 24" className="w-2.5 h-2.5" fill="currentColor" aria-hidden="true">
-        <path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .078-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .079.009c.12.099.246.198.373.292a.077.077 0 0 1-.007.127 12.3 12.3 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z" />
-      </svg>
+      <DiscordIcon className="w-2.5 h-2.5" />
       Discord
     </span>
   );
@@ -228,7 +297,7 @@ export function renderMessageText(content: string, opts: RenderOptions): React.R
         continue;
       }
     } else if (token.startsWith(':') && token.endsWith(':')) {
-      const rendered = renderEmojiToken(token, opts.customEmojis, i++);
+      const rendered = renderEmojiToken(token, opts.customEmojis, i++, 'w-5 h-5', opts.token);
       if (rendered) {
         out.push(rendered);
         continue;

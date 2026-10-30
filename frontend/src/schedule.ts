@@ -1,5 +1,5 @@
 // 時程 (朝の会・1〜6限・帰りの会) と、ヘッダーに出す「今」の状態
-export type ScheduleType = 'normal' | 'short' | 's_short';
+export type ScheduleType = 'normal' | 'short' | 's_short' | 'special';
 export type PeriodTime = { start: string; end: string };
 export interface ScheduleDef {
   morning: PeriodTime;
@@ -22,14 +22,19 @@ export interface TimetableItem {
   note?: string;
 }
 
-export const SCHEDULE_LABELS: Record<ScheduleType, string> = { normal: '通常時程', short: '短縮時程', s_short: 'S短時程' };
+export const SCHEDULE_LABELS: Record<ScheduleType, string> = {
+  normal: '通常時程',
+  short: '短縮時程',
+  s_short: 'S短時程',
+  special: '特別時程',
+};
 // クラス (1〜6組)
 export const CLASS_NUMBERS = [1, 2, 3, 4, 5, 6];
 export const DAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
 export const MAX_PERIODS = 6;
 
 // 中学校の教科
-export const SUBJECTS = ['国語', '数学', '英語', '理科', '社会', '音楽', '美術', '保健体育', '技術', '家庭', '道徳', '総合', '学活'];
+export const SUBJECTS = ['国語', '数学', '英語', '理科', '社会', '音楽', '美術', '保健体育', '技術', '家庭', '道徳', '総合', '学活', '行事', 'テスト'];
 export const MAIN_SUBJECTS = ['国語', '数学', '英語', '理科', '社会'];
 export const PRACTICAL_SUBJECTS = ['音楽', '美術', '保健体育', '技術・家庭'];
 
@@ -42,7 +47,7 @@ export const DEFAULT_CONFIG: TimetableConfig = {
         { start: '08:35', end: '09:25' }, { start: '09:35', end: '10:25' }, { start: '10:35', end: '11:25' },
         { start: '11:35', end: '12:25' }, { start: '13:20', end: '14:10' }, { start: '14:20', end: '15:10' },
       ],
-      closing: { start: '15:10', end: '15:40' },
+      closing: { start: '15:25', end: '15:40' },
     },
     short: {
       morning: { start: '08:10', end: '08:25' },
@@ -50,7 +55,7 @@ export const DEFAULT_CONFIG: TimetableConfig = {
         { start: '08:35', end: '09:15' }, { start: '09:25', end: '10:05' }, { start: '10:15', end: '10:55' },
         { start: '11:05', end: '11:45' }, { start: '12:40', end: '13:20' }, { start: '13:30', end: '14:10' },
       ],
-      closing: { start: '14:10', end: '14:40' },
+      closing: { start: '14:25', end: '14:40' },
     },
     s_short: {
       morning: { start: '08:10', end: '08:25' },
@@ -58,7 +63,15 @@ export const DEFAULT_CONFIG: TimetableConfig = {
         { start: '08:35', end: '09:05' }, { start: '09:15', end: '09:45' }, { start: '09:55', end: '10:25' },
         { start: '10:35', end: '11:05' }, { start: '12:00', end: '12:30' }, { start: '12:40', end: '13:10' },
       ],
-      closing: { start: '13:10', end: '13:40' },
+      closing: { start: '13:25', end: '13:40' },
+    },
+    special: {
+      morning: { start: '08:10', end: '08:25' },
+      periods: [
+        { start: '08:35', end: '09:20' }, { start: '09:30', end: '10:15' }, { start: '10:25', end: '11:10' },
+        { start: '11:20', end: '12:05' }, { start: '13:00', end: '13:45' }, { start: '13:55', end: '14:40' },
+      ],
+      closing: { start: '14:55', end: '15:15' },
     },
   },
   dayPeriodCounts: { 1: 6, 2: 6, 3: 6, 4: 6, 5: 6 },
@@ -86,16 +99,73 @@ export function closingFor(def: ScheduleDef, periodCount: number): PeriodTime {
   return { start: fromMinutes(start), end: fromMinutes(start + length) };
 }
 
-// その日の流れ (朝の会 → 各時限 → 帰りの会)
+// その日の流れ (朝の会 → 1〜4限 → 給食 → 昼休み → 5〜6限 → 清掃 → 帰りの会)
 export function daySlots(config: TimetableConfig, dow: number, rows: TimetableItem[]) {
   const def = config.schedules[config.activeScheduleType] || DEFAULT_CONFIG.schedules.normal;
-  const count = periodCountFor(config, dow);
+  const count = Math.max(1, Math.min(MAX_PERIODS, periodCountFor(config, dow)));
   const subjectOf = (p: number) => rows.find(t => t.period === p)?.subject || '';
-  return [
+
+  const slots: Array<{ key: string; label: string; time: PeriodTime; subject: string; isBreak?: boolean }> = [
     { key: 'morning', label: '朝の会', time: def.morning, subject: '' },
-    ...def.periods.slice(0, count).map((time, i) => ({ key: `p${i + 1}`, label: `${i + 1}限`, time, subject: subjectOf(i + 1) })),
-    { key: 'closing', label: '帰りの会', time: closingFor(def, count), subject: '' },
   ];
+
+  // 1〜4限
+  for (let i = 0; i < Math.min(count, 4); i++) {
+    slots.push({ key: `p${i + 1}`, label: `${i + 1}限`, time: def.periods[i], subject: subjectOf(i + 1) });
+  }
+
+  // 4限以降がある日の給食・昼休み
+  if (count >= 4 && def.periods[3] && def.periods[4]) {
+    const p4End = toMinutes(def.periods[3].end);
+    const p5Start = toMinutes(def.periods[4].start);
+    if (p5Start - p4End >= 30) {
+      const lunchEnd = p4End + 25;
+      slots.push({
+        key: 'lunch',
+        label: '給食',
+        time: { start: fromMinutes(p4End), end: fromMinutes(lunchEnd) },
+        subject: '',
+        isBreak: true,
+      });
+      slots.push({
+        key: 'lunch_break',
+        label: '昼休み',
+        time: { start: fromMinutes(lunchEnd), end: fromMinutes(p5Start) },
+        subject: '',
+        isBreak: true,
+      });
+    }
+  }
+
+  // 5限〜6限
+  for (let i = 4; i < count; i++) {
+    slots.push({ key: `p${i + 1}`, label: `${i + 1}限`, time: def.periods[i], subject: subjectOf(i + 1) });
+  }
+
+  // 最終時限終了後の清掃と帰りの会
+  const lastPeriod = def.periods[count - 1];
+  if (lastPeriod) {
+    const lastEnd = toMinutes(lastPeriod.end);
+    const cleaningEnd = lastEnd + 15;
+    slots.push({
+      key: 'cleaning',
+      label: '清掃',
+      time: { start: fromMinutes(lastEnd), end: fromMinutes(cleaningEnd) },
+      subject: '',
+      isBreak: true,
+    });
+    const closingLen = Math.max(15, toMinutes(def.closing.end) - toMinutes(def.closing.start));
+    slots.push({
+      key: 'closing',
+      label: '帰りの会',
+      time: { start: fromMinutes(cleaningEnd), end: fromMinutes(cleaningEnd + closingLen) },
+      subject: '',
+    });
+  } else {
+    slots.push({ key: 'closing', label: '帰りの会', time: closingFor(def, count), subject: '' });
+  }
+
+  return slots;
 }
 
 export type SchoolStatusKind = 'holiday' | 'before' | 'homeroom' | 'class' | 'break' | 'after';
@@ -120,20 +190,20 @@ export function computeSchoolStatus(now: Date, config: TimetableConfig, today: T
     const end = toMinutes(s.time.end);
     if (nowMin >= start && nowMin < end) {
       const isHomeroom = s.key === 'morning' || s.key === 'closing';
+      const isBreak = Boolean(s.isBreak);
       return {
-        kind: isHomeroom ? 'homeroom' : 'class',
-        label: isHomeroom ? s.label : `${s.label} ${s.subject || '授業中'}`,
+        kind: isHomeroom ? 'homeroom' : isBreak ? 'break' : 'class',
+        label: isHomeroom || isBreak ? s.label : `${s.label} ${s.subject || '授業中'}`,
         sub: `~${s.time.end}`,
         currentKey: s.key,
       };
     }
     const next = slots[i + 1];
     if (next && nowMin >= end && nowMin < toMinutes(next.time.start)) {
-      const isLunch = toMinutes(next.time.start) - end >= 30;
       return {
         kind: 'break',
-        label: `Next: ${next.label} ${next.subject}`.trim(),
-        sub: `${isLunch ? '昼休み' : '休み時間'} · ${next.time.start}~`,
+        label: `Next: ${next.label}${next.subject ? ` ${next.subject}` : ''}`.trim(),
+        sub: `休み時間 · ${next.time.start}~`,
         currentKey: next.key,
       };
     }

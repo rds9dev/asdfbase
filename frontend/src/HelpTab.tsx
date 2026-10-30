@@ -262,15 +262,50 @@ const SECTIONS: Section[] = [
   },
 ];
 
-export default function HelpTab({ onAskAi }: HelpTabProps) {
+export default function HelpTab({ onAskAi, safeFetch, token }: HelpTabProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [tocOpen, setTocOpen] = useState(false);
+  const [aiQuestion, setAiQuestion] = useState('');
+  const [aiAnswer, setAiAnswer] = useState<string | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
 
   const jump = (id: string) => {
     const el = document.getElementById(`help-${id}`);
     const container = scrollRef.current;
     if (el && container) container.scrollTo({ top: el.offsetTop - 12, behavior: 'smooth' });
     setTocOpen(false);
+  };
+
+  const handleAskInline = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const q = aiQuestion.trim();
+    if (!q || aiLoading) return;
+    setAiLoading(true);
+    setAiAnswer(null);
+
+    try {
+      if (safeFetch && token) {
+        const res = await safeFetch('/api/ai/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            messages: [{ role: 'user', content: `asdfbase の機能・使い方についての質問です。親切かつ簡潔に教えてください:\n\n${q}` }],
+            persona: 'teacher',
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (data.reply) {
+          setAiAnswer(data.reply);
+          return;
+        }
+      }
+      // フォールバック: AIタブへジャンプ
+      if (onAskAi) onAskAi(`asdfbaseの使い方について質問です: ${q}`);
+    } catch {
+      if (onAskAi) onAskAi(`asdfbaseの使い方について質問です: ${q}`);
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   const handleAsk = () => {
@@ -310,8 +345,53 @@ export default function HelpTab({ onAskAi }: HelpTabProps) {
               title="asdfbase の使い方を AI に直接質問します"
             >
               <Sparkles className="w-4 h-4 text-amber-400" />
-              <span>AI に質問</span>
+              <span>AIタブで質問</span>
             </button>
+          </div>
+
+          {/* ヘルプ専用 AI 質問ボックス */}
+          <div className="bg-gradient-to-br from-[#12141B] via-[#0F1014] to-[#16141F] border border-amber-500/30 rounded-2xl p-4 shadow-xl space-y-3">
+            <div className="flex items-center gap-2 text-white font-bold text-sm">
+              <Bot className="w-5 h-5 text-amber-400 animate-pulse" />
+              <span>AI に使い方をその場で質問</span>
+              <span className="text-[10px] text-amber-400/80 font-normal px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 ml-auto">
+                ヘルプ専用アシスタント
+              </span>
+            </div>
+            <form onSubmit={handleAskInline} className="flex gap-2">
+              <input
+                type="text"
+                value={aiQuestion}
+                onChange={e => setAiQuestion(e.target.value)}
+                placeholder="例: メッセージを削除するには？ / 時間割の特別時程はどう設定する？"
+                className="flex-1 bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-xs text-white placeholder-stone-600 focus:outline-none focus:border-amber-500/60"
+              />
+              <button
+                type="submit"
+                disabled={aiLoading || !aiQuestion.trim()}
+                className="px-4 py-2 rounded-xl btn-primary font-bold text-xs flex items-center gap-1.5 disabled:opacity-40 shrink-0"
+              >
+                {aiLoading ? <Sparkles className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                <span>{aiLoading ? '回答中…' : '質問する'}</span>
+              </button>
+            </form>
+
+            {aiAnswer && (
+              <div className="relative mt-2 p-3.5 rounded-xl bg-[#090A0C] border border-stone-800/90 text-stone-200 text-xs leading-relaxed anim-fade">
+                <button
+                  type="button"
+                  onClick={() => setAiAnswer(null)}
+                  className="absolute top-2 right-2 text-stone-500 hover:text-white p-1"
+                  title="閉じる"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+                <div className="font-bold text-amber-300 text-[11px] mb-1 flex items-center gap-1">
+                  <Sparkles className="w-3 h-3 text-amber-400" /> 回答:
+                </div>
+                <div className="whitespace-pre-wrap">{aiAnswer}</div>
+              </div>
+            )}
           </div>
           <div className="md:hidden bg-[#111214] border border-stone-800 rounded-xl text-xs">
             <button onClick={() => setTocOpen(v => !v)} className="w-full flex items-center justify-between px-3 py-2.5 text-white font-bold">

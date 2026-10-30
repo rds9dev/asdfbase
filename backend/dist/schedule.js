@@ -9,7 +9,7 @@ exports.nowInTokyo = nowInTokyo;
 exports.addDaysYmd = addDaysYmd;
 exports.nextLessonDate = nextLessonDate;
 exports.nextWeekday = nextWeekday;
-exports.SCHEDULE_TYPES = ['normal', 'short', 's_short'];
+exports.SCHEDULE_TYPES = ['normal', 'short', 's_short', 'special'];
 exports.MAX_PERIODS = 6;
 exports.DEFAULT_SCHEDULES = {
     normal: {
@@ -35,6 +35,14 @@ exports.DEFAULT_SCHEDULES = {
             { start: '10:35', end: '11:05' }, { start: '12:00', end: '12:30' }, { start: '12:40', end: '13:10' },
         ],
         closing: { start: '13:10', end: '13:40' },
+    },
+    special: {
+        morning: { start: '08:10', end: '08:25' },
+        periods: [
+            { start: '08:35', end: '09:20' }, { start: '09:30', end: '10:15' }, { start: '10:25', end: '11:10' },
+            { start: '11:20', end: '12:05' }, { start: '13:00', end: '13:45' }, { start: '13:55', end: '14:40' },
+        ],
+        closing: { start: '14:45', end: '15:15' },
     },
 };
 // 曜日(1=月..5=金)ごとの授業数 (5限 or 6限)

@@ -85,6 +85,8 @@ import {
   Server,
   Smile,
   Upload,
+  CheckCheck,
+  Radio,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -103,7 +105,7 @@ import {
 } from './schedule';
 import {
   renderMessageText, renderComposerHighlight, findCompletionToken, rankCandidates,
-  DiscordBadge, splitSenderName, memoSlotId, toProxiedMediaUrl,
+  DiscordBadge, DiscordIcon, splitSenderName, memoSlotId, toProxiedMediaUrl,
   BUILTIN_SHORTCODES, type CustomEmojiItem, SmartMarkdown, renderEmojiToken, resolveEmojiUrl,
 } from './chatText';
 import { ReactionBar, DEFAULT_QUICK_EMOJIS, renderReactionEmoji } from './Reactions';
@@ -562,10 +564,25 @@ export default function App() {
     { id: 2, name: 'homework', type: 'text' },
   ]);
   const [activeChannelId, setActiveChannelIdState] = useState<number>(() => Number(LS.get('asdf_active_channel', '1')) || 1);
+  const lastActiveChannelByServerRef = useRef<Record<string, number>>((() => {
+    try {
+      return JSON.parse(localStorage.getItem('asdf_last_channel_by_server') || '{}');
+    } catch {
+      return {};
+    }
+  })());
   const setActiveChannelId = (id: number) => {
     setActiveChannelIdState(id);
     LS.set('asdf_active_channel', String(id));
     syncPreferencesToServer({ activeChannelId: id });
+    const ch = channels.find(c => c.id === id);
+    if (ch) {
+      const srvId = resolveChannelServerId(ch);
+      lastActiveChannelByServerRef.current[srvId] = id;
+      try {
+        localStorage.setItem('asdf_last_channel_by_server', JSON.stringify(lastActiveChannelByServerRef.current));
+      } catch {}
+    }
     if (isSmallScreen()) setIsChannelsCollapsed(true);
   };
   const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
@@ -678,8 +695,15 @@ export default function App() {
   // Camera Facing Mode ('user' or 'environment')
   const [cameraFacingMode, setCameraFacingMode] = useState<'user' | 'environment'>('user');
 
-  // Memo View Mode ('split' or 'view_only') & Auto-save status
-  const [memoViewMode, setMemoViewMode] = useState<'split' | 'view_only'>('split');
+  // Memo View Mode ('edit_only' | 'split' | 'view_only') & Auto-save status
+  const [memoViewMode, setMemoViewMode] = useState<'edit_only' | 'split' | 'view_only'>('split');
+  const [memoPlainMode, setMemoPlainMode] = useState<'edit' | 'view'>('edit');
+  const [memoLanguage, setMemoLanguage] = useState<string>('typescript');
+  // その他タブのサブタブ ('scores' | 'patch_notes')
+  const [moreSubTab, setMoreSubTab] = useState<'scores' | 'patch_notes'>('scores');
+  // Discord チャンネル同期一覧のアコーディオン展開状態 & 検索
+  const [expandedServerBindings, setExpandedServerBindings] = useState<Record<string, boolean>>({});
+  const [serverBindingSearch, setServerBindingSearch] = useState<string>('');
   const [autoSaveStatus, setAutoSaveStatus] = useState<'saved' | 'saving' | 'dirty'>('saved');
   const memoAutoSaveTimerRef = useRef<any>(null);
   const selectedSlotIndexRef = useRef<number>(selectedSlotIndex);
@@ -1595,6 +1619,7 @@ export default function App() {
           setSelectedSlotIndex(current.slot_index);
           setMemoTitle(current.title);
           setMemoContent(current.content);
+          setMemoLanguage((current as any).language || 'typescript');
           setMemoMode(current.slot_index >= 11 ? 'monaco' : current.mode === 'monaco' ? 'markdown' : current.mode);
           setMemoAssignedUser(current.assigned_user_id ?? null);
         }
@@ -1659,6 +1684,11 @@ export default function App() {
       // ブラウザ標準の Tab によるフォーカス移動は使わない (補完・インデントは各入力欄で処理)
       if (e.key === 'Tab' && !e.defaultPrevented && !(e.target as HTMLElement)?.closest?.('[data-allow-tab]')) {
         e.preventDefault();
+      }
+      if (e.shiftKey && e.key === 'Escape') {
+        e.preventDefault();
+        handleMarkAllReadRef.current?.();
+        return;
       }
       if (e.key === 'Escape') {
         setIsPaletteOpen(false);
@@ -2046,10 +2076,18 @@ export default function App() {
 
   const handleComposerPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(e.clipboardData.files).filter(f => f.type.startsWith('image/'));
-    if (files.length === 0) return;
-    // 画像だけのコピーならテキスト貼り付けは起きないようにする
-    if (!e.clipboardData.getData('text/plain')) e.preventDefault();
-    addPendingImages(files);
+    if (files.length > 0) {
+      // 画像ファイルがある場合は必ずデフォルトのテキスト貼り付け (<img ... alt="拡大画像"/> 等) を防止
+      e.preventDefault();
+      addPendingImages(files);
+      return;
+    }
+    // HTMLテキストとして画像タグが含まれていた場合の混入防止
+    const textData = e.clipboardData.getData('text/plain');
+    if (/<img\s+[^>]*alt=["']拡大画像["'][^>]*>/i.test(textData)) {
+      e.preventDefault();
+      return;
+    }
   };
 
   const uploadChatImage = async (file: File): Promise<string> => {
@@ -2071,7 +2109,9 @@ export default function App() {
   const postChatMessage = async (content: string, targetChannelId: number, clientNonce: string, replyToId?: number | null) => {
     // 8秒タイムアウト監視 (送信中が長引いた場合に自動で再試行ボタンを表示)
     const timer = setTimeout(() => {
-      setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === clientNonce && m.pending ? { ...m, pending: false, failed: true } : m)));
+      if (targetChannelId === activeChannelIdRef.current) {
+        setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === clientNonce && m.pending ? { ...m, pending: false, failed: true } : m)));
+      }
     }, 8000);
 
     try {
@@ -2087,12 +2127,16 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const savedMessage: Message = await res.json();
       ingestNewMessageRef.current({ ...savedMessage, client_nonce: clientNonce });
-      // WS経由で先に確定済みでも、残っている送信中表示を必ず消す
-      setMessages(prev => mergeIncomingMessage(prev, { ...savedMessage, client_nonce: clientNonce }));
+      // 送信先チャンネルを現在見ている時のみ、画面の messages を更新
+      if (targetChannelId === activeChannelIdRef.current) {
+        setMessages(prev => mergeIncomingMessage(prev, { ...savedMessage, client_nonce: clientNonce }));
+      }
     } catch (err) {
       clearTimeout(timer);
       console.error('Failed to send message:', err);
-      setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === clientNonce ? { ...m, pending: false, failed: true } : m)));
+      if (targetChannelId === activeChannelIdRef.current) {
+        setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === clientNonce ? { ...m, pending: false, failed: true } : m)));
+      }
     }
   };
 
@@ -2183,8 +2227,12 @@ export default function App() {
     const optimistic: Message[] = [];
     if (textNonce) optimistic.push(makeOptimistic(content, textNonce, true));
     images.forEach((img, i) => optimistic.push(makeOptimistic(`![image](${img.url})`, imageNonces[i], !textNonce && i === 0)));
-    setMessages(prev => [...prev, ...optimistic]);
-    scheduleScrollToBottom();
+    
+    // 表示中チャンネルと同一なら楽観的UIを追加
+    if (targetChannelId === activeChannelIdRef.current) {
+      setMessages(prev => [...prev, ...optimistic]);
+      scheduleScrollToBottom();
+    }
 
     if (textNonce) await postChatMessage(content, targetChannelId, textNonce, replyTarget?.id);
     if (images.length === 0) return;
@@ -2196,13 +2244,16 @@ export default function App() {
       const result = await uploads[i];
       const nonce = imageNonces[i];
       if ('url' in result) {
-        // 再送に備えて、表示中の仮メッセージも本物のURLに差し替えておく
         const body = `![image](${result.url})`;
-        setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === nonce ? { ...m, content: body } : m)));
+        if (targetChannelId === activeChannelIdRef.current) {
+          setMessages(prev => prev.map(m => (m.id < 0 && m.client_nonce === nonce ? { ...m, content: body } : m)));
+        }
         await postChatMessage(`![image](${result.url})`, targetChannelId, nonce, !textNonce && i === 0 ? replyTarget?.id : null);
         URL.revokeObjectURL(images[i].url);
       } else {
-        setMessages(prev => prev.filter(m => !(m.id < 0 && m.client_nonce === nonce)));
+        if (targetChannelId === activeChannelIdRef.current) {
+          setMessages(prev => prev.filter(m => !(m.id < 0 && m.client_nonce === nonce)));
+        }
         failed.push(images[i]);
       }
     }
@@ -2314,7 +2365,24 @@ export default function App() {
   };
 
   const handleToggleReaction = async (messageId: number, emoji: string) => {
-    if (!token) return;
+    if (!token || !currentUserRef.current) return;
+    const myId = currentUserRef.current.id;
+
+    // 1. 楽観的UI更新: SSE/WS の遅延をカバーするため即座にローカル表示をトグル
+    setMessages(prev => prev.map(m => {
+      if (m.id !== messageId) return m;
+      const rx = { ...(m.reactions || {}) };
+      const users: number[] = ((rx[emoji] as any) || []).map(Number);
+      if (users.includes(myId)) {
+        rx[emoji] = users.filter(u => u !== myId);
+        if (rx[emoji].length === 0) delete rx[emoji];
+      } else {
+        rx[emoji] = [...users, myId];
+      }
+      return { ...m, reactions: rx };
+    }));
+
+    // 2. サーバー送信
     try {
       await safeFetch(`${API_BASE_URL}/api/messages/${messageId}/reactions`, {
         method: 'POST',
@@ -2328,6 +2396,22 @@ export default function App() {
       console.error(err);
     }
   };
+
+  const handleMarkAllReadRef = useRef<() => void>(() => {});
+  const handleMarkAllRead = async () => {
+    setUnreadCounts({});
+    setMentionCounts({});
+    try {
+      await safeFetch(`${API_BASE_URL}/api/channels/read-all`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      toast('すべてのチャンネルを既読にしました', { kind: 'success' });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+  handleMarkAllReadRef.current = handleMarkAllRead;
 
   const handleTogglePin = async (messageId: number) => {
     if (!token) return;
@@ -3101,7 +3185,8 @@ export default function App() {
     }
   };
 
-  // メモの Markdown エディタ ⇔ プレビュー スクロール同期
+  // メモの Markdown エディタ ⇔ プレビュー スクロール同期 (requestAnimationFrame で最適化)
+  const memoScrollRafRef = useRef<number | null>(null);
   const handleMemoEditorScroll = () => {
     if (memoScrollLockRef.current === 'preview') return;
     const ed = memoTextareaRef.current;
@@ -3111,9 +3196,11 @@ export default function App() {
     const prMax = pr.scrollHeight - pr.clientHeight;
     if (edMax <= 0 || prMax <= 0) return;
     memoScrollLockRef.current = 'editor';
-    pr.scrollTop = (ed.scrollTop / edMax) * prMax;
-    requestAnimationFrame(() => {
-      if (memoScrollLockRef.current === 'editor') memoScrollLockRef.current = null;
+    if (memoScrollRafRef.current) cancelAnimationFrame(memoScrollRafRef.current);
+    memoScrollRafRef.current = requestAnimationFrame(() => {
+      pr.scrollTop = (ed.scrollTop / edMax) * prMax;
+      memoScrollLockRef.current = null;
+      memoScrollRafRef.current = null;
     });
   };
 
@@ -3126,9 +3213,11 @@ export default function App() {
     const prMax = pr.scrollHeight - pr.clientHeight;
     if (edMax <= 0 || prMax <= 0) return;
     memoScrollLockRef.current = 'preview';
-    ed.scrollTop = (pr.scrollTop / prMax) * edMax;
-    requestAnimationFrame(() => {
-      if (memoScrollLockRef.current === 'preview') memoScrollLockRef.current = null;
+    if (memoScrollRafRef.current) cancelAnimationFrame(memoScrollRafRef.current);
+    memoScrollRafRef.current = requestAnimationFrame(() => {
+      ed.scrollTop = (pr.scrollTop / prMax) * edMax;
+      memoScrollLockRef.current = null;
+      memoScrollRafRef.current = null;
     });
   };
 
@@ -3350,11 +3439,14 @@ export default function App() {
 
 
   // メモ保存: 保存先スロットは呼び出し時点で固定する (保存待ちの間にスロットを切り替えても混ざらない)
-  const memoStateRef = useRef({ title: memoTitle, content: memoContent, mode: memoMode });
-  memoStateRef.current = { title: memoTitle, content: memoContent, mode: memoMode };
+  const memoStateRef = useRef({ title: memoTitle, content: memoContent, mode: memoMode, language: memoLanguage });
+  memoStateRef.current = { title: memoTitle, content: memoContent, mode: memoMode, language: memoLanguage };
   const pendingMemoSaveRef = useRef<{ slot: number; timer: any } | null>(null);
 
-  const handleSaveMemo = async (slot = selectedSlotIndexRef.current, data = memoStateRef.current) => {
+  const handleSaveMemo = async (
+    slot = selectedSlotIndexRef.current,
+    data: { title: string; content: string; mode: any; language?: string } = memoStateRef.current
+  ) => {
     if (!token) return;
     if (pendingMemoSaveRef.current?.slot === slot) {
       clearTimeout(pendingMemoSaveRef.current.timer);
@@ -3369,7 +3461,12 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ title: data.title, content: data.content, mode: data.mode })
+        body: JSON.stringify({
+          title: data.title,
+          content: data.content,
+          mode: data.mode,
+          language: (data as any).language || memoLanguage,
+        })
       });
       if (res.ok) {
         const updated = await res.json();
@@ -3422,6 +3519,7 @@ export default function App() {
     setSelectedSlotIndex(slot.slot_index);
     setMemoTitle(slot.title);
     setMemoContent(slot.content);
+    setMemoLanguage((slot as any).language || 'typescript');
     setMemoMode(slot.slot_index >= 11 ? 'monaco' : slot.mode === 'monaco' ? 'markdown' : slot.mode);
     setMemoAssignedUser(slot.assigned_user_id ?? null);
     setIsMemoListOpen(false);
@@ -4709,7 +4807,9 @@ export default function App() {
                         onClick={() => {
                           setSelectedServerId(srv.id);
                           if (srvChannels.length > 0 && !srvChannels.some(c => c.id === activeChannelId)) {
-                            setActiveChannelId(srvChannels[0].id);
+                            const rememberedId = lastActiveChannelByServerRef.current[srv.id];
+                            const targetChannel = (rememberedId && srvChannels.find(c => c.id === rememberedId)) || srvChannels[0];
+                            setActiveChannelId(targetChannel.id);
                           }
                         }}
                         title={`${srv.name}${vcCount > 0 ? ` (VC ${vcCount}人)` : ''}`}
@@ -4731,8 +4831,8 @@ export default function App() {
                             className="w-full h-full rounded-[inherit] object-cover"
                           />
                         ) : (
-                          <span className="text-xs font-bold text-indigo-200 truncate px-1">
-                            {String(srv.name || 'DC').slice(0, 2)}
+                          <span className="flex items-center justify-center text-indigo-400" title={srv.name}>
+                            <DiscordIcon className="w-5 h-5" />
                           </span>
                         )}
                         {srvMentions > 0 ? (
@@ -4741,10 +4841,11 @@ export default function App() {
                           </span>
                         ) : vcCount > 0 ? (
                           <span
-                            className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-indigo-500 text-white text-[9px] font-bold leading-4 text-center border border-[#08090B]"
+                            className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-emerald-600 text-white text-[9px] font-bold leading-4 flex items-center justify-center gap-0.5 border border-[#08090B] shadow"
                             title={`VC参加中 ${vcCount}人`}
                           >
-                            🔊
+                            <Volume2 className="w-2.5 h-2.5 animate-pulse" />
+                            {vcCount}
                           </span>
                         ) : null}
                       </button>
@@ -4919,10 +5020,10 @@ export default function App() {
                                         <span className="truncate flex-1">{ch.name}</span>
                                         {binding && (
                                           <span
-                                            className="shrink-0 text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono"
+                                            className="shrink-0 flex items-center justify-center p-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
                                             title={`Discord #${binding.discordChannelName} と同期中`}
                                           >
-                                            DC
+                                            <DiscordIcon className="w-2.5 h-2.5" />
                                           </span>
                                         )}
                                         {hasRoleRestriction && (
@@ -4986,6 +5087,58 @@ export default function App() {
                         </button>
                       </div>
                     )}
+
+                    {/* ボイスチャンネル (VC): チャンネル一覧の一番下に配置 */}
+                    {(() => {
+                      const relevantVcs = discordVcs.filter(vc => {
+                        if (!selectedServer) return true;
+                        return vc.guildName === selectedServer.name || (selectedServer.voiceChannels && selectedServer.voiceChannels.some((v: any) => v.id === vc.channelId));
+                      });
+                      if (relevantVcs.length === 0) return null;
+                      return (
+                        <div className="pt-2 border-t border-stone-800/60 space-y-1">
+                          <div className="text-[10px] uppercase tracking-wider text-stone-500 font-extrabold px-1.5 flex items-center justify-between">
+                            <span className="flex items-center gap-1.5">
+                              <Volume2 className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                              <span>ボイスチャンネル</span>
+                            </span>
+                            <span className="text-[9px] text-emerald-400 font-bold bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/20">
+                              {relevantVcs.reduce((s, v) => s + (v.members?.length || 0), 0)}人
+                            </span>
+                          </div>
+                          <div className="space-y-1">
+                            {relevantVcs.map(vc => (
+                              <div key={vc.channelId} className="p-2 rounded-lg bg-[#14161C] border border-stone-800/60 space-y-1.5">
+                                <div className="text-xs font-bold text-stone-300 flex items-center gap-1.5 truncate">
+                                  <Radio className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                                  <span className="truncate">{vc.channelName}</span>
+                                </div>
+                                <div className="flex flex-wrap gap-1 pl-1">
+                                  {vc.members.map((m: any) => (
+                                    <span
+                                      key={m.id}
+                                      className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border ${
+                                        m.speaking
+                                          ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold shadow'
+                                          : 'bg-stone-800/80 border-stone-700/60 text-stone-300'
+                                      }`}
+                                      title={`${m.name}${m.speaking ? ' (マイクON/発話中)' : ' (ミュート)'}`}
+                                    >
+                                      {m.avatarUrl ? (
+                                        <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
+                                      ) : (
+                                        <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
+                                      )}
+                                      <span className="max-w-[75px] truncate">{m.name}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
               </aside>
@@ -5076,6 +5229,14 @@ export default function App() {
                       <Search className="w-3.5 h-3.5" />
                     </button>
                   )}
+
+                  <button
+                    onClick={handleMarkAllRead}
+                    className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-stone-600"
+                    title="すべてのチャンネルを既読にする (Shift + Esc)"
+                  >
+                    <CheckCheck className="w-3.5 h-3.5" />
+                  </button>
 
                   <button
                     onClick={() => setIsMembersCollapsed(!isMembersCollapsed)}
@@ -5288,7 +5449,12 @@ export default function App() {
                                         e.preventDefault();
                                         handleEditMessage(m.id);
                                       }
-                                      if (e.key === 'Escape') {
+                                      if (e.shiftKey && e.key === 'Escape') {
+        e.preventDefault();
+        handleMarkAllReadRef.current?.();
+        return;
+      }
+      if (e.key === 'Escape') {
                                         e.stopPropagation();
                                         cancelEditing();
                                       }
@@ -5870,47 +6036,8 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Discord VC 参加者 */}
-                {discordVcs && discordVcs.length > 0 && (
-                  <div className="mb-3 pb-3 border-b border-stone-800/80">
-                    <div className="text-[11px] uppercase tracking-wider text-indigo-400 px-2 mb-1.5 font-bold flex items-center gap-1.5">
-                      <Volume2 className="w-3.5 h-3.5 text-indigo-400 animate-pulse" /> Discord VC
-                    </div>
-                    <div className="space-y-1.5">
-                      {discordVcs.map(vc => (
-                        <div key={vc.channelId} className="px-2 py-1.5 rounded-lg bg-[#16181D] border border-stone-800/60">
-                          <div className="text-[11px] font-medium text-stone-300 truncate flex items-center gap-1 mb-1">
-                            <span className="text-indigo-300 font-semibold">🔊 {vc.channelName}</span>
-                            <span className="text-[10px] text-stone-500">({vc.guildName})</span>
-                          </div>
-                          <div className="flex flex-wrap gap-1">
-                            {vc.members.map((m: any) => (
-                              <span
-                                key={m.id}
-                                className={`inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded-full border ${
-                                  m.speaking
-                                    ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold'
-                                    : 'bg-stone-800 border-stone-700/60 text-stone-200'
-                                }`}
-                                title={`${m.name}${m.speaking ? ' (マイクON/発話可)' : ' (ミュート)'}`}
-                              >
-                                {m.avatarUrl ? (
-                                  <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
-                                ) : (
-                                  <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
-                                )}
-                                <span className="max-w-[70px] truncate">{m.name}</span>
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* メンバー一覧: Discordサーバー連携時はDiscordメンバー、それ以外はasdfbaseメンバーを表示 */}
-                {selectedServer && selectedServer.members && selectedServer.members.length > 0 ? (
+                {/* メンバー一覧: Discordサーバー連携時はDiscordメンバー、その下にasdfbaseメンバーを表示 */}
+                {selectedServer && selectedServer.members && selectedServer.members.length > 0 && (
                   (() => {
                     const onlineMembers = selectedServer.members.filter((m: any) => m.status && m.status !== 'offline');
                     const offlineMembers = selectedServer.members.filter((m: any) => !m.status || m.status === 'offline');
@@ -5918,7 +6045,11 @@ export default function App() {
                     const displayOffline = showAllOfflineMembers ? offlineMembers : offlineMembers.slice(0, 30);
 
                     return (
-                      <>
+                      <div className="mb-4 pb-3 border-b border-stone-800/80">
+                        <div className="text-[10px] uppercase tracking-wider text-indigo-400 px-2 mb-2 font-extrabold flex items-center justify-between">
+                          <span>Discord メンバー</span>
+                          <span className="text-[9px] text-stone-500 font-mono">{selectedServer.members.length}</span>
+                        </div>
                         {/* オンライングループ */}
                         {onlineMembers.length > 0 && (
                           <div className="mb-3">
@@ -5967,7 +6098,7 @@ export default function App() {
 
                         {/* オフライングループ */}
                         {offlineMembers.length > 0 && (
-                          <div className="mb-3">
+                          <div className="mb-2">
                             <div className="text-[11px] uppercase tracking-wider text-stone-500 px-2 mb-1 font-bold flex items-center justify-between">
                               <span>オフライン — {offlineMembers.length}</span>
                               {hasMoreOffline && (
@@ -6025,12 +6156,20 @@ export default function App() {
                             )}
                           </div>
                         )}
-                      </>
+                      </div>
                     );
                   })()
-                ) : (
-                  /* selectedServer が無い場合は asdfbase ユーザーを表示 */
-                  (['online', 'away', 'offline'] as const).map(group => {
+                )}
+
+                {/* asdfbase メンバーセクション */}
+                <div className="space-y-3">
+                  {selectedServer && (
+                    <div className="text-[10px] uppercase tracking-wider text-amber-400 px-2 font-extrabold flex items-center justify-between">
+                      <span>asdfbase メンバー</span>
+                      <span className="text-[9px] text-stone-500 font-mono">{onlineUsers.length}</span>
+                    </div>
+                  )}
+                  {(['online', 'away', 'offline'] as const).map(group => {
                     const allMembers = onlineUsers.filter(u =>
                       group === 'offline' ? (u.status !== 'online' && u.status !== 'away') : u.status === group
                     );
@@ -6091,8 +6230,8 @@ export default function App() {
                         )}
                       </div>
                     );
-                  })
-                )}
+                  })}
+                </div>
               </aside>
             )}
           </div>
@@ -6280,13 +6419,23 @@ export default function App() {
                         <div className="flex items-center bg-[#14161C] border border-stone-800 rounded-lg p-0.5">
                           <button
                             type="button"
+                            onClick={() => setMemoViewMode('edit_only')}
+                            className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 ${
+                              memoViewMode === 'edit_only' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
+                            }`}
+                          >
+                            <Edit3 className="w-3 h-3" />
+                            <span>編集のみ</span>
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => setMemoViewMode('split')}
                             className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 ${
                               memoViewMode === 'split' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
                             }`}
                           >
-                            <Edit3 className="w-3 h-3" />
-                            <span>編集</span>
+                            <BookOpenCheck className="w-3 h-3" />
+                            <span>両方</span>
                           </button>
                           <button
                             type="button"
@@ -6300,11 +6449,64 @@ export default function App() {
                           </button>
                         </div>
                       )}
+
+                      {memoMode === 'plain' && (
+                        <div className="flex items-center bg-[#14161C] border border-stone-800 rounded-lg p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setMemoPlainMode('edit')}
+                            className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 ${
+                              memoPlainMode === 'edit' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
+                            }`}
+                          >
+                            <Edit3 className="w-3 h-3" />
+                            <span>編集</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setMemoPlainMode('view')}
+                            className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 ${
+                              memoPlainMode === 'view' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-stone-400 hover:text-white'
+                            }`}
+                          >
+                            <Eye className="w-3 h-3" />
+                            <span>表示</span>
+                          </button>
+                        </div>
+                      )}
                     </>
                   ) : (
-                    <span className="text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1">
-                      <Code className="w-3 h-3" /> コード
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1">
+                        <Code className="w-3 h-3" /> コード
+                      </span>
+                      <select
+                        value={memoLanguage}
+                        disabled={isMonacoLocked}
+                        onChange={e => {
+                          const lang = e.target.value;
+                          setMemoLanguage(lang);
+                          handleSaveMemo(selectedSlotIndex, { ...memoStateRef.current, language: lang } as any);
+                        }}
+                        className="bg-[#14161C] border border-stone-800 text-stone-300 rounded-lg px-2 py-1.5 focus:outline-none disabled:opacity-50 text-xs hover:border-stone-600 font-mono"
+                        title="言語の指定"
+                      >
+                        <option value="typescript">TypeScript</option>
+                        <option value="javascript">JavaScript</option>
+                        <option value="python">Python</option>
+                        <option value="html">HTML</option>
+                        <option value="css">CSS</option>
+                        <option value="json">JSON</option>
+                        <option value="markdown">Markdown</option>
+                        <option value="sql">SQL</option>
+                        <option value="cpp">C++</option>
+                        <option value="csharp">C#</option>
+                        <option value="rust">Rust</option>
+                        <option value="go">Go</option>
+                        <option value="php">PHP</option>
+                        <option value="shell">Shell</option>
+                      </select>
+                    </div>
                   )}
 
                   {/* Memo AI */}
@@ -6374,6 +6576,7 @@ export default function App() {
                     <Editor
                       height="100%"
                       defaultLanguage="typescript"
+                      language={memoLanguage || 'typescript'}
                       theme="vs-dark"
                       value={memoContent}
                       options={{
@@ -6387,13 +6590,33 @@ export default function App() {
                     />
                   </div>
                 ) : memoMode === 'plain' ? (
+                  memoPlainMode === 'view' ? (
+                    <div className="flex-1 p-3 sm:p-6 overflow-y-auto">
+                      <div className="max-w-4xl mx-auto font-mono text-sm leading-relaxed text-stone-200 whitespace-pre-wrap select-text anim-fade">
+                        {memoContent || <span className="text-stone-600">まだ何も書かれていません</span>}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex-1 p-2 sm:p-4 overflow-hidden">
+                      <textarea
+                        value={memoContent}
+                        readOnly={isMonacoLocked}
+                        onChange={e => handleMemoContentChange(e.target.value)}
+                        onKeyDown={handleMemoTextareaKeyDown}
+                        placeholder="テキストを入力"
+                        className="w-full h-full bg-[#16181D] border border-stone-800 rounded-xl p-3 sm:p-4 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
+                      />
+                    </div>
+                  )
+                ) : memoViewMode === 'edit_only' ? (
                   <div className="flex-1 p-2 sm:p-4 overflow-hidden">
                     <textarea
+                      ref={memoTextareaRef}
                       value={memoContent}
                       readOnly={isMonacoLocked}
                       onChange={e => handleMemoContentChange(e.target.value)}
                       onKeyDown={handleMemoTextareaKeyDown}
-                      placeholder="テキストを入力"
+                      placeholder="Markdown で書けます (# 見出し、- リスト、:smile: 絵文字など)"
                       className="w-full h-full bg-[#16181D] border border-stone-800 rounded-xl p-3 sm:p-4 text-stone-200 font-mono text-sm leading-relaxed focus:outline-none focus:border-amber-500/50 resize-none"
                     />
                   </div>
@@ -6521,7 +6744,6 @@ export default function App() {
                 });
                 setMemoSlots(prev => prev.map(m => (m.slot_index === slot ? { ...m, title, content: newContent, mode } : m)));
               }
-              toast(`スロット ${slot} のメモに差分を適用しました`, { kind: 'success' });
             }}
             backgroundJobProgress={aiJobProgressText}
             onJobStarted={() => {
@@ -7059,10 +7281,122 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 6: その他 (テスト点数) */}
+        {/* TAB 6: その他 (テスト点数 / パッチノート) */}
         {activeTab === 'more' && (
-          <div className="flex-1 min-h-0 flex anim-tab">
-            <TestScoresTab token={token} safeFetch={safeFetch} currentUser={currentUser} users={onlineUsers} />
+          <div className="flex-1 min-h-0 flex flex-col anim-tab bg-[#090A0C]">
+            {/* サブタブバー */}
+            <div className="shrink-0 h-11 border-b border-stone-800/80 px-4 flex items-center justify-between bg-[#0C0D10]/60">
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setMoreSubTab('scores')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                    moreSubTab === 'scores'
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                      : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/60'
+                  }`}
+                >
+                  <Award className="w-3.5 h-3.5" />
+                  <span>テスト点数</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMoreSubTab('patch_notes')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                    moreSubTab === 'patch_notes'
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                      : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/60'
+                  }`}
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>パッチノート</span>
+                  <span className="px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-mono border border-emerald-500/30 font-bold">
+                    NEW
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {/* サブタブコンテンツ */}
+            <div className="flex-1 min-h-0 flex overflow-hidden">
+              {moreSubTab === 'scores' ? (
+                <TestScoresTab token={token} safeFetch={safeFetch} currentUser={currentUser} users={onlineUsers} />
+              ) : (
+                <div className="flex-1 overflow-y-auto p-4 sm:p-6 text-stone-200">
+                  <div className="max-w-3xl mx-auto space-y-6">
+                    <div className="border-b border-stone-800/80 pb-4">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-xs font-mono font-bold border border-amber-500/40">v2.5.0</span>
+                        <h2 className="text-xl sm:text-2xl font-bold font-['Space_Grotesk'] text-white">大型アップデート パッチノート</h2>
+                      </div>
+                      <p className="text-xs text-stone-400">Discord連携の全面刷新・リアクションの改善・AI機能強化・メモと時程の拡充</p>
+                    </div>
+
+                    {/* 1. Discord連携・メッセージ送受信 */}
+                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
+                      <div className="flex items-center gap-2 text-sm font-bold text-indigo-400">
+                        <DiscordIcon className="w-4 h-4" />
+                        <span>1. Discord連携・メッセージ送受信の強化</span>
+                      </div>
+                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
+                        <li><b>Webhook送信の導入</b>: 「rds9:」表記を廃止し、送信者のアイコンとユーザー名がDiscord側にそのまま反映されるようになりました。</li>
+                        <li><b>送信中チャンネル移動の混入防止</b>: メッセージや画像送信中に別チャンネルへ移動しても、元のチャンネルへ正確に投稿されます。</li>
+                        <li><b>サーバー切替時のチャンネル記憶</b>: サーバーを切り替えた際、常に一番上ではなく前回見ていたチャンネルへ復帰するようになりました。</li>
+                        <li><b>外部Bot・他Webhookの取得</b>: 他のBotや外部Webhookのメッセージもasdfbase側で漏れなく受信できるようになりました。</li>
+                        <li><b>メッセージ削除のDiscord同期</b>: asdfbase側でメッセージを削除した際、Discord側にも即座に「(メッセージが削除されました)」として反映されます。</li>
+                        <li><b>画像ペースト時のHTMLタグ混入防止</b>: 画像をクリップボードから貼り付けた際に不要なタグが入力欄に入らないよう修正しました。</li>
+                        <li><b>Discord公式ロゴ</b>: サーバーアイコンやチャンネルタグの「DC」表記を公式ロゴSVGに統一しました。</li>
+                      </ul>
+                    </div>
+
+                    {/* 2. リアクション周りの改善 */}
+                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
+                      <div className="flex items-center gap-2 text-sm font-bold text-amber-400">
+                        <Smile className="w-4 h-4" />
+                        <span>2. リアクション周りの改善</span>
+                      </div>
+                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
+                        <li><b>楽観的UI (Optimistic UI)</b>: リアクションを押した瞬間にローカルで即座に反映され、体感レスポンスが劇的に高速化しました。</li>
+                        <li><b>リアクション送信者ポップアップ</b>: リアクションチップをクリックまたはホバーすると、誰がリアクションしたか全員の名前が一覧で表示されます。</li>
+                        <li><b>Discordリアクション者名の解決</b>: Discord側でリアクションしたユーザーの表示名が正しく表示されるようになりました。</li>
+                        <li><b>全チャンネル一括既読機能</b>: チャンネルヘッダーの「すべて既読」ボタンまたは <kbd className="px-1.5 py-0.5 rounded bg-stone-800 border border-stone-700 text-[10px] font-mono">Shift + Esc</kbd> で全未読を一度に既読にできます。</li>
+                      </ul>
+                    </div>
+
+                    {/* 3. AIタブ & ヘルプ */}
+                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
+                      <div className="flex items-center gap-2 text-sm font-bold text-purple-400">
+                        <Sparkles className="w-4 h-4" />
+                        <span>3. AIタブ & ヘルプの改善</span>
+                      </div>
+                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
+                        <li><b>AI出力の停止ボタン</b>: 長文生成中いつでも「停止」ボタンで出力を中断できるようになりました。</li>
+                        <li><b>ガタつき解消 & 出力アニメーション</b>: 過去ログ閲覧中のスクロール干渉を解消し、スムーズなタイピングアニメーションを実装しました。</li>
+                        <li><b>スレッドごとの処理分離</b>: AIの出力中に別の会話スレッドを開いてもメッセージが混ざらないよう分離しました。</li>
+                        <li><b>コードブロックのワンクリックコピー</b>: AIが出力したコードブロックにコピーボタンを追加しました。</li>
+                        <li><b>文面の自然化</b>: 「変更差分 (Diff)」→「変更差分」、「元に戻す (Undo)」→「元に戻す」に日本語を整理しました。</li>
+                        <li><b>ヘルプタブのAI質問枠</b>: ヘルプタブの上部から直接AIに使い方や疑問を質問できるようになりました。</li>
+                      </ul>
+                    </div>
+
+                    {/* 4. メモ・時間割・その他 */}
+                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
+                      <div className="flex items-center gap-2 text-sm font-bold text-emerald-400">
+                        <Book className="w-4 h-4" />
+                        <span>4. メモ・時間割・絵文字・その他の改修</span>
+                      </div>
+                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
+                        <li><b>メモの3モード対応</b>: Markdownメモで「編集のみ」「両方」「表示」を自由に切り替えられるようになりました。プレーンテキストにも「編集」「表示」モードを追加しました。</li>
+                        <li><b>同時スクロールの軽量化</b>: スクロール同期処理を最適化し、長文メモでも滑らかに動くようになりました。</li>
+                        <li><b>専用コードゾーンの言語指定 & 上限緩和</b>: Monaco Editor で TypeScript, Python, HTML, Rust などの言語を選択できるようになりました。コードゾーンは最大30個まで作成可能です。</li>
+                        <li><b>特別時程・学校スケジュール拡充</b>: 「特別時程」に対応し、給食（4限後）・昼休み・清掃（6限後）のスケジュール管理が可能になりました。</li>
+                        <li><b>ジャンボ絵文字 & ショートコード</b>: 絵文字単体投稿時のスタンプサイズ拡大表示、および <code>:melting_face:</code> や <code>:salute:</code> 等のDiscord標準ショートコードに対応しました。</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -8472,70 +8806,111 @@ export default function App() {
               )}
             </div>
 
-            {/* サーバーごとのチャンネル同期管理 & 一括同期 */}
+            {/* サーバーごとのチャンネル同期管理 & 一括同期 (アコーディオン & 検索フィルタ対応) */}
             <div className="space-y-3 border-t border-stone-800 pt-3">
-              <div className="font-bold text-stone-300">サーバーごとのチャンネル同期状況</div>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="font-bold text-stone-300">サーバーごとのチャンネル同期状況</div>
+                <div className="relative w-48 sm:w-60">
+                  <Search className="w-3.5 h-3.5 text-stone-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    placeholder="チャンネル名を検索…"
+                    value={serverBindingSearch}
+                    onChange={e => setServerBindingSearch(e.target.value)}
+                    className="w-full bg-[#111214] border border-stone-800 rounded-lg pl-8 pr-2.5 py-1 text-xs text-white placeholder-stone-500 focus:outline-none focus:border-amber-500/50"
+                  />
+                </div>
+              </div>
+
               {discordServers.length === 0 ? (
                 <div className="text-stone-500 text-xs">接続中のサーバーがありません</div>
               ) : (
-                discordServers.map((srv: any) => {
-                  const srvBindings = discordBindings.filter((b: any) =>
+                discordServers.map((srv: any, srvIdx: number) => {
+                  const allSrvBindings = discordBindings.filter((b: any) =>
                     b.guildId === srv.id || b.discordGuildName === srv.name
                   );
+                  const isExpanded = expandedServerBindings[srv.id] ?? (srvIdx === 0 || Boolean(serverBindingSearch.trim()));
+                  const filteredBindings = serverBindingSearch.trim()
+                    ? allSrvBindings.filter((b: any) =>
+                        String(b.discordChannelName || '').toLowerCase().includes(serverBindingSearch.toLowerCase()) ||
+                        String(b.asdfChannelName || '').toLowerCase().includes(serverBindingSearch.toLowerCase())
+                      )
+                    : allSrvBindings;
+
                   return (
-                    <div key={srv.id} className="p-3.5 rounded-xl bg-[#16181D] border border-stone-800 space-y-2.5">
-                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-800/80 pb-2">
+                    <div key={srv.id} className="rounded-xl bg-[#16181D] border border-stone-800 overflow-hidden">
+                      {/* アコーディオンヘッダー */}
+                      <div
+                        onClick={() => setExpandedServerBindings(prev => ({ ...prev, [srv.id]: !isExpanded }))}
+                        className="p-3 flex flex-wrap items-center justify-between gap-2 bg-[#12141A] hover:bg-[#1a1c23] cursor-pointer transition select-none"
+                      >
                         <div className="flex items-center gap-2">
+                          <button type="button" className="text-stone-400 hover:text-white p-0.5">
+                            {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                          </button>
                           {srv.iconUrl ? (
                             <img src={toProxiedMediaUrl(srv.iconUrl, token)} alt="" className="w-5 h-5 rounded-lg object-cover" />
                           ) : (
                             <Server className="w-4 h-4 text-indigo-400" />
                           )}
                           <span className="font-bold text-white text-sm">{srv.name}</span>
-                          <span className="text-[10px] text-stone-400">({srvBindings.length} / {(srv.textChannels || []).length} チャンネル同期中)</span>
+                          <span className="text-[10px] text-stone-400">({allSrvBindings.length} / {(srv.textChannels || []).length} チャンネル同期中)</span>
                         </div>
                         {currentUser?.role === 'admin' && (
-                          <button
-                            onClick={() => handleSyncAllChannels(srv.id, srv.name)}
-                            disabled={isSyncingAllChannels}
-                            className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-300 font-bold text-[11px] flex items-center gap-1.5 disabled:opacity-40"
-                          >
-                            <RefreshCw className={`w-3 h-3 ${isSyncingAllChannels ? 'animate-spin' : ''}`} />
-                            このサーバーの全チャンネルを一括同期
-                          </button>
+                          <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
+                            <button
+                              onClick={() => handleSyncAllChannels(srv.id, srv.name)}
+                              disabled={isSyncingAllChannels}
+                              className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-300 font-bold text-[11px] flex items-center gap-1.5 disabled:opacity-40"
+                            >
+                              <RefreshCw className={`w-3 h-3 ${isSyncingAllChannels ? 'animate-spin' : ''}`} />
+                              全チャンネルを一括同期
+                            </button>
+                          </div>
                         )}
                       </div>
-                      <div className="space-y-1.5">
-                        {srvBindings.length === 0 ? (
-                          <div className="text-stone-500 text-[11px] py-1">同期中のチャンネルはありません。「全チャンネルを一括同期」または上の簡単紐付けから追加できます。</div>
-                        ) : (
-                          srvBindings.map((b: any) => (
-                            <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[#111214] border border-stone-800">
-                              <div className="min-w-0 flex items-center gap-2 flex-wrap text-xs">
-                                <span className="text-indigo-300 font-bold">#{b.discordChannelName}</span>
-                                <span className="text-stone-600">⇔</span>
-                                <span className="text-amber-300 font-bold">asdfbase #{b.asdfChannelName}</span>
-                              </div>
-                              {currentUser?.role === 'admin' && (
-                                <div className="flex items-center gap-1.5 shrink-0">
-                                  <button
-                                    onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
-                                    className="px-2 py-1 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-300 text-[10px]"
-                                  >
-                                    同期解除
-                                  </button>
-                                  <button
-                                    onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
-                                    className="px-2 py-1 rounded-lg bg-red-950/50 hover:bg-red-900/60 border border-red-900 text-red-300 text-[10px]"
-                                  >
-                                    削除
-                                  </button>
-                                </div>
-                              )}
+
+                      {/* 展開時: チャンネル同期一覧 */}
+                      {isExpanded && (
+                        <div className="p-3 border-t border-stone-800/80 space-y-2">
+                          {filteredBindings.length === 0 ? (
+                            <div className="text-stone-500 text-[11px] py-1 text-center">
+                              {serverBindingSearch.trim()
+                                ? '検索に一致するチャンネルはありません'
+                                : '同期中のチャンネルはありません。「全チャンネルを一括同期」または上の簡単紐付けから追加できます。'}
                             </div>
-                          ))
-                        )}
-                      </div>
+                          ) : (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-80 overflow-y-auto pr-1">
+                              {filteredBindings.map((b: any) => (
+                                <div key={b.discordChannelId} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[#111214] border border-stone-800/80 hover:border-stone-700">
+                                  <div className="min-w-0 flex items-center gap-1.5 text-xs truncate">
+                                    <DiscordIcon className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                                    <span className="text-indigo-300 font-bold truncate">#{b.discordChannelName}</span>
+                                    <span className="text-stone-600 shrink-0">⇔</span>
+                                    <span className="text-amber-300 font-bold truncate">#{b.asdfChannelName}</span>
+                                  </div>
+                                  {currentUser?.role === 'admin' && (
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <button
+                                        onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}` })}
+                                        className="px-2 py-0.5 rounded bg-stone-800 hover:bg-stone-700 text-stone-300 text-[10px]"
+                                      >
+                                        解除
+                                      </button>
+                                      <button
+                                        onClick={() => handleUnbindDiscordChannel({ asdfChannelId: b.asdfChannelId, discordChannelId: b.discordChannelId, label: `#${b.asdfChannelName}`, deleteChannel: true })}
+                                        className="px-2 py-0.5 rounded bg-red-950/50 hover:bg-red-900/60 border border-red-900 text-red-300 text-[10px]"
+                                      >
+                                        削除
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })

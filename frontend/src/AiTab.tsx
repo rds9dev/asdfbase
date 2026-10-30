@@ -66,6 +66,50 @@ export interface AiTabProps {
   onJobFinished?: () => void;
 }
 
+function CodeBlockWithCopy({ inline, className, children, ...props }: any) {
+  const [copied, setCopied] = useState(false);
+  const match = /language-(\w+)/.exec(className || '');
+  const lang = match ? match[1] : '';
+  const text = String(children).replace(/\n$/, '');
+
+  if (inline) {
+    return (
+      <code className="bg-[#1c1d22] text-amber-300 font-mono text-[12px] px-1.5 py-0.5 rounded border border-stone-800" {...props}>
+        {children}
+      </code>
+    );
+  }
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  return (
+    <div className="relative group/code my-3 rounded-xl border border-stone-800 bg-[#0B0C0E] overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-1.5 bg-[#121316] border-b border-stone-800/80 text-[11px] font-mono text-stone-400">
+        <span className="uppercase text-[10px] tracking-wider text-amber-400/80 font-bold">{lang || 'code'}</span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="flex items-center gap-1 px-2 py-0.5 rounded bg-stone-800 hover:bg-stone-700 text-stone-300 hover:text-white transition text-[10px]"
+          title="コードをコピー"
+        >
+          {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+          <span>{copied ? 'コピー完了' : 'コピー'}</span>
+        </button>
+      </div>
+      <pre className="p-3 font-mono text-xs overflow-x-auto text-stone-200 leading-relaxed">
+        <code className={className} {...props}>
+          {children}
+        </code>
+      </pre>
+    </div>
+  );
+}
+
 function DiffViewer({
   diff,
   onApply,
@@ -85,7 +129,7 @@ function DiffViewer({
           className="flex items-center gap-1.5 font-mono text-[11px] text-amber-300 hover:text-white font-bold"
         >
           <span>{open ? '▼' : '▶'}</span>
-          <span>変更差分 (Diff): {diff.target}</span>
+          <span>変更差分: {diff.target}</span>
         </button>
         <div className="flex items-center gap-1.5">
           {onApply && diff.slot && !applied && (
@@ -112,13 +156,13 @@ function DiffViewer({
                 onClick={() => {
                   onApply(diff.slot!, diff.oldText);
                   setApplied(false);
-                  toast(`メモ #${diff.slot} の差分を元に戻しました (Undo)`, { kind: 'success' });
+                  toast(`メモ #${diff.slot} の差分を元に戻しました`, { kind: 'success' });
                 }}
                 className="px-2 py-0.5 rounded bg-stone-800 hover:bg-stone-700 text-stone-300 hover:text-white text-[10px] font-bold flex items-center gap-1 transition border border-stone-700"
                 title="適用前の状態に戻す"
               >
                 <RotateCcw className="w-3 h-3 text-amber-400" />
-                元に戻す (Undo)
+                元に戻す
               </button>
             </div>
           )}
@@ -226,6 +270,9 @@ export default function AiTab({
   const [editingTitle, setEditingTitle] = useState('');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [loadingThreadId, setLoadingThreadId] = useState<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const isNearBottomRef = useRef(true);
   const [images, setImages] = useState<PendingImage[]>([]);
   // モデル切り替え: 高速 (gemini-3.5-flash-lite) / 思考 (gemini-3.8-flash)
   const [modelMode, setModelMode] = useState<'fast' | 'thinking'>('fast');
@@ -392,18 +439,37 @@ export default function AiTab({
     setShowPersonaModal(false);
   };
 
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  };
+
   const scrollToBottom = (smooth: boolean) => {
     const el = scrollRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+  };
+
+  const stopGenerating = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+    setLoadingThreadId(null);
+    onJobFinished?.();
+    toast('AIの応答を中断しました', { kind: 'success' });
   };
 
   // 開いた時は一番下から
   useLayoutEffect(() => {
     if (active) scrollToBottom(false);
   }, [active, activeThreadId]);
-  useEffect(() => scrollToBottom(true), [messages.length, loading]);
   useEffect(() => {
-    if (reveal) scrollToBottom(false);
+    if (isNearBottomRef.current) scrollToBottom(true);
+  }, [messages.length, loading, loadingThreadId]);
+  useEffect(() => {
+    if (reveal && isNearBottomRef.current) scrollToBottom(false);
   }, [reveal]);
 
   // 返信を少しずつ表示 (CPU負荷軽減のため70msデバウンス)
@@ -448,6 +514,10 @@ export default function AiTab({
     setForceWebSearch(false);
     if (inputRef.current) inputRef.current.style.height = 'auto';
     setLoading(true);
+    setLoadingThreadId(targetThreadId);
+
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     const currentThread = threads.find(t => t.id === targetThreadId);
     const autoTitle =
@@ -462,6 +532,7 @@ export default function AiTab({
       const jobRes = await safeFetch('/api/ai/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        signal: abortController.signal,
         body: JSON.stringify({
           messages: next.filter(m => !m.error).slice(-30).map(m => ({ role: m.role, content: m.content })),
           contextData: buildContext(),
@@ -483,11 +554,13 @@ export default function AiTab({
         let done = false;
         let attempts = 0;
         while (!done && attempts < 90) {
+          if (abortController.signal.aborted) throw new Error('ユーザーにより中断されました');
           await new Promise(r => setTimeout(r, 2000));
           attempts++;
           try {
             const checkRes = await safeFetch(`/api/ai/jobs/${jobId}`, {
               headers: { Authorization: `Bearer ${token}` },
+              signal: abortController.signal,
             });
             if (checkRes.ok) {
               const jobData = await checkRes.json();
@@ -501,6 +574,7 @@ export default function AiTab({
               }
             }
           } catch (e: any) {
+            if (abortController.signal.aborted) throw e;
             if (attempts > 60) throw e;
           }
         }
@@ -510,6 +584,7 @@ export default function AiTab({
         const res = await safeFetch('/api/ai/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          signal: abortController.signal,
           body: JSON.stringify({
             messages: next.filter(m => !m.error).slice(-30).map(m => ({ role: m.role, content: m.content })),
             contextData: buildContext(),
@@ -746,17 +821,6 @@ export default function AiTab({
                 <span>思考</span>
               </button>
             </div>
-
-            {/* 性格設定ボタン */}
-            <button
-              type="button"
-              onClick={() => setShowPersonaModal(true)}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 text-[11px] shrink-0"
-              title="AIの性格・口調を設定"
-            >
-              <UserCheck className="w-3.5 h-3.5" />
-              <span>性格: {currentPersonaObj.short}</span>
-            </button>
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
@@ -909,7 +973,7 @@ export default function AiTab({
         </div>
       )}
 
-      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4">
+      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4">
         <div className="max-w-4xl mx-auto space-y-4">
           {messages.length === 0 && !loading && (
             <div className="py-12 flex flex-col items-center gap-3 text-stone-500 text-xs anim-fade text-center">
@@ -978,7 +1042,7 @@ export default function AiTab({
                   ) : (
                     <>
                       <div className="markdown-body overflow-x-auto">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ code: CodeBlockWithCopy }}>{shown}</ReactMarkdown>
                         {isRevealing && <span className="ai-caret" />}
                       </div>
                       {/* Diff (変更差分) プレビュー */}
@@ -1042,15 +1106,30 @@ export default function AiTab({
               </div>
             );
           })}
-          {loading && (
-            <div className="flex gap-2.5 anim-msg">
-              <div className="w-7 h-7 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0">
-                <Bot className="w-4 h-4" />
+          {loadingThreadId === activeThreadId && (
+            <div className="flex gap-2.5 anim-msg items-center justify-between">
+              <div className="flex gap-2.5 items-center">
+                <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-amber-500/20 to-indigo-500/20 border border-amber-500/40 text-amber-300 flex items-center justify-center shrink-0 shadow-[0_0_12px_rgba(245,158,11,0.2)]">
+                  <Bot className="w-4 h-4 animate-pulse" />
+                </div>
+                <div className="bg-[#14161C] border border-stone-800/80 rounded-2xl px-4 py-3 flex items-center gap-3 text-xs text-stone-300 shadow-lg">
+                  <div className="flex items-center gap-1.5 text-amber-400">
+                    <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                    <span className="typing-dots"><i /><i /><i /></span>
+                  </div>
+                  <span className="font-medium bg-gradient-to-r from-amber-200 via-stone-200 to-indigo-200 bg-clip-text text-transparent">
+                    {backgroundJobProgress || '思考中・ツールを実行中…'}
+                  </span>
+                </div>
               </div>
-              <div className="bg-[#14161C] border border-stone-800/80 rounded-2xl px-4 py-3 flex items-center gap-2 text-xs text-stone-400">
-                <span className="typing-dots"><i /><i /><i /></span>
-                {backgroundJobProgress || '調べています…'}
-              </div>
+              <button
+                type="button"
+                onClick={stopGenerating}
+                className="px-3 py-1.5 rounded-xl bg-red-950/40 hover:bg-red-900/50 border border-red-800/60 text-red-300 hover:text-white font-bold text-xs flex items-center gap-1.5 transition active:scale-95 shrink-0"
+              >
+                <X className="w-3.5 h-3.5 stroke-[2.5]" />
+                <span>停止</span>
+              </button>
             </div>
           )}
         </div>
@@ -1133,9 +1212,10 @@ export default function AiTab({
                   }}
                   onPaste={e => {
                     const files = Array.from(e.clipboardData.files).filter(f => f.type.startsWith('image/'));
-                    if (files.length === 0) return;
-                    if (!e.clipboardData.getData('text/plain')) e.preventDefault();
-                    addImages(files);
+                    if (files.length > 0) {
+                      e.preventDefault();
+                      addImages(files);
+                    }
                   }}
                   onKeyDown={e => {
                     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
@@ -1147,14 +1227,27 @@ export default function AiTab({
                   placeholder={forceWebSearch ? 'Web で調べたいことを入力' : '質問や頼みごとを入力 (Shift+Enter で改行・Ctrl+V で画像)'}
                   className="flex-1 bg-transparent text-sm text-stone-100 placeholder-stone-600 focus:outline-none resize-none leading-relaxed max-h-[180px] py-0.5"
                 />
-                <button
-                  onClick={() => send()}
-                  disabled={loading || (!input.trim() && images.length === 0)}
-                  className="p-2 rounded-lg btn-primary disabled:opacity-40"
-                  aria-label="送信"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
+                {loadingThreadId === activeThreadId ? (
+                  <button
+                    type="button"
+                    onClick={stopGenerating}
+                    className="p-2 rounded-lg bg-red-950/60 hover:bg-red-900 border border-red-800 text-red-300 transition"
+                    aria-label="停止"
+                    title="生成を中断"
+                  >
+                    <X className="w-4 h-4 stroke-[2.5]" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => send()}
+                    disabled={loading || (!input.trim() && images.length === 0)}
+                    className="p-2 rounded-lg btn-primary disabled:opacity-40"
+                    aria-label="送信"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             </>
           )}

@@ -106,8 +106,25 @@ export async function notifyImportant(title: string, description: string, color 
   }
 }
 
-// 通常メッセージの Discord 転送: Bot 連携があれば Bot、なければメッセージ用 Webhook
-export async function relayMessage(msg: { id?: number; channel_id: number; username?: string; sender_username?: string; content: string; reply_to_id?: number | null }): Promise<boolean> {
+// Discord リアクションをした Discord ユーザー名キャッシュ (pseudoUserId -> username)
+export const discordReactionUsernames = new Map<number, string>();
+
+// ユーザーのアバターキャッシュ
+const userAvatarCache = new Map<number, string | null>();
+export async function getUserAvatar(userId: number): Promise<string | null> {
+  if (userAvatarCache.has(userId)) return userAvatarCache.get(userId) || null;
+  try {
+    const res = await pool.query(`SELECT avatar_url FROM users WHERE id = $1`, [userId]);
+    const url = res.rows[0]?.avatar_url || null;
+    userAvatarCache.set(userId, url);
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+// 通常メッセージの Discord 転送: Bot 連携があれば Bot (Webhook化でアイコン反映)、なければメッセージ用 Webhook
+export async function relayMessage(msg: { id?: number; channel_id: number; username?: string; sender_username?: string; content: string; reply_to_id?: number | null; author_avatar?: string | null }): Promise<boolean> {
   try {
     const username = msg.sender_username || msg.username || 'unknown';
     if (username.startsWith('[Discord]')) return false; // Discord から来たものは戻さない
@@ -124,7 +141,7 @@ export async function relayMessage(msg: { id?: number; channel_id: number; usern
       }
     }
 
-    const sent = await relayToDiscordBot(msg.channel_id, username, msg.content, targetDiscordMsgId);
+    const sent = await relayToDiscordBot(msg.channel_id, username, msg.content, targetDiscordMsgId, msg.author_avatar);
     if (sent.length > 0) {
       // あとで編集を Discord 側にも反映できるよう、送ったメッセージを覚えておく
       if (msg.id) {
@@ -977,6 +994,34 @@ app.post('/api/channels/:channelId/read', authMiddleware, async (req: AuthReques
   }
 });
 
+// 全チャンネルを一括既読にする
+app.post('/api/channels/read-all', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const latestPerChannel = await pool.query(
+      `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages GROUP BY channel_id`
+    );
+    const readUpdates: Record<number, number> = {};
+    for (const row of latestPerChannel.rows) {
+      const channelId = Number(row.channel_id);
+      const maxId = Number(row.max_id);
+      if (maxId > 0) {
+        await pool.query(
+          `INSERT INTO channel_reads (user_id, channel_id, last_read_id) VALUES ($1, $2, $3)
+           ON CONFLICT (user_id, channel_id) DO UPDATE SET last_read_id = GREATEST(channel_reads.last_read_id, EXCLUDED.last_read_id)`,
+          [userId, channelId, maxId]
+        );
+        readUpdates[channelId] = maxId;
+      }
+    }
+    publish({ type: 'ALL_CHANNELS_READ', payload: { userId, readUpdates } }, { targetUserId: userId });
+    res.json({ success: true, readUpdates });
+  } catch (err: any) {
+    console.error('Read all channels error:', err);
+    res.status(500).json({ error: '一括既読エラー' });
+  }
+});
+
 // メッセージリンク用: 指定メッセージの前後をまとめて返す
 app.get('/api/messages/:messageId/context', authMiddleware, async (req, res) => {
   try {
@@ -1169,7 +1214,8 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
       [channelId, userId, username, content, JSON.stringify(attachments || []), replyToId || null]
     );
 
-    const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: username, client_nonce: clientNonce || null }]);
+    const userAvatar = await getUserAvatar(userId);
+    const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: username, author_avatar: userAvatar, client_nonce: clientNonce || null }]);
     broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
 
     const relayed = await relayMessage(savedMessage);
@@ -1224,7 +1270,7 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthR
     if (msgRes.rows.length === 0) return res.status(404).json({ error: 'メッセージがありません' });
 
     const reactions = msgRes.rows[0].reactions || {};
-    const users = reactions[emoji] || [];
+    const users: number[] = (reactions[emoji] || []).map((u: any) => Number(u));
 
     if (users.includes(userId)) {
       reactions[emoji] = users.filter((id: number) => id !== userId);
@@ -2511,7 +2557,8 @@ app.post('/api/ai/memo-assist', authMiddleware, async (req: AuthRequest, res) =>
     let instruction = 'あなたは的確で簡潔なアシスタントです。余計な前置きを省いて結果のみを返してください。';
 
     if (type === 'summarize') {
-      prompt = `以下のメモ内容を3行以内の重要ポイントに箇条書きで要約してください:\n\n${content}`;
+      prompt = `以下のメモ内容を読み、重要なポイントや文脈が抜け落ちないよう、分かりやすい見出しや箇条書きを用いて充実した日本語で要約してください。過度な省略は避け、主要な情報や詳細をしっかりと含めてください:\n\n${content}`;
+      instruction = 'あなたは要約のスペシャリストです。元の文脈や重要なディテールを損なわず、読みやすく構造化された要約を出力してください。';
     } else if (type === 'proofread') {
       prompt = `以下の文章の誤字脱字・表現の不自然さを直した「校正後の全文」だけを出力してください。説明・前置き・コードブロックの囲みは不要です。Markdown の書式はそのまま残してください:\n\n${content}`;
     } else if (type === 'explain_code') {
@@ -2875,7 +2922,7 @@ app.get('/api/notes', authMiddleware, async (req, res) => {
 app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const slotIndex = parseInt(req.params.slotIndex, 10);
-    const { title, content, mode } = req.body;
+    const { title, content, mode, language } = req.body;
     const userId = req.user!.id;
     const userRole = req.user!.role;
     const username = req.user!.username;
@@ -2901,16 +2948,18 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
     }
 
     const effectiveMode = slotIndex >= 11 ? 'monaco' : (mode || currentNote?.mode || 'markdown');
+    const effectiveLanguage = language || currentNote?.language || 'typescript';
 
     const updated = await pool.query(
       `UPDATE notes 
        SET title = COALESCE($1, title), 
            content = COALESCE($2, content), 
            mode = $3, 
+           language = $4,
            version = version + 1, 
            updated_at = NOW() 
-       WHERE slot_index = $4 RETURNING *`,
-      [title, content, effectiveMode, slotIndex]
+       WHERE slot_index = $5 RETURNING *`,
+      [title, content, effectiveMode, effectiveLanguage, slotIndex]
     );
 
     const updatedNote = {
@@ -2931,10 +2980,10 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
-// 管理者専用: 専用コードゾーンの作成（ユーザー割り当て）
+// 管理者専用: 専用コードゾーンの作成（ユーザー割り当て / 最大30個 / 言語指定対応）
 app.post('/api/notes/code-zones', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
   try {
-    const { targetUserId } = req.body;
+    const { targetUserId, title: reqTitle, language: reqLanguage } = req.body;
     if (!targetUserId || typeof targetUserId !== 'number') {
       return res.status(400).json({ error: 'targetUserId が必要です' });
     }
@@ -2944,26 +2993,27 @@ app.post('/api/notes/code-zones', authMiddleware, adminOnly, async (req: AuthReq
     }
     const targetUser = userRes.rows[0];
 
-    // すでに専用コードゾーンがあるか確認
-    const existing = await pool.query(`SELECT * FROM notes WHERE assigned_user_id = $1 AND slot_index >= 11`, [targetUserId]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'このユーザーの専用コードゾーンは既に存在します' });
-    }
-
-    // 空いている最小スロット (11以降) を探索
+    // 全体の専用コードゾーン数 (最大30個まで、スロット11〜40)
     const usedSlotsRes = await pool.query(`SELECT slot_index FROM notes WHERE slot_index >= 11 ORDER BY slot_index ASC`);
+    if (usedSlotsRes.rows.length >= 30) {
+      return res.status(400).json({ error: '専用コードゾーンの上限（最大30個）に達しています' });
+    }
     const usedSlots = new Set(usedSlotsRes.rows.map(r => r.slot_index));
     let newSlot = 11;
     while (usedSlots.has(newSlot)) {
       newSlot++;
     }
+    if (newSlot > 40) {
+      return res.status(400).json({ error: 'スロット空きがありません' });
+    }
 
-    const title = `${targetUser.username}の専用エディタ`;
+    const title = reqTitle ? String(reqTitle).slice(0, 50) : `${targetUser.username}のコードゾーン #${newSlot - 10}`;
+    const language = reqLanguage || 'typescript';
     const inserted = await pool.query(
-      `INSERT INTO notes (slot_index, title, content, mode, assigned_user_id)
-       VALUES ($1, $2, '', 'monaco', $3)
+      `INSERT INTO notes (slot_index, title, content, mode, assigned_user_id, language)
+       VALUES ($1, $2, '', 'monaco', $3, $4)
        RETURNING *`,
-      [newSlot, title, targetUserId]
+      [newSlot, title, targetUserId, language]
     );
 
     const createdNote = {
@@ -2977,7 +3027,7 @@ app.post('/api/notes/code-zones', authMiddleware, adminOnly, async (req: AuthReq
       sender: req.user!.username,
     });
     logAudit(req.user!, 'code_zone_create', 'note', newSlot, {
-      message: `管理者 ${req.user!.username} が ${targetUser.username} に専用コードゾーン #${newSlot} を割り当てました`,
+      message: `管理者 ${req.user!.username} が ${targetUser.username} に専用コードゾーン #${newSlot} (${language}) を割り当てました`,
     });
 
     res.json(createdNote);
@@ -3302,10 +3352,24 @@ app.get('/api/users', authMiddleware, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, role, status, custom_status, avatar_url, class_no, custom_roles, last_active_at FROM users ORDER BY username ASC`
     );
-    res.json(result.rows.map(r => ({
-      ...r,
-      custom_roles: Array.isArray(r.custom_roles) ? r.custom_roles : [],
-    })));
+    const pseudoUsers = Array.from(discordReactionUsernames.entries()).map(([id, uname]) => ({
+      id,
+      username: uname,
+      role: 'member',
+      status: 'offline',
+      custom_status: 'Discord',
+      avatar_url: null,
+      class_no: null,
+      custom_roles: [],
+      last_active_at: null,
+    }));
+    res.json([
+      ...result.rows.map(r => ({
+        ...r,
+        custom_roles: Array.isArray(r.custom_roles) ? r.custom_roles : [],
+      })),
+      ...pseudoUsers,
+    ]);
   } catch (err) {
     res.status(500).json({ error: 'ユーザー一覧取得エラー' });
   }
@@ -3903,7 +3967,8 @@ async function handleClientMessage(user: { id: number; username: string }, connI
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
       [channelId, user.id, user.username, content, JSON.stringify(attachments || []), replyToId || null]
     );
-    const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: user.username, client_nonce: clientNonce || null }]);
+    const userAvatar = await getUserAvatar(user.id);
+    const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: user.username, author_avatar: userAvatar, client_nonce: clientNonce || null }]);
     broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
     const relayed = await relayMessage(savedMessage);
     if (String(content).includes('@everyone') && !relayed) {
@@ -4376,18 +4441,22 @@ server.listen(PORT, async () => {
           }
         }
       },
-      ingestReaction: async (discordMessageId, emoji, discordUserId, action) => {
+      ingestReaction: async (discordMessageId, emoji, discordUserId, action, username) => {
         const links = (await pool.query(
           `SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1`,
           [discordMessageId]
         )).rows;
         // 負の整数IDを生成して既存ユーザーと衝突防止
         const pseudoUserId = -Math.abs(Array.from(discordUserId).reduce((acc, c) => ((acc << 5) - acc + c.charCodeAt(0)) | 0, 0));
+        if (username) {
+          const displayUname = username.startsWith('[Discord]') ? username : `[Discord] ${username}`;
+          discordReactionUsernames.set(pseudoUserId, displayUname);
+        }
         for (const l of links) {
           const msgRes = await pool.query(`SELECT reactions FROM messages WHERE id = $1`, [l.asdf_message_id]);
           if (msgRes.rows.length === 0) continue;
           const reactions = msgRes.rows[0].reactions || {};
-          const users = reactions[emoji] || [];
+          const users: number[] = (reactions[emoji] || []).map((u: any) => Number(u));
           if (action === 'add') {
             if (!users.includes(pseudoUserId)) {
               reactions[emoji] = [...users, pseudoUserId];
@@ -4402,7 +4471,11 @@ server.listen(PORT, async () => {
           );
           broadcast({
             type: 'MESSAGE_REACTION_UPDATED',
-            payload: { messageId: l.asdf_message_id, reactions: updated.rows[0].reactions },
+            payload: {
+              messageId: l.asdf_message_id,
+              reactions: updated.rows[0].reactions,
+              reactionUser: username ? { id: pseudoUserId, username: username.startsWith('[Discord]') ? username : `[Discord] ${username}` } : undefined,
+            },
           });
         }
       },

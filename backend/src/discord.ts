@@ -11,6 +11,7 @@ import {
   Partials,
   PermissionFlagsBits,
   ApplicationCommandOptionType,
+  Webhook,
   type Message as DiscordMessage,
   type PartialMessage,
   type ChatInputCommandInteraction,
@@ -74,7 +75,7 @@ export interface DiscordDeps {
   // Discord 側でメッセージが削除された (取り消し線反映)
   ingestDelete?: (discordMessageId: string) => Promise<void>;
   // Discord 側でリアクション追加/削除
-  ingestReaction?: (discordMessageId: string, emoji: string, discordUserId: string, action: 'add' | 'remove') => Promise<void>;
+  ingestReaction?: (discordMessageId: string, emoji: string, discordUserId: string, action: 'add' | 'remove', username?: string) => Promise<void>;
   // ピン留め一覧の同期
   syncPinsForChannel?: (discordChannelId: string, pinnedDiscordMsgIds: string[]) => Promise<void>;
   // Discord 側の入力中イベント
@@ -705,8 +706,59 @@ async function avatarFor(msg: DiscordMessage): Promise<string | null> {
   }
 }
 
+// Webhook 送信管理: チャンネルごとの Webhook キャッシュ & 自送信エコーバック除外
+const webhookCache = new Map<string, Webhook>();
+const ourWebhookIds = new Set<string>();
+
+async function getOrCreateWebhook(channel: any): Promise<Webhook | null> {
+  if (!channel || !('fetchWebhooks' in channel)) return null;
+  const channelId = channel.id;
+  const cached = webhookCache.get(channelId);
+  if (cached) return cached;
+  try {
+    const webhooks = await channel.fetchWebhooks();
+    let hook = webhooks.find((w: any) => w.name === 'asdfbase-relay' || (client?.user && w.owner?.id === client.user.id)) || webhooks.first();
+    if (!hook && 'createWebhook' in channel) {
+      hook = await channel.createWebhook({
+        name: 'asdfbase-relay',
+        reason: 'asdfbase message relay',
+      });
+    }
+    if (hook) {
+      webhookCache.set(channelId, hook);
+      ourWebhookIds.add(hook.id);
+      return hook;
+    }
+  } catch (err: any) {
+    console.warn('[discord] webhook fetch/create failed:', err.message);
+  }
+  return null;
+}
+
+// 本文中の @メンバー名 を Discord の <@userId> 記法に変換
+async function resolveDiscordMentions(guild: any, text: string): Promise<string> {
+  if (!guild || !text.includes('@')) return text;
+  try {
+    const members = guild.members.cache;
+    return text.replace(/@([^\s@#]+)/g, (match, name) => {
+      if (name === 'everyone' || name === 'here') return match;
+      const target = members.find((m: any) => m.displayName === name || m.user?.username === name || m.user?.globalName === name);
+      return target ? `<@${target.id}>` : match;
+    });
+  } catch {
+    return text;
+  }
+}
+
+// 自分の送信・Webhookエコー判定 (他の外部Botや他Webhookは通す)
+function isOurEchoMessage(msg: { author?: { id?: string; bot?: boolean }; webhookId?: string | null }): boolean {
+  if (msg.webhookId && ourWebhookIds.has(msg.webhookId)) return true;
+  if (client?.user && msg.author?.id === client.user.id) return true;
+  return false;
+}
+
 async function processDiscordMessage(msg: DiscordMessage, targets: DiscordBinding[], isHistorySync = false): Promise<number> {
-  if (msg.author.bot || msg.webhookId) return 0; // 自分の転送を再取り込みしない
+  if (isOurEchoMessage(msg)) return 0; // 自分の転送を再取り込みしない
   if (targets.length === 0) return 0;
 
   const name = `[Discord] ${msg.member?.displayName || msg.author.globalName || msg.author.username}`;
@@ -782,7 +834,7 @@ async function processDiscordMessage(msg: DiscordMessage, targets: DiscordBindin
 
 async function handleDiscordMessage(msg: DiscordMessage) {
   if (!isGuildAllowed(msg.guildId)) return;
-  if (msg.author.bot || msg.webhookId) return;
+  if (isOurEchoMessage(msg)) return;
   const bindings = await getBindings();
   const targets = bindings.filter(b => b.discordChannelId === msg.channelId);
   if (targets.length === 0) return;
@@ -835,7 +887,7 @@ export async function syncDiscordHistory(opts?: {
       );
 
       for (const msg of sorted) {
-        if (msg.author.bot || msg.webhookId) continue;
+        if (isOurEchoMessage(msg)) continue;
         // 古いメッセージ (2時間以上前) はスキップ
         if (msg.createdTimestamp < oldestAllowedTime) continue;
 
@@ -858,7 +910,7 @@ export async function syncDiscordHistory(opts?: {
 async function handleDiscordEdit(msg: DiscordMessage | PartialMessage) {
   if (!isGuildAllowed(msg.guildId)) return;
   const full = msg.partial ? await msg.fetch().catch(() => null) : msg;
-  if (!full || full.author.bot || full.webhookId) return;
+  if (!full || isOurEchoMessage(full)) return;
   const bindings = await getBindings();
   if (!bindings.some(b => b.discordChannelId === full.channelId)) return;
   const rawText = full.cleanContent?.trim() || '';
@@ -871,12 +923,13 @@ async function handleDiscordEdit(msg: DiscordMessage | PartialMessage) {
   await deps!.ingestEdit(full.id, text);
 }
 
-// asdfbase のメッセージを連携先の Discord チャンネルへ送信。送った Discord メッセージを返す (空なら未送信)
+// asdfbase のメッセージを連携先の Discord チャンネルへ送信 (Webhook によるアイコン・名前直接反映)。送った Discord メッセージを返す (空なら未送信)
 export async function relayToDiscordBot(
   asdfChannelId: number,
   username: string,
   content: string,
-  replyTargetDiscordMessageId?: string | null
+  replyTargetDiscordMessageId?: string | null,
+  avatarUrl?: string | null
 ): Promise<RelayedMessage[]> {
   if (!client || !connected || !deps) return [];
   const targets = (await getBindings()).filter(b => b.asdfChannelId === asdfChannelId);
@@ -890,21 +943,48 @@ export async function relayToDiscordBot(
   }).trim();
   const isVideoMsg = /\.(mp4|mov|webm|mkv)(\?|$)/i.test(content);
 
-  const body = isVideoMsg ? VIDEO_NOTICE : text;
-  const payload: any = {
-    content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000),
-    files: isVideoMsg ? [] : files,
-    allowedMentions: { parse: [] as never[] },
-  };
-  if (replyTargetDiscordMessageId) {
-    payload.reply = { messageReference: replyTargetDiscordMessageId, failIfNotExists: false };
-  }
+  const baseOrigin = process.env.PUBLIC_ORIGIN || process.env.BASE_URL || 'https://asdfbase.onrender.com';
+  const resolvedAvatarUrl = avatarUrl
+    ? (avatarUrl.startsWith('http') ? avatarUrl : `${baseOrigin.replace(/\/+$/, '')}/${avatarUrl.replace(/^\/+/, '')}`)
+    : undefined;
 
   const sent: RelayedMessage[] = [];
   for (const t of targets) {
     try {
       const ch = (await client.channels.fetch(t.discordChannelId)) as TextBasedChannel | null;
-      if (ch && 'send' in ch && isGuildAllowed((ch as any).guildId)) {
+      if (!ch || !isGuildAllowed((ch as any).guildId)) continue;
+
+      const guild = (ch as any).guild;
+      const mentionResolvedText = await resolveDiscordMentions(guild, isVideoMsg ? VIDEO_NOTICE : text);
+      const body = mentionResolvedText.slice(0, 2000);
+
+      const webhook = await getOrCreateWebhook(ch);
+      if (webhook) {
+        const payload: any = {
+          username: username.slice(0, 80),
+          avatarURL: resolvedAvatarUrl,
+          content: body || (files.length > 0 ? '' : ' '),
+          files: isVideoMsg ? [] : files,
+          allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+        };
+        const m = await webhook.send(payload);
+        if (m?.id) {
+          ourWebhookIds.add(webhook.id);
+          sent.push({ discordChannelId: t.discordChannelId, discordMessageId: m.id });
+          continue;
+        }
+      }
+
+      // Webhook が使えない場合のフォールバック (Bot送信)
+      if ('send' in ch) {
+        const payload: any = {
+          content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000),
+          files: isVideoMsg ? [] : files,
+          allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+        };
+        if (replyTargetDiscordMessageId) {
+          payload.reply = { messageReference: replyTargetDiscordMessageId, failIfNotExists: false };
+        }
         const m = await (ch as any).send(payload);
         sent.push({ discordChannelId: t.discordChannelId, discordMessageId: m.id });
       }
@@ -990,18 +1070,39 @@ export async function editRelayedOnDiscord(links: RelayedMessage[], username: st
   return edited;
 }
 
-// asdfbase で削除されたメッセージを Discord 側でも削除
+// asdfbase で削除されたメッセージを Discord 側でも削除 (権限不足時は「メッセージが削除されました」に編集)
 export async function deleteRelayedOnDiscord(links: RelayedMessage[]): Promise<boolean> {
   if (!client || !connected || links.length === 0) return false;
   let deleted = false;
   for (const l of links) {
     try {
       const ch = (await client.channels.fetch(l.discordChannelId)) as TextBasedChannel | null;
-      if (!ch || !('messages' in ch) || !isGuildAllowed((ch as any).guildId)) continue;
-      const m = await (ch as any).messages.fetch(l.discordMessageId).catch(() => null);
-      if (m && m.deletable) {
-        await m.delete();
-        deleted = true;
+      if (!ch || !isGuildAllowed((ch as any).guildId)) continue;
+
+      // 1. Webhook で送信されたメッセージの削除を試みる
+      const webhook = await getOrCreateWebhook(ch);
+      if (webhook) {
+        try {
+          await webhook.deleteMessage(l.discordMessageId);
+          deleted = true;
+          continue;
+        } catch {
+          // Webhook による削除が失敗した場合は下記へフォールバック
+        }
+      }
+
+      // 2. 通常のメッセージ取得・削除
+      if ('messages' in ch) {
+        const m = await (ch as any).messages.fetch(l.discordMessageId).catch(() => null);
+        if (m) {
+          if (m.deletable) {
+            await m.delete();
+            deleted = true;
+          } else if (m.editable) {
+            await m.edit({ content: '*(メッセージが削除されました)*', allowedMentions: { parse: [] } });
+            deleted = true;
+          }
+        }
       }
     } catch (err: any) {
       console.error('[discord] delete relay failed:', err.message);
@@ -1114,7 +1215,9 @@ export async function startDiscordBot(d: DiscordDeps) {
         const emoji = fullRx.emoji.name;
         if (!emoji || !deps?.ingestReaction) return;
         const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
-        await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'add');
+        const member = fullMsg.guild ? await fullMsg.guild.members.fetch(user.id).catch(() => null) : null;
+        const senderName = member?.displayName || user.globalName || user.username || undefined;
+        await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'add', senderName);
       } catch (err: any) {
         console.error('[discord] reactionAdd failed:', err.message);
       }
@@ -1128,7 +1231,9 @@ export async function startDiscordBot(d: DiscordDeps) {
         const emoji = fullRx.emoji.name;
         if (!emoji || !deps?.ingestReaction) return;
         const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
-        await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'remove');
+        const member = fullMsg.guild ? await fullMsg.guild.members.fetch(user.id).catch(() => null) : null;
+        const senderName = member?.displayName || user.globalName || user.username || undefined;
+        await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'remove', senderName);
       } catch (err: any) {
         console.error('[discord] reactionRemove failed:', err.message);
       }
