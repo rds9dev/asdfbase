@@ -20,6 +20,8 @@ exports.relayReactionToDiscord = relayReactionToDiscord;
 exports.relayPinToDiscord = relayPinToDiscord;
 exports.editRelayedOnDiscord = editRelayedOnDiscord;
 exports.deleteRelayedOnDiscord = deleteRelayedOnDiscord;
+exports.discordUserIdToPseudoId = discordUserIdToPseudoId;
+exports.resolveDiscordReactionUsers = resolveDiscordReactionUsers;
 exports.startDiscordBot = startDiscordBot;
 // Discord Bot 連携
 // - 許可されたサーバー (DISCORD_GUILD_ID) 以外では一切動作しない
@@ -447,7 +449,6 @@ async function getDiscordServers(includeUnapproved = false) {
         }
         // オンラインまたはVC参加中のメンバーを優先して取得 (オフライン含め最大300名)
         const sortedRaw = rawMemberList
-            .filter(m => !m.user.bot || voiceMemberIds.has(m.id) || (m.presence?.status && m.presence.status !== 'offline'))
             .sort((a, b) => {
             const aVc = voiceMemberIds.has(a.id) ? 0 : 1;
             const bVc = voiceMemberIds.has(b.id) ? 0 : 1;
@@ -463,18 +464,50 @@ async function getDiscordServers(includeUnapproved = false) {
             const presence = m.presence;
             const status = (presence?.status || (voiceMemberIds.has(m.id) ? 'online' : 'offline'));
             const acts = presence?.activities || [];
-            const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2 || a.type === 4);
+            const customAct = acts.find(a => a.type === 4);
+            const customStatus = customAct ? [customAct.emoji?.name, customAct.state].filter(Boolean).join(' ') || null : null;
+            const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2 || a.type === 3 || a.type === 5);
             const activityText = gameAct
-                ? (gameAct.type === 4 ? (gameAct.state || gameAct.name) : `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}`)
-                : null;
+                ? `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}`
+                : customStatus;
+            const activities = acts
+                .filter(a => a.type !== 4)
+                .map(a => ({
+                name: a.name,
+                type: a.type,
+                details: a.details || null,
+                state: a.state || null,
+            }));
+            const sortedRoles = Array.from(m.roles.cache.values())
+                .filter(r => r.name !== '@everyone')
+                .sort((a, b) => b.position - a.position);
+            const roleDetails = sortedRoles.map(r => ({
+                id: r.id,
+                name: r.name,
+                color: r.hexColor && r.hexColor !== '#000000' ? r.hexColor : '#94a3b8',
+            }));
+            const bannerColor = (m.displayHexColor && m.displayHexColor !== '#000000' ? m.displayHexColor : null) ||
+                (m.user.hexAccentColor || null);
+            const clientStatus = presence?.clientStatus ? Object.keys(presence.clientStatus) : [];
             return {
                 id: m.id,
                 username: m.user.username,
+                globalName: m.user.globalName || null,
+                nickname: m.nickname || null,
                 displayName: m.displayName || m.user.globalName || m.user.username,
                 avatarUrl: await resolveMemberAvatar(m),
+                bannerColor,
                 status,
                 activity: activityText,
-                roles: m.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).slice(0, 5),
+                customStatus,
+                activities,
+                clientStatus,
+                roles: sortedRoles.map(r => r.name),
+                roleDetails,
+                createdAt: m.user.createdAt ? m.user.createdAt.toISOString() : null,
+                joinedAt: m.joinedAt ? m.joinedAt.toISOString() : null,
+                premiumSince: m.premiumSince ? m.premiumSince.toISOString() : null,
+                voiceChannelName: m.voice?.channel?.name || null,
                 isBot: m.user.bot,
                 inVoice: voiceMemberIds.has(m.id),
                 speaking: speakingMemberIds.has(m.id),
@@ -708,6 +741,7 @@ async function processDiscordMessage(msg, targets, isHistorySync = false) {
                 discordMessageId: i === 0 ? msg.id : null,
                 replyToDiscordMsgId: i === 0 ? replyToDiscordMsgId : null,
                 createdAt,
+                isBot: Boolean(msg.author.bot || msg.webhookId),
             });
             count++;
         }
@@ -929,27 +963,99 @@ async function relayPinToDiscord(discordChannelId, discordMessageId, isPinned) {
         console.warn('[discord] relayPin failed:', err.message);
     }
 }
-// Bot が送ったメッセージを編集 (Discord 側にも「編集済み」が付く)。1つでも編集できれば true
-async function editRelayedOnDiscord(links, username, content) {
+// 編集の Discord 反映: 元メッセージを削除して新しいメッセージを送信し、新しいリンク一覧を返す
+async function editRelayedOnDiscord(links, username, content, avatarUrl) {
     if (!client || !connected || links.length === 0)
-        return false;
-    const body = content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, '').trim();
-    let edited = false;
+        return [];
+    const files = [];
+    const text = content
+        .replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, (_m, p) => {
+        if (deps) {
+            const f = path_1.default.join(deps.uploadDir, path_1.default.basename(p));
+            if (fs_1.default.existsSync(f))
+                files.push(f);
+        }
+        return '';
+    })
+        .trim();
+    const isVideoMsg = content.trim() === VIDEO_NOTICE;
+    let resolvedAvatarUrl;
+    if (avatarUrl) {
+        if (avatarUrl.startsWith('http://') || avatarUrl.startsWith('https://')) {
+            resolvedAvatarUrl = avatarUrl;
+        }
+        else if (avatarUrl.startsWith('/')) {
+            const publicBase = process.env.PUBLIC_URL || 'https://asdf.rds9.net';
+            resolvedAvatarUrl = `${publicBase.replace(/\/$/, '')}${avatarUrl}`;
+        }
+    }
+    const updatedLinks = [];
     for (const l of links) {
         try {
             const ch = (await client.channels.fetch(l.discordChannelId));
-            if (!ch || !('messages' in ch) || !isGuildAllowed(ch.guildId))
+            if (!ch || !isGuildAllowed(ch.guildId))
                 continue;
-            const m = await ch.messages.fetch(l.discordMessageId);
-            await m.edit({ content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000), allowedMentions: { parse: [] } });
-            edited = true;
+            const webhook = await getOrCreateWebhook(ch);
+            // 1. 元メッセージを削除
+            let deletedOld = false;
+            if (webhook) {
+                try {
+                    await webhook.deleteMessage(l.discordMessageId);
+                    deletedOld = true;
+                }
+                catch (_) { }
+            }
+            if (!deletedOld && 'messages' in ch) {
+                const oldMsg = await ch.messages.fetch(l.discordMessageId).catch(() => null);
+                if (oldMsg && oldMsg.deletable) {
+                    await oldMsg.delete().catch(() => { });
+                }
+            }
+            // 2. 新しいメッセージを送信
+            const guild = ch.guild;
+            const mentionResolvedText = await resolveDiscordMentions(guild, isVideoMsg ? VIDEO_NOTICE : text);
+            const body = mentionResolvedText.slice(0, 2000);
+            if (webhook) {
+                const payload = {
+                    username: username.slice(0, 80),
+                    avatarURL: resolvedAvatarUrl,
+                    content: body || (files.length > 0 ? '' : ' '),
+                    files: isVideoMsg ? [] : files,
+                    allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+                };
+                const m = await webhook.send(payload);
+                if (m?.id) {
+                    ourWebhookIds.add(webhook.id);
+                    updatedLinks.push({
+                        discordChannelId: l.discordChannelId,
+                        oldDiscordMessageId: l.discordMessageId,
+                        newDiscordMessageId: m.id,
+                    });
+                    continue;
+                }
+            }
+            if ('send' in ch) {
+                const payload = {
+                    content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000),
+                    files: isVideoMsg ? [] : files,
+                    allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+                };
+                const m = await ch.send(payload);
+                if (m?.id) {
+                    updatedLinks.push({
+                        discordChannelId: l.discordChannelId,
+                        oldDiscordMessageId: l.discordMessageId,
+                        newDiscordMessageId: m.id,
+                    });
+                }
+            }
         }
         catch (err) {
             lastError = `編集の反映に失敗: ${err.message}`;
             console.error('[discord] edit relay failed:', err.message);
         }
     }
-    return edited;
+    return updatedLinks;
 }
 // asdfbase で削除されたメッセージを Discord 側でも削除 (権限不足時は「メッセージが削除されました」に編集)
 async function deleteRelayedOnDiscord(links) {
@@ -993,6 +1099,62 @@ async function deleteRelayedOnDiscord(links) {
         }
     }
     return deleted;
+}
+function discordUserIdToPseudoId(discordUserId) {
+    return -Math.abs(Array.from(String(discordUserId)).reduce((acc, c) => ((acc << 5) - acc + c.charCodeAt(0)) | 0, 0)) || -1;
+}
+// Discord メッセージのリアクションユーザーおよびキャッシュ済みユーザーから pseudoId -> 表示名 を解決
+async function resolveDiscordReactionUsers(links) {
+    const result = new Map();
+    if (!client || !connected)
+        return result;
+    // 1. キャッシュ済みの全サーバーメンバー・ユーザーを走査
+    for (const guild of client.guilds.cache.values()) {
+        for (const m of guild.members.cache.values()) {
+            const pid = discordUserIdToPseudoId(m.id);
+            const name = m.displayName || m.user.globalName || m.user.username;
+            if (name)
+                result.set(pid, name);
+        }
+    }
+    for (const u of client.users.cache.values()) {
+        const pid = discordUserIdToPseudoId(u.id);
+        if (!result.has(pid)) {
+            const name = u.globalName || u.username;
+            if (name)
+                result.set(pid, name);
+        }
+    }
+    // 2. 対象メッセージのリアクションユーザーを Discord API から直接取得
+    for (const l of links) {
+        try {
+            const ch = (await client.channels.fetch(l.discordChannelId).catch(() => null));
+            if (!ch || !('messages' in ch))
+                continue;
+            const guild = ch.guild;
+            const msg = await ch.messages.fetch(l.discordMessageId).catch(() => null);
+            if (!msg)
+                continue;
+            for (const reaction of msg.reactions.cache.values()) {
+                const users = await reaction.users.fetch().catch(() => null);
+                if (!users)
+                    continue;
+                for (const u of users.values()) {
+                    if (u.bot && client.user && u.id === client.user.id)
+                        continue;
+                    const pid = discordUserIdToPseudoId(u.id);
+                    const member = guild?.members?.cache?.get(u.id) || (await guild?.members?.fetch(u.id).catch(() => null));
+                    const name = member?.displayName || u.globalName || u.username;
+                    if (name)
+                        result.set(pid, name);
+                }
+            }
+        }
+        catch {
+            // ignore fetch errors
+        }
+    }
+    return result;
 }
 function createClient(_withMessageContent) {
     // 特権インテント (GuildMembers, GuildPresences, MessageContent) を全て有効化
@@ -1090,6 +1252,8 @@ async function startDiscordBot(d) {
         });
         c.on(discord_js_1.Events.MessageReactionAdd, async (reaction, user) => {
             try {
+                if (user.partial)
+                    await user.fetch().catch(() => { });
                 if (user.bot)
                     return;
                 const fullRx = reaction.partial ? await reaction.fetch().catch(() => reaction) : reaction;
@@ -1100,7 +1264,9 @@ async function startDiscordBot(d) {
                 if (!emoji || !deps?.ingestReaction)
                     return;
                 const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
-                const member = fullMsg.guild ? await fullMsg.guild.members.fetch(user.id).catch(() => null) : null;
+                const member = fullMsg.guild
+                    ? (fullMsg.guild.members.cache.get(user.id) || await fullMsg.guild.members.fetch(user.id).catch(() => null))
+                    : null;
                 const senderName = member?.displayName || user.globalName || user.username || undefined;
                 await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'add', senderName);
             }
@@ -1110,6 +1276,8 @@ async function startDiscordBot(d) {
         });
         c.on(discord_js_1.Events.MessageReactionRemove, async (reaction, user) => {
             try {
+                if (user.partial)
+                    await user.fetch().catch(() => { });
                 if (user.bot)
                     return;
                 const fullRx = reaction.partial ? await reaction.fetch().catch(() => reaction) : reaction;
@@ -1120,7 +1288,9 @@ async function startDiscordBot(d) {
                 if (!emoji || !deps?.ingestReaction)
                     return;
                 const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
-                const member = fullMsg.guild ? await fullMsg.guild.members.fetch(user.id).catch(() => null) : null;
+                const member = fullMsg.guild
+                    ? (fullMsg.guild.members.cache.get(user.id) || await fullMsg.guild.members.fetch(user.id).catch(() => null))
+                    : null;
                 const senderName = member?.displayName || user.globalName || user.username || undefined;
                 await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'remove', senderName);
             }

@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DEFAULT_DAY_PERIOD_COUNTS = exports.DEFAULT_SCHEDULES = exports.MAX_PERIODS = exports.SCHEDULE_TYPES = void 0;
+exports.DEFAULT_SPECIAL_DAY_PERIOD_COUNTS = exports.DEFAULT_DAY_PERIOD_COUNTS = exports.DEFAULT_SCHEDULES = exports.MAX_PERIODS = exports.SCHEDULE_TYPES = void 0;
 exports.isValidSchedule = isValidSchedule;
 exports.toMinutes = toMinutes;
 exports.fromMinutes = fromMinutes;
@@ -45,8 +45,9 @@ exports.DEFAULT_SCHEDULES = {
         closing: { start: '14:45', end: '15:15' },
     },
 };
-// 曜日(1=月..5=金)ごとの授業数 (5限 or 6限)
+// 曜日(1=月..5=金)ごとの授業数 (1〜6限)
 exports.DEFAULT_DAY_PERIOD_COUNTS = { 1: 6, 2: 6, 3: 6, 4: 6, 5: 6 };
+exports.DEFAULT_SPECIAL_DAY_PERIOD_COUNTS = { 1: 4, 2: 4, 3: 4, 4: 4, 5: 4 };
 const TIME_RE = /^\d{2}:\d{2}$/;
 const isTime = (p) => Boolean(p) && TIME_RE.test(p.start) && TIME_RE.test(p.end);
 function isValidSchedule(def) {

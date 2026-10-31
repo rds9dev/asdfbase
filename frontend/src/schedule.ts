@@ -10,6 +10,7 @@ export interface TimetableConfig {
   activeScheduleType: ScheduleType;
   schedules: Record<ScheduleType, ScheduleDef>;
   dayPeriodCounts: Record<string, number>;
+  specialDayPeriodCounts?: Record<string, number>;
 }
 
 export interface TimetableItem {
@@ -75,6 +76,7 @@ export const DEFAULT_CONFIG: TimetableConfig = {
     },
   },
   dayPeriodCounts: { 1: 6, 2: 6, 3: 6, 4: 6, 5: 6 },
+  specialDayPeriodCounts: { 1: 4, 2: 4, 3: 4, 4: 4, 5: 4 },
 };
 
 export function toMinutes(hhmm: string): number {
@@ -86,8 +88,12 @@ export function fromMinutes(min: number): string {
   return `${String(Math.floor(min / 60) % 24).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
 }
 
-export function periodCountFor(config: TimetableConfig, dow: number): number {
-  return config.dayPeriodCounts[String(dow)] || MAX_PERIODS;
+export function periodCountFor(config: TimetableConfig, dow: number, scheduleType?: ScheduleType): number {
+  const st = scheduleType ?? config.activeScheduleType;
+  if (st === 'special' && config.specialDayPeriodCounts?.[String(dow)] != null) {
+    return Math.max(1, Math.min(MAX_PERIODS, Number(config.specialDayPeriodCounts[String(dow)])));
+  }
+  return Math.max(1, Math.min(MAX_PERIODS, Number(config.dayPeriodCounts[String(dow)] || MAX_PERIODS)));
 }
 
 // 5限の日は帰りの会を5限の直後へずらす (長さは同じ)
@@ -100,9 +106,10 @@ export function closingFor(def: ScheduleDef, periodCount: number): PeriodTime {
 }
 
 // その日の流れ (朝の会 → 1〜4限 → 給食 → 昼休み → 5〜6限 → 清掃 → 帰りの会)
-export function daySlots(config: TimetableConfig, dow: number, rows: TimetableItem[]) {
-  const def = config.schedules[config.activeScheduleType] || DEFAULT_CONFIG.schedules.normal;
-  const count = Math.max(1, Math.min(MAX_PERIODS, periodCountFor(config, dow)));
+export function daySlots(config: TimetableConfig, dow: number, rows: TimetableItem[], overrideScheduleType?: ScheduleType) {
+  const currentType = overrideScheduleType || config.activeScheduleType;
+  const def = config.schedules[currentType] || DEFAULT_CONFIG.schedules.normal;
+  const count = Math.max(1, Math.min(MAX_PERIODS, periodCountFor(config, dow, currentType)));
   const subjectOf = (p: number) => rows.find(t => t.period === p)?.subject || '';
 
   const slots: Array<{ key: string; label: string; time: PeriodTime; subject: string; isBreak?: boolean }> = [
@@ -114,8 +121,8 @@ export function daySlots(config: TimetableConfig, dow: number, rows: TimetableIt
     slots.push({ key: `p${i + 1}`, label: `${i + 1}限`, time: def.periods[i], subject: subjectOf(i + 1) });
   }
 
-  // 4限以降がある日の給食・昼休み
-  if (count >= 4 && def.periods[3] && def.periods[4]) {
+  // 5限以降がある日の給食・昼休み
+  if (count >= 5 && def.periods[3] && def.periods[4]) {
     const p4End = toMinutes(def.periods[3].end);
     const p5Start = toMinutes(def.periods[4].start);
     if (p5Start - p4End >= 30) {
@@ -142,9 +149,9 @@ export function daySlots(config: TimetableConfig, dow: number, rows: TimetableIt
     slots.push({ key: `p${i + 1}`, label: `${i + 1}限`, time: def.periods[i], subject: subjectOf(i + 1) });
   }
 
-  // 最終時限終了後の清掃と帰りの会
+  // 最終時限終了後の清掃と帰りの会 (午前授業のみの日は清掃なしで帰りの会)
   const lastPeriod = def.periods[count - 1];
-  if (lastPeriod) {
+  if (lastPeriod && count >= 5) {
     const lastEnd = toMinutes(lastPeriod.end);
     const cleaningEnd = lastEnd + 15;
     slots.push({

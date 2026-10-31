@@ -45,8 +45,9 @@ export const DEFAULT_SCHEDULES: Record<ScheduleType, ScheduleDef> = {
   },
 };
 
-// 曜日(1=月..5=金)ごとの授業数 (5限 or 6限)
+// 曜日(1=月..5=金)ごとの授業数 (1〜6限)
 export const DEFAULT_DAY_PERIOD_COUNTS: Record<string, number> = { 1: 6, 2: 6, 3: 6, 4: 6, 5: 6 };
+export const DEFAULT_SPECIAL_DAY_PERIOD_COUNTS: Record<string, number> = { 1: 4, 2: 4, 3: 4, 4: 4, 5: 4 };
 
 const TIME_RE = /^\d{2}:\d{2}$/;
 const isTime = (p: any): p is PeriodTime => Boolean(p) && TIME_RE.test(p.start) && TIME_RE.test(p.end);
@@ -95,6 +96,7 @@ export interface TimetableConfig {
   activeScheduleType: ScheduleType;
   schedules: Record<ScheduleType, ScheduleDef>;
   dayPeriodCounts: Record<string, number>;
+  specialDayPeriodCounts?: Record<string, number>;
 }
 
 // YYYY-MM-DD に日数を足す

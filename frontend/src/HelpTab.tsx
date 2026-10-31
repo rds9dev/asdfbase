@@ -1,5 +1,7 @@
 // ヘルプ: すべての機能の説明 (目次つき)
 import React, { useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { BookOpen, ChevronDown, Sparkles, Bot, Send, X } from 'lucide-react';
 
 interface HelpTabProps {
@@ -262,8 +264,27 @@ const SECTIONS: Section[] = [
   },
 ];
 
-export default function HelpTab({ onAskAi, safeFetch, token }: HelpTabProps) {
+function nodeToPlainText(node: React.ReactNode): string {
+  if (node === null || node === undefined || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(nodeToPlainText).join('');
+  if (React.isValidElement(node)) {
+    const type = node.type;
+    const inner = nodeToPlainText((node.props as any)?.children);
+    if (type === 'li') return `\n- ${inner}`;
+    if (type === 'p' || type === 'div' || type === 'ul' || type === 'ol') return `${inner}\n`;
+    return inner;
+  }
+  return '';
+}
+
+const HELP_MANUAL_CONTEXT = SECTIONS.map((s, idx) => (
+  `### ${idx + 1}. ${s.title}\n${nodeToPlainText(s.body).trim()}`
+)).join('\n\n');
+
+export default function HelpTab({ safeFetch, token }: HelpTabProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const [tocOpen, setTocOpen] = useState(false);
   const [aiQuestion, setAiQuestion] = useState('');
   const [aiAnswer, setAiAnswer] = useState<string | null>(null);
@@ -284,33 +305,40 @@ export default function HelpTab({ onAskAi, safeFetch, token }: HelpTabProps) {
     setAiAnswer(null);
 
     try {
-      if (safeFetch && token) {
-        const res = await safeFetch('/api/ai/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({
-            messages: [{ role: 'user', content: `asdfbase の機能・使い方についての質問です。親切かつ簡潔に教えてください:\n\n${q}` }],
-            persona: 'teacher',
-          }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (data.reply) {
-          setAiAnswer(data.reply);
-          return;
-        }
+      const fetcher = safeFetch || window.fetch.bind(window);
+      const authToken = token || localStorage.getItem('token') || '';
+      const systemInstruction = [
+        'あなたは asdfbase のヘルプ専用AIアシスタントです。',
+        '以下の「asdfbase 公式ヘルプマニュアル」の内容を自動で参照し、ユーザーの質問にその場で分かりやすく簡潔に回答してください。',
+        'AIタブへの移動は案内せず、この場ですぐ実践できる手順を具体的に答えてください。',
+        '',
+        '【asdfbase 公式ヘルプマニュアル】',
+        HELP_MANUAL_CONTEXT,
+      ].join('\n');
+
+      const res = await fetcher('/api/ai/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: q }],
+          systemInstruction,
+          allowActions: false,
+          persona: 'teacher',
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.reply) {
+        setAiAnswer(data.reply);
+      } else {
+        setAiAnswer(data.error || '回答を取得できませんでした。もう一度お試しください。');
       }
-      // フォールバック: AIタブへジャンプ
-      if (onAskAi) onAskAi(`asdfbaseの使い方について質問です: ${q}`);
-    } catch {
-      if (onAskAi) onAskAi(`asdfbaseの使い方について質問です: ${q}`);
+    } catch (err: any) {
+      setAiAnswer(`通信エラーが発生しました: ${err?.message || 'もう一度お試しください'}`);
     } finally {
       setAiLoading(false);
-    }
-  };
-
-  const handleAsk = () => {
-    if (onAskAi) {
-      onAskAi('asdfbaseの使い方について質問があります：');
     }
   };
 
@@ -339,27 +367,20 @@ export default function HelpTab({ onAskAi, safeFetch, token }: HelpTabProps) {
         <div className="max-w-3xl mx-auto space-y-6">
           <div className="flex items-center justify-between gap-3">
             <h2 className="text-xl sm:text-2xl font-bold text-white">ヘルプ</h2>
-            <button
-              onClick={handleAsk}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500/20 to-amber-600/20 border border-amber-500/40 text-amber-300 font-bold hover:bg-amber-500/30 transition shadow-sm text-xs sm:text-sm"
-              title="asdfbase の使い方を AI に直接質問します"
-            >
-              <Sparkles className="w-4 h-4 text-amber-400" />
-              <span>AIタブで質問</span>
-            </button>
           </div>
 
-          {/* ヘルプ専用 AI 質問ボックス */}
+          {/* ヘルプ専用 AI 質問ボックス (その場でヘルプ全文を自動参照して回答) */}
           <div className="bg-gradient-to-br from-[#12141B] via-[#0F1014] to-[#16141F] border border-amber-500/30 rounded-2xl p-4 shadow-xl space-y-3">
             <div className="flex items-center gap-2 text-white font-bold text-sm">
               <Bot className="w-5 h-5 text-amber-400 animate-pulse" />
               <span>AI に使い方をその場で質問</span>
               <span className="text-[10px] text-amber-400/80 font-normal px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 ml-auto">
-                ヘルプ専用アシスタント
+                ヘルプ全文を自動参照
               </span>
             </div>
             <form onSubmit={handleAskInline} className="flex gap-2">
               <input
+                ref={inputRef}
                 type="text"
                 value={aiQuestion}
                 onChange={e => setAiQuestion(e.target.value)}
@@ -372,7 +393,7 @@ export default function HelpTab({ onAskAi, safeFetch, token }: HelpTabProps) {
                 className="px-4 py-2 rounded-xl btn-primary font-bold text-xs flex items-center gap-1.5 disabled:opacity-40 shrink-0"
               >
                 {aiLoading ? <Sparkles className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
-                <span>{aiLoading ? '回答中…' : '質問する'}</span>
+                <span>{aiLoading ? 'ヘルプを参照して回答中…' : 'その場で質問'}</span>
               </button>
             </form>
 
@@ -386,10 +407,12 @@ export default function HelpTab({ onAskAi, safeFetch, token }: HelpTabProps) {
                 >
                   <X className="w-3.5 h-3.5" />
                 </button>
-                <div className="font-bold text-amber-300 text-[11px] mb-1 flex items-center gap-1">
+                <div className="font-bold text-amber-300 text-[11px] mb-1.5 flex items-center gap-1">
                   <Sparkles className="w-3 h-3 text-amber-400" /> 回答:
                 </div>
-                <div className="whitespace-pre-wrap">{aiAnswer}</div>
+                <div className="markdown-body text-stone-200 space-y-1.5 pr-5">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{aiAnswer}</ReactMarkdown>
+                </div>
               </div>
             )}
           </div>

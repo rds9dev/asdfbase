@@ -101,18 +101,27 @@ export const BUILTIN_SHORTCODES: Record<string, string> = {
   swim: '🏊',
 };
 
-// メッセージ本文が絵文字のみ（1〜3個）で構成されているか判定 (ジャンボ絵文字用)
-export function isOnlyEmojis(text: string): boolean {
+// メッセージ本文が絵文字のみ（1〜5個）で構成されているか判定 (ジャンボ絵文字用)
+export function isOnlyEmojis(text: string, customEmojis?: Map<string, string>): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
-  const shortcodeRe = /^(:[a-zA-Z0-9_-]{2,32}:\s*){1,3}$/;
-  if (shortcodeRe.test(trimmed)) return true;
-  const emojiRegex = /^(\p{Extended_Pictographic}|\p{Emoji_Presentation}|\uFE0F|\u200D|\s){1,10}$/u;
-  if (emojiRegex.test(trimmed)) {
-    const chars = Array.from(trimmed.replace(/\s+/g, ''));
-    return chars.length >= 1 && chars.length <= 6;
+  // ショートコード (:melting_face:, :swim: 等) を抽出して一旦除去
+  const shortcodes = trimmed.match(/:[a-zA-Z0-9_+-]{1,32}:/g) || [];
+  for (const sc of shortcodes) {
+    const clean = sc.slice(1, -1).toLowerCase();
+    const isKnown = Boolean(BUILTIN_SHORTCODES[clean] || clean === 'swim' || customEmojis?.has(clean));
+    if (!isKnown) return false;
   }
-  return false;
+  const withoutShortcodes = trimmed.replace(/:[a-zA-Z0-9_+-]{1,32}:/g, '').trim();
+  if (!withoutShortcodes) {
+    return shortcodes.length >= 1 && shortcodes.length <= 5;
+  }
+  const emojiRegex = /^(\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Emoji_Modifier}|\uFE0F|\u200D|\s)+$/u;
+  if (!emojiRegex.test(withoutShortcodes)) return false;
+  const PictographicRe = /\p{Extended_Pictographic}|\p{Emoji_Presentation}/gu;
+  const unicodeMatches = withoutShortcodes.match(PictographicRe) || [];
+  const totalCount = shortcodes.length + unicodeMatches.length;
+  return totalCount >= 1 && totalCount <= 5;
 }
 
 export interface RenderOptions {
@@ -263,7 +272,7 @@ export function splitSenderName(raw: string): { name: string; fromDiscord: boole
   return raw.startsWith('[Discord] ') ? { name: raw.slice(10), fromDiscord: true } : { name: raw, fromDiscord: raw === '[Discord]' };
 }
 
-export function renderMessageText(content: string, opts: RenderOptions): React.ReactNode[] {
+export function renderMessageText(content: string, opts: RenderOptions, emojiSizeClass = 'w-6 h-6'): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   let last = 0;
   let i = 0;
@@ -297,7 +306,7 @@ export function renderMessageText(content: string, opts: RenderOptions): React.R
         continue;
       }
     } else if (token.startsWith(':') && token.endsWith(':')) {
-      const rendered = renderEmojiToken(token, opts.customEmojis, i++, 'w-5 h-5', opts.token);
+      const rendered = renderEmojiToken(token, opts.customEmojis, i++, emojiSizeClass, opts.token);
       if (rendered) {
         out.push(rendered);
         continue;
@@ -373,6 +382,22 @@ export const SmartMarkdown = React.memo(function SmartMarkdown({
   className?: string;
   containerRef?: React.RefObject<HTMLElement | null>;
 }) {
+  const scrollToHeadingElement = (targetEl: Element) => {
+    const scrollContainer = containerRef?.current;
+    if (scrollContainer) {
+      scrollContainer.dataset.anchorJumping = '1';
+      const containerRect = scrollContainer.getBoundingClientRect();
+      const targetRect = targetEl.getBoundingClientRect();
+      const nextTop = scrollContainer.scrollTop + (targetRect.top - containerRect.top) - 24;
+      scrollContainer.scrollTo({ top: Math.max(0, nextTop), behavior: 'smooth' });
+      window.setTimeout(() => {
+        if (scrollContainer.dataset) delete scrollContainer.dataset.anchorJumping;
+      }, 1200);
+    } else {
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
   const handleAnchorClick = (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
     const msgId = opts.onMessageLink ? messageLinkId(href) : null;
     if (msgId !== null) {
@@ -398,7 +423,7 @@ export const SmartMarkdown = React.memo(function SmartMarkdown({
         (root instanceof Document ? root.getElementById(rawTarget) : root.querySelector(`[id="${CSS.escape(rawTarget)}"]`)) ||
         (root instanceof Document ? root.getElementById(slug) : root.querySelector(`[id="${CSS.escape(slug)}"]`));
       if (byId) {
-        byId.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        scrollToHeadingElement(byId);
         return;
       }
       // 見出しテキスト一致でもフォールバック検索
@@ -406,12 +431,20 @@ export const SmartMarkdown = React.memo(function SmartMarkdown({
       for (const h of Array.from(headings)) {
         const text = (h.textContent || '').trim();
         if (text === rawTarget || slugifyHeading(text) === slug) {
-          h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          scrollToHeadingElement(h);
           return;
         }
       }
     }
   };
+
+  if (isOnlyEmojis(content, opts.customEmojis)) {
+    return (
+      <div className={`${className} py-1 text-5xl sm:text-6xl leading-tight flex flex-wrap items-center gap-1.5 select-none`}>
+        {renderMessageText(content.trim(), opts, 'w-14 h-14 sm:w-16 sm:h-16')}
+      </div>
+    );
+  }
 
   return (
     <div className={className}>
@@ -481,7 +514,16 @@ export const SmartMarkdown = React.memo(function SmartMarkdown({
       </ReactMarkdown>
     </div>
   );
-});
+}, (prev, next) => (
+  prev.content === next.content &&
+  prev.className === next.className &&
+  prev.containerRef === next.containerRef &&
+  prev.opts.me === next.opts.me &&
+  prev.opts.token === next.opts.token &&
+  prev.opts.usernames.size === next.opts.usernames.size &&
+  prev.opts.channels.size === next.opts.channels.size &&
+  (prev.opts.customEmojis?.size ?? 0) === (next.opts.customEmojis?.size ?? 0)
+));
 
 // 入力欄の下に敷く「ハイライトだけの影」。文字は透明で、メンション部分にだけ色を付ける
 export function renderComposerHighlight(

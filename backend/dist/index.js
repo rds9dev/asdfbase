@@ -8,6 +8,9 @@ exports.getSetting = getSetting;
 exports.setSetting = setSetting;
 exports.getDiscordWebhookUrl = getDiscordWebhookUrl;
 exports.notifyImportant = notifyImportant;
+exports.discordUserIdToPseudoId = discordUserIdToPseudoId;
+exports.loadDiscordReactionUsernames = loadDiscordReactionUsernames;
+exports.saveDiscordReactionUsername = saveDiscordReactionUsername;
 exports.getUserAvatar = getUserAvatar;
 exports.relayMessage = relayMessage;
 exports.logAudit = logAudit;
@@ -111,6 +114,43 @@ async function notifyImportant(title, description, color = 0xf59e0b) {
 }
 // Discord リアクションをした Discord ユーザー名キャッシュ (pseudoUserId -> username)
 exports.discordReactionUsernames = new Map();
+function discordUserIdToPseudoId(discordUserId) {
+    return -Math.abs(Array.from(String(discordUserId)).reduce((acc, c) => ((acc << 5) - acc + c.charCodeAt(0)) | 0, 0)) || -1;
+}
+async function loadDiscordReactionUsernames() {
+    try {
+        const raw = await getSetting('discord_reaction_usernames', '{}');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+            for (const [k, v] of Object.entries(parsed)) {
+                const id = Number(k);
+                if (Number.isFinite(id) && id < 0 && typeof v === 'string' && v) {
+                    exports.discordReactionUsernames.set(id, v);
+                }
+            }
+        }
+    }
+    catch { }
+}
+let saveDiscordReactionTimer = null;
+function saveDiscordReactionUsername(pseudoId, username) {
+    if (!Number.isFinite(pseudoId) || pseudoId >= 0 || !username)
+        return;
+    const prev = exports.discordReactionUsernames.get(pseudoId);
+    if (prev === username)
+        return;
+    exports.discordReactionUsernames.set(pseudoId, username);
+    if (saveDiscordReactionTimer)
+        clearTimeout(saveDiscordReactionTimer);
+    saveDiscordReactionTimer = setTimeout(() => {
+        const obj = {};
+        for (const [id, name] of exports.discordReactionUsernames.entries()) {
+            if (id < 0 && name)
+                obj[String(id)] = name;
+        }
+        setSetting('discord_reaction_usernames', JSON.stringify(obj)).catch(() => { });
+    }, 1500);
+}
 // ユーザーのアバターキャッシュ
 const userAvatarCache = new Map();
 async function getUserAvatar(userId) {
@@ -170,14 +210,20 @@ async function relayMessage(msg) {
         return false;
     }
 }
-// 編集の Discord 反映: Bot で送ったものはそのメッセージを編集。Webhook は編集できないので「(編集済み)」付きで送り直す
+// 編集の Discord 反映: 元メッセージを削除し、Webhook で新しいメッセージを送信してリンクを差し替える
 async function relayEdit(msg, username) {
     try {
         if ((await getSetting('notify_messages_enabled', 'on')) !== 'on')
             return;
+        const avatarUrl = msg.author_avatar || (msg.user_id ? await getUserAvatar(msg.user_id) : null);
         const links = (await db_js_1.pool.query(`SELECT discord_channel_id, discord_message_id FROM discord_message_links WHERE asdf_message_id = $1 AND direction = 'out'`, [msg.id])).rows.map(r => ({ discordChannelId: r.discord_channel_id, discordMessageId: r.discord_message_id }));
         if (links.length > 0) {
-            await (0, discord_js_1.editRelayedOnDiscord)(links, username, msg.content);
+            const replaced = await (0, discord_js_1.editRelayedOnDiscord)(links, username, msg.content, avatarUrl);
+            for (const r of replaced) {
+                await db_js_1.pool.query(`UPDATE discord_message_links
+           SET discord_message_id = $1
+           WHERE asdf_message_id = $2 AND discord_channel_id = $3 AND discord_message_id = $4`, [r.newDiscordMessageId, msg.id, r.discordChannelId, r.oldDiscordMessageId]);
+            }
             return;
         }
         // Bot で同期しているチャンネルなのにリンクが無い (古いメッセージ等) なら何もしない
@@ -189,7 +235,7 @@ async function relayEdit(msg, username) {
         const text = msg.content.replace(/!\[[^\]]*\]\((\/uploads\/[^)\s]+)\)/g, '').trim();
         if (!text)
             return;
-        await postWebhook(url, { username: `[asdfbase] ${username}`, content: `${text} (編集済み)`.slice(0, 2000), allowed_mentions: { parse: [] } });
+        await postWebhook(url, { username: `[asdfbase] ${username}`, content: text.slice(0, 2000), allowed_mentions: { parse: [] } });
     }
     catch (err) {
         console.error('relayEdit error:', err.message);
@@ -1132,7 +1178,13 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req, res) 
         const updated = await db_js_1.pool.query(`UPDATE messages SET reactions = $1 WHERE id = $2 RETURNING *`, [JSON.stringify(reactions), messageId]);
         broadcast({
             type: 'MESSAGE_REACTION_UPDATED',
-            payload: { messageId, reactions: updated.rows[0].reactions },
+            payload: {
+                ...updated.rows[0],
+                id: messageId,
+                messageId,
+                channel_id: updated.rows[0].channel_id,
+                reactions: updated.rows[0].reactions,
+            },
         });
         // Discord 側にもリアクションを反映 (非同期)
         (async () => {
@@ -1151,6 +1203,52 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req, res) 
     }
     catch (err) {
         res.status(500).json({ error: 'リアクション更新エラー' });
+    }
+});
+app.get('/api/messages/:messageId/reaction-users', authMiddleware, async (req, res) => {
+    try {
+        const messageId = parseInt(req.params.messageId, 10);
+        const msgRes = await db_js_1.pool.query(`SELECT reactions FROM messages WHERE id = $1`, [messageId]);
+        if (msgRes.rows.length === 0)
+            return res.status(404).json({ error: 'メッセージがありません' });
+        const reactions = msgRes.rows[0].reactions || {};
+        const allIds = Array.from(new Set(Object.values(reactions).flat().map(Number).filter(n => !isNaN(n))));
+        const resolved = {};
+        // 1. asdfbase メンバー
+        const positiveIds = allIds.filter(id => id > 0);
+        if (positiveIds.length > 0) {
+            const uRes = await db_js_1.pool.query(`SELECT id, username FROM users WHERE id = ANY($1::int[])`, [positiveIds]);
+            for (const r of uRes.rows)
+                resolved[Number(r.id)] = r.username;
+        }
+        // 2. キャッシュ済み Discord リアクション名
+        const negativeIds = allIds.filter(id => id < 0);
+        let needDiscordFetch = false;
+        for (const nid of negativeIds) {
+            const cached = exports.discordReactionUsernames.get(nid);
+            if (cached) {
+                resolved[nid] = cached;
+            }
+            else {
+                needDiscordFetch = true;
+            }
+        }
+        // 3. 未解決の Discord リアクションがあれば Discord API / Guild キャッシュから解決して保存
+        if (needDiscordFetch) {
+            const links = (await db_js_1.pool.query(`SELECT discord_channel_id AS "discordChannelId", discord_message_id AS "discordMessageId" FROM discord_message_links WHERE asdf_message_id = $1`, [messageId])).rows;
+            const fetched = await (0, discord_js_1.resolveDiscordReactionUsers)(links);
+            for (const [pid, name] of fetched.entries()) {
+                const displayUname = name.startsWith('[Discord]') ? name : `[Discord] ${name}`;
+                saveDiscordReactionUsername(pid, displayUname);
+                if (negativeIds.includes(pid)) {
+                    resolved[pid] = displayUname;
+                }
+            }
+        }
+        res.json({ users: resolved });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'リアクションユーザー取得エラー' });
     }
 });
 app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
@@ -2277,11 +2375,12 @@ app.post('/api/ai/memo-assist', authMiddleware, async (req, res) => {
     }
 });
 // Timetables API
-// 教科はクラスごとに1つ。短縮・S短は時刻が変わるだけで教科は同じ (schedule_type は常に normal)
+// 教科は通常時程 ('normal') と 特別時程用の一時時間割 ('special') を使い分け可能
 app.get('/api/timetables', authMiddleware, async (req, res) => {
     try {
         const classNo = parseClassNo(req.query.classNo) ?? (await classOf(req.user.id)) ?? 1;
-        const result = await db_js_1.pool.query(`SELECT * FROM timetables WHERE schedule_type = 'normal' AND class_no = $1 ORDER BY day_of_week ASC, period ASC`, [classNo]);
+        const scheduleType = req.query.scheduleType === 'special' ? 'special' : 'normal';
+        const result = await db_js_1.pool.query(`SELECT * FROM timetables WHERE schedule_type = $1 AND class_no = $2 ORDER BY day_of_week ASC, period ASC`, [scheduleType, classNo]);
         res.json(result.rows);
     }
     catch (err) {
@@ -2291,6 +2390,7 @@ app.get('/api/timetables', authMiddleware, async (req, res) => {
 async function getTimetableConfig() {
     let schedules = { ...schedule_js_1.DEFAULT_SCHEDULES };
     let dayPeriodCounts = { ...schedule_js_1.DEFAULT_DAY_PERIOD_COUNTS };
+    let specialDayPeriodCounts = { ...schedule_js_1.DEFAULT_SPECIAL_DAY_PERIOD_COUNTS };
     try {
         const saved = JSON.parse(await getSetting('timetable_config_v2', '{}'));
         for (const t of schedule_js_1.SCHEDULE_TYPES) {
@@ -2299,6 +2399,8 @@ async function getTimetableConfig() {
         }
         if (saved.dayPeriodCounts)
             dayPeriodCounts = { ...dayPeriodCounts, ...saved.dayPeriodCounts };
+        if (saved.specialDayPeriodCounts)
+            specialDayPeriodCounts = { ...specialDayPeriodCounts, ...saved.specialDayPeriodCounts };
     }
     catch (_) { }
     // 「今日の時程」は設定した日だけ有効。日付が変わったら通常時程へ戻る
@@ -2306,7 +2408,7 @@ async function getTimetableConfig() {
     const activeDate = await getSetting('timetable_active_date', '');
     const today = (0, schedule_js_1.nowInTokyo)().date;
     const activeScheduleType = schedule_js_1.SCHEDULE_TYPES.includes(active) && activeDate === today ? active : 'normal';
-    return { activeScheduleType, activeDate: today, schedules, dayPeriodCounts };
+    return { activeScheduleType, activeDate: today, schedules, dayPeriodCounts, specialDayPeriodCounts };
 }
 // 時程(朝の会・各時限・帰りの会)と「今日の時程」: 全員で共有
 app.get('/api/timetables/config', authMiddleware, async (req, res) => {
@@ -2319,16 +2421,16 @@ app.get('/api/timetables/config', authMiddleware, async (req, res) => {
 });
 app.put('/api/timetables/config', authMiddleware, async (req, res) => {
     try {
-        const { activeScheduleType, schedules, dayPeriodCounts } = req.body || {};
+        const { activeScheduleType, schedules, dayPeriodCounts, specialDayPeriodCounts } = req.body || {};
         const changes = [];
         if (activeScheduleType !== undefined) {
             if (!schedule_js_1.SCHEDULE_TYPES.includes(activeScheduleType))
                 return res.status(400).json({ error: '時程の種類が不正です' });
             await setSetting('timetable_active_schedule', activeScheduleType);
             await setSetting('timetable_active_date', (0, schedule_js_1.nowInTokyo)().date);
-            changes.push(`今日の時程を ${activeScheduleType === 'normal' ? '通常' : activeScheduleType === 'short' ? '短縮' : 'S短'} に変更`);
+            changes.push(`今日の時程を ${activeScheduleType === 'normal' ? '通常' : activeScheduleType === 'short' ? '短縮' : '特別時程'} に変更`);
         }
-        if (schedules !== undefined || dayPeriodCounts !== undefined) {
+        if (schedules !== undefined || dayPeriodCounts !== undefined || specialDayPeriodCounts !== undefined) {
             const current = await getTimetableConfig();
             const nextSchedules = { ...current.schedules };
             if (schedules !== undefined) {
@@ -2343,14 +2445,30 @@ app.put('/api/timetables/config', authMiddleware, async (req, res) => {
             const nextCounts = { ...current.dayPeriodCounts };
             if (dayPeriodCounts !== undefined) {
                 for (const [day, count] of Object.entries(dayPeriodCounts)) {
-                    if (!['1', '2', '3', '4', '5'].includes(day) || ![5, 6].includes(Number(count))) {
-                        return res.status(400).json({ error: '授業数は 5 か 6 を指定してください' });
+                    const n = Number(count);
+                    if (!['1', '2', '3', '4', '5'].includes(day) || !Number.isFinite(n) || n < 1 || n > 6) {
+                        return res.status(400).json({ error: '授業数は 1〜6 の範囲で指定してください' });
                     }
-                    nextCounts[day] = Number(count);
+                    nextCounts[day] = Math.round(n);
                 }
                 changes.push('曜日ごとの授業数を変更');
             }
-            await setSetting('timetable_config_v2', JSON.stringify({ schedules: nextSchedules, dayPeriodCounts: nextCounts }));
+            const nextSpecialCounts = { ...(current.specialDayPeriodCounts || schedule_js_1.DEFAULT_SPECIAL_DAY_PERIOD_COUNTS) };
+            if (specialDayPeriodCounts !== undefined) {
+                for (const [day, count] of Object.entries(specialDayPeriodCounts)) {
+                    const n = Number(count);
+                    if (!['1', '2', '3', '4', '5'].includes(day) || !Number.isFinite(n) || n < 1 || n > 6) {
+                        return res.status(400).json({ error: '特別時程の授業数は 1〜6 の範囲で指定してください' });
+                    }
+                    nextSpecialCounts[day] = Math.round(n);
+                }
+                changes.push('特別時程の曜日別授業数を変更');
+            }
+            await setSetting('timetable_config_v2', JSON.stringify({
+                schedules: nextSchedules,
+                dayPeriodCounts: nextCounts,
+                specialDayPeriodCounts: nextSpecialCounts,
+            }));
         }
         const config = await getTimetableConfig();
         broadcast({ type: 'TIMETABLE_CONFIG_UPDATED', payload: config });
@@ -2368,7 +2486,7 @@ app.post('/api/timetables', authMiddleware, async (req, res) => {
         if (dayOfWeek === undefined || !period || !subject) {
             return res.status(400).json({ error: '曜日、時限、教科名は必須です' });
         }
-        const type = 'normal';
+        const type = req.body.scheduleType === 'special' ? 'special' : 'normal';
         const classNo = parseClassNo(req.body.classNo) ?? (await classOf(req.user.id)) ?? 1;
         const existing = await db_js_1.pool.query(`SELECT * FROM timetables WHERE day_of_week = $1 AND period = $2 AND schedule_type = $3 AND class_no = $4 ORDER BY id ASC`, [dayOfWeek, period, type, classNo]);
         let row;
@@ -2384,15 +2502,31 @@ app.post('/api/timetables', authMiddleware, async (req, res) => {
             row = (await db_js_1.pool.query(`INSERT INTO timetables (day_of_week, period, subject, schedule_type, items, note, class_no)
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`, [dayOfWeek, period, subject, type, items || '', note || '', classNo])).rows[0];
         }
-        broadcast({ type: 'TIMETABLE_UPDATED', payload: { classNo } });
+        broadcast({ type: 'TIMETABLE_UPDATED', payload: { classNo, scheduleType: type } });
         logAudit(req.user, 'timetable_set', 'timetable', row.id, {
-            message: `${classNo}組の時間割 ${['', '月', '火', '水', '木', '金', '土'][dayOfWeek] || dayOfWeek}曜${period}限 を「${subject}」に設定`,
+            message: `${classNo}組(${type === 'special' ? '特別時程' : '通常'})の時間割 ${['', '月', '火', '水', '木', '金', '土'][dayOfWeek] || dayOfWeek}曜${period}限 を「${subject}」に設定`,
             before: existing.rows[0]?.subject || null,
         });
         res.json(row);
     }
     catch (err) {
         res.status(500).json({ error: '時間割登録エラー' });
+    }
+});
+// 通常時間割を特別時程用の時間割へ一括コピーする (一時的な時間割編集のベース作成用)
+app.post('/api/timetables/special-copy', authMiddleware, async (req, res) => {
+    try {
+        const classNo = parseClassNo(req.body?.classNo) ?? (await classOf(req.user.id)) ?? 1;
+        await db_js_1.pool.query(`DELETE FROM timetables WHERE class_no = $1 AND schedule_type = 'special'`, [classNo]);
+        await db_js_1.pool.query(`INSERT INTO timetables (day_of_week, period, subject, schedule_type, items, note, class_no)
+       SELECT day_of_week, period, subject, 'special', items, note, class_no
+       FROM timetables WHERE class_no = $1 AND schedule_type = 'normal'`, [classNo]);
+        broadcast({ type: 'TIMETABLE_UPDATED', payload: { classNo, scheduleType: 'special' } });
+        const rows = await db_js_1.pool.query(`SELECT * FROM timetables WHERE class_no = $1 AND schedule_type = 'special' ORDER BY day_of_week ASC, period ASC`, [classNo]);
+        res.json(rows.rows);
+    }
+    catch (err) {
+        res.status(500).json({ error: '特別時程へのコピーエラー' });
     }
 });
 // コマの詳細 (教科・持ち物・メモ) を更新
@@ -2475,6 +2609,28 @@ app.post('/api/board/text', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'テキスト付箋保存エラー' });
     }
 });
+app.delete('/api/board/stroke/:id', authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        await db_js_1.pool.query(`DELETE FROM board_strokes WHERE id = $1`, [id]);
+        broadcast({ type: 'BOARD_DELETE_STROKE', payload: { id } });
+        res.json({ success: true, id });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'ストローク削除エラー' });
+    }
+});
+app.delete('/api/board/text/:id', authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        await db_js_1.pool.query(`DELETE FROM board_texts WHERE id = $1`, [id]);
+        broadcast({ type: 'BOARD_DELETE_TEXT', payload: { id } });
+        res.json({ success: true, id });
+    }
+    catch (err) {
+        res.status(500).json({ error: 'テキスト付箋削除エラー' });
+    }
+});
 app.delete('/api/board/clear', authMiddleware, async (req, res) => {
     try {
         const cnt = await db_js_1.pool.query(`SELECT (SELECT COUNT(*) FROM board_strokes) AS s, (SELECT COUNT(*) FROM board_texts) AS t`);
@@ -2535,43 +2691,31 @@ async function ensureNoteSlots() {
     SET title = REGEXP_REPLACE(title, '^メモ\\s*#([0-9]+)', 'メモ \\1') 
     WHERE slot_index <= 10 AND title LIKE '%#%'
   `).catch(() => { });
-    // 3. 全利用メンバーの専用Monacoエディタスロット（スロット11以降: 10 + user.id 固定）を自動確保
+    // 3. まだ専用エディタスロットを1つも持たない利用メンバーに初期スロット（10 + user.id 優先）を自動確保
     const usersRes = await db_js_1.pool.query(`SELECT id, username FROM users ORDER BY id ASC`);
     for (const u of usersRes.rows) {
-        const slotIndex = 10 + u.id; // ユーザーID固定スロット
+        const existing = await db_js_1.pool.query(`SELECT 1 FROM notes WHERE slot_index > 10 AND assigned_user_id = $1 LIMIT 1`, [u.id]);
+        if (existing.rowCount && existing.rowCount > 0)
+            continue;
+        let slotIndex = 10 + u.id;
+        const conflict = await db_js_1.pool.query(`SELECT 1 FROM notes WHERE slot_index = $1`, [slotIndex]);
+        if (conflict.rowCount && conflict.rowCount > 0) {
+            const maxRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(slot_index), 10) AS max_slot FROM notes WHERE slot_index > 10`);
+            slotIndex = Math.max(11, Number(maxRes.rows[0]?.max_slot || 10) + 1);
+        }
         await db_js_1.pool.query(`
       INSERT INTO notes (slot_index, title, content, mode, assigned_user_id)
       VALUES ($1, $2, '', 'monaco', $3)
-      ON CONFLICT (slot_index) DO UPDATE 
-      SET assigned_user_id = EXCLUDED.assigned_user_id,
-          title = CASE WHEN notes.title LIKE '%の専用エディタ' THEN EXCLUDED.title ELSE notes.title END
+      ON CONFLICT (slot_index) DO NOTHING
     `, [slotIndex, `${u.username}の専用エディタ`, u.id]);
     }
-    // 4. 旧方式(11 + 並び順)で作られた重複専用スロットを正規スロット(10 + user.id)へ統合して削除
-    const strayRes = await db_js_1.pool.query(`
-    SELECT n.slot_index, n.content, n.assigned_user_id
-    FROM notes n
+    // 4. 削除済みユーザーの空スロットのみ整理 (複数作成された専用コードゾーンは保持する)
+    await db_js_1.pool.query(`
+    DELETE FROM notes n
     WHERE n.slot_index > 10
-      AND (n.assigned_user_id IS NULL
-           OR n.slot_index <> 10 + n.assigned_user_id
-           OR NOT EXISTS (SELECT 1 FROM users u WHERE u.id = n.assigned_user_id))
+      AND (n.assigned_user_id IS NULL OR NOT EXISTS (SELECT 1 FROM users u WHERE u.id = n.assigned_user_id))
+      AND (n.content IS NULL OR n.content = '')
   `);
-    for (const stray of strayRes.rows) {
-        const owner = usersRes.rows.find(u => u.id === stray.assigned_user_id);
-        if (owner) {
-            const canonical = 10 + owner.id;
-            // 正規スロットが空なら内容を引き継ぐ
-            if (stray.content) {
-                await db_js_1.pool.query(`UPDATE notes SET content = $1, updated_at = NOW() WHERE slot_index = $2 AND (content IS NULL OR content = '')`, [stray.content, canonical]);
-            }
-            await db_js_1.pool.query(`UPDATE note_history SET slot_index = $1 WHERE slot_index = $2`, [canonical, stray.slot_index]);
-            await db_js_1.pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
-        }
-        else if (!stray.content) {
-            // 削除済みユーザーの空スロット
-            await db_js_1.pool.query(`DELETE FROM notes WHERE slot_index = $1`, [stray.slot_index]);
-        }
-    }
 }
 app.get('/api/notes', authMiddleware, async (req, res) => {
     try {
@@ -2633,32 +2777,33 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'メモ更新エラー' });
     }
 });
-// 管理者専用: 専用コードゾーンの作成（ユーザー割り当て / 最大30個 / 言語指定対応）
-app.post('/api/notes/code-zones', authMiddleware, adminOnly, async (req, res) => {
+// 専用コードゾーンの作成（何個でも登録可能 / ユーザー割り当て / 言語指定対応）
+app.post('/api/notes/code-zones', authMiddleware, async (req, res) => {
     try {
-        const { targetUserId, title: reqTitle, language: reqLanguage } = req.body;
-        if (!targetUserId || typeof targetUserId !== 'number') {
+        const { targetUserId: rawTargetUserId, userId: rawUserId, title: reqTitle, language: reqLanguage } = req.body || {};
+        const targetUserId = Number(rawTargetUserId ?? rawUserId ?? req.user.id);
+        if (!targetUserId || !Number.isFinite(targetUserId)) {
             return res.status(400).json({ error: 'targetUserId が必要です' });
+        }
+        if (req.user.role !== 'admin' && targetUserId !== req.user.id) {
+            return res.status(403).json({ error: '他ユーザーのコードゾーン作成には管理者権限が必要です' });
         }
         const userRes = await db_js_1.pool.query(`SELECT id, username FROM users WHERE id = $1`, [targetUserId]);
         if (userRes.rows.length === 0) {
             return res.status(404).json({ error: '対象のユーザーが見つかりません' });
         }
         const targetUser = userRes.rows[0];
-        // 全体の専用コードゾーン数 (最大30個まで、スロット11〜40)
-        const usedSlotsRes = await db_js_1.pool.query(`SELECT slot_index FROM notes WHERE slot_index >= 11 ORDER BY slot_index ASC`);
-        if (usedSlotsRes.rows.length >= 30) {
-            return res.status(400).json({ error: '専用コードゾーンの上限（最大30個）に達しています' });
-        }
-        const usedSlots = new Set(usedSlotsRes.rows.map(r => r.slot_index));
+        const usedSlotsRes = await db_js_1.pool.query(`SELECT slot_index, assigned_user_id FROM notes WHERE slot_index >= 11 ORDER BY slot_index ASC`);
+        const usedSlots = new Set(usedSlotsRes.rows.map(r => Number(r.slot_index)));
+        const userZoneCount = usedSlotsRes.rows.filter(r => Number(r.assigned_user_id) === targetUserId).length;
         let newSlot = 11;
         while (usedSlots.has(newSlot)) {
             newSlot++;
         }
-        if (newSlot > 40) {
-            return res.status(400).json({ error: 'スロット空きがありません' });
-        }
-        const title = reqTitle ? String(reqTitle).slice(0, 50) : `${targetUser.username}のコードゾーン #${newSlot - 10}`;
+        const defaultTitle = userZoneCount === 0
+            ? `${targetUser.username}の専用エディタ`
+            : `${targetUser.username}のコードゾーン #${userZoneCount + 1}`;
+        const title = (reqTitle && String(reqTitle).trim()) ? String(reqTitle).trim().slice(0, 50) : defaultTitle;
         const language = reqLanguage || 'typescript';
         const inserted = await db_js_1.pool.query(`INSERT INTO notes (slot_index, title, content, mode, assigned_user_id, language)
        VALUES ($1, $2, '', 'monaco', $3, $4)
@@ -2673,7 +2818,7 @@ app.post('/api/notes/code-zones', authMiddleware, adminOnly, async (req, res) =>
             sender: req.user.username,
         });
         logAudit(req.user, 'code_zone_create', 'note', newSlot, {
-            message: `管理者 ${req.user.username} が ${targetUser.username} に専用コードゾーン #${newSlot} (${language}) を割り当てました`,
+            message: `${req.user.username} が ${targetUser.username} に専用コードゾーン #${newSlot} (${language}) を作成しました`,
         });
         res.json(createdNote);
     }
@@ -2682,8 +2827,8 @@ app.post('/api/notes/code-zones', authMiddleware, adminOnly, async (req, res) =>
         res.status(500).json({ error: err.message || '専用コードゾーンの作成に失敗しました' });
     }
 });
-// 管理者専用: 専用コードゾーンの削除
-app.delete('/api/notes/code-zones/:slotIndex', authMiddleware, adminOnly, async (req, res) => {
+// 専用コードゾーンの削除 (本人または管理者)
+app.delete('/api/notes/code-zones/:slotIndex', authMiddleware, async (req, res) => {
     try {
         const slotIndex = parseInt(req.params.slotIndex, 10);
         if (isNaN(slotIndex) || slotIndex < 11) {
@@ -2694,6 +2839,9 @@ app.delete('/api/notes/code-zones/:slotIndex', authMiddleware, adminOnly, async 
             return res.status(404).json({ error: '指定されたコードゾーンが見つかりません' });
         }
         const note = noteRes.rows[0];
+        if (req.user.role !== 'admin' && note.assigned_user_id !== req.user.id) {
+            return res.status(403).json({ error: '他のユーザーの専用コードゾーンは削除できません' });
+        }
         await db_js_1.pool.query(`DELETE FROM note_history WHERE slot_index = $1`, [slotIndex]);
         await db_js_1.pool.query(`DELETE FROM notes WHERE slot_index = $1`, [slotIndex]);
         broadcast({
@@ -2980,7 +3128,24 @@ app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
 });
 app.get('/api/users', authMiddleware, async (req, res) => {
     try {
-        const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, avatar_url, class_no, custom_roles, last_active_at FROM users ORDER BY username ASC`);
+        const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, avatar_url, class_no, custom_roles, last_active_at, created_at FROM users ORDER BY username ASC`);
+        // Discord サーバーメンバー全員の pseudoUserId -> 表示名 を補完してリアクションの「ほか N 人」を解消する
+        try {
+            const servers = await (0, discord_js_1.getDiscordServers)();
+            for (const srv of servers) {
+                for (const m of srv.members || []) {
+                    const uname = m.displayName || m.username;
+                    if (m.id && uname) {
+                        const pid = discordUserIdToPseudoId(m.id);
+                        const displayUname = uname.startsWith('[Discord]') ? uname : `[Discord] ${uname}`;
+                        if (!exports.discordReactionUsernames.has(pid)) {
+                            saveDiscordReactionUsername(pid, displayUname);
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
         const pseudoUsers = Array.from(exports.discordReactionUsernames.entries()).map(([id, uname]) => ({
             id,
             username: uname,
@@ -3904,6 +4069,7 @@ server.listen(PORT, async () => {
         });
         // 再起動直後は全員オフライン扱いにし、接続/アクセスで復帰させる
         await db_js_1.pool.query(`UPDATE users SET status = 'offline'`);
+        await loadDiscordReactionUsernames();
         await ensureNoteSlots();
         await ensureDefaultCustomEmojis();
         // 既存の general 等の未割り当てチャンネルをデフォルトDiscordサーバー (2年団) に所属させる
@@ -3941,8 +4107,8 @@ server.listen(PORT, async () => {
                     }
                 }
                 const result = meta.createdAt
-                    ? await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, created_at) VALUES ($1, NULL, $2, $3, $4, $5, $6) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId, meta.createdAt])
-                    : await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id) VALUES ($1, NULL, $2, $3, $4, $5) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId]);
+                    ? await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, created_at, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId, meta.createdAt, Boolean(meta.isBot)])
+                    : await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId, Boolean(meta.isBot)]);
                 const saved = result.rows[0];
                 if (meta.discordMessageId) {
                     await db_js_1.pool.query(`INSERT INTO discord_message_links (asdf_message_id, discord_channel_id, discord_message_id, direction)
@@ -3985,13 +4151,13 @@ server.listen(PORT, async () => {
             ingestReaction: async (discordMessageId, emoji, discordUserId, action, username) => {
                 const links = (await db_js_1.pool.query(`SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1`, [discordMessageId])).rows;
                 // 負の整数IDを生成して既存ユーザーと衝突防止
-                const pseudoUserId = -Math.abs(Array.from(discordUserId).reduce((acc, c) => ((acc << 5) - acc + c.charCodeAt(0)) | 0, 0));
+                const pseudoUserId = discordUserIdToPseudoId(discordUserId);
                 if (username) {
                     const displayUname = username.startsWith('[Discord]') ? username : `[Discord] ${username}`;
-                    exports.discordReactionUsernames.set(pseudoUserId, displayUname);
+                    saveDiscordReactionUsername(pseudoUserId, displayUname);
                 }
                 for (const l of links) {
-                    const msgRes = await db_js_1.pool.query(`SELECT reactions FROM messages WHERE id = $1`, [l.asdf_message_id]);
+                    const msgRes = await db_js_1.pool.query(`SELECT reactions, channel_id FROM messages WHERE id = $1`, [l.asdf_message_id]);
                     if (msgRes.rows.length === 0)
                         continue;
                     const reactions = msgRes.rows[0].reactions || {};
@@ -4010,7 +4176,10 @@ server.listen(PORT, async () => {
                     broadcast({
                         type: 'MESSAGE_REACTION_UPDATED',
                         payload: {
+                            ...updated.rows[0],
+                            id: l.asdf_message_id,
                             messageId: l.asdf_message_id,
+                            channel_id: msgRes.rows[0].channel_id,
                             reactions: updated.rows[0].reactions,
                             reactionUser: username ? { id: pseudoUserId, username: username.startsWith('[Discord]') ? username : `[Discord] ${username}` } : undefined,
                         },

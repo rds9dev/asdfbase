@@ -468,11 +468,8 @@ export default function AiTab({
   useEffect(() => {
     if (isNearBottomRef.current) scrollToBottom(true);
   }, [messages.length, loading, loadingThreadId]);
-  useEffect(() => {
-    if (reveal && isNearBottomRef.current) scrollToBottom(false);
-  }, [reveal]);
 
-  // 返信を少しずつ表示 (CPU負荷軽減のため70msデバウンス)
+  // 返信を 60fps の requestAnimationFrame で滑らかにストリーミング表示 + スムーズスクロール追従
   useEffect(() => {
     if (!reveal) return;
     const msg = messages.find(m => m.id === reveal.id);
@@ -480,10 +477,42 @@ export default function AiTab({
       setReveal(null);
       return;
     }
-    const step = Math.max(12, Math.ceil(msg.content.length / 25));
-    const t = setTimeout(() => setReveal(r => (r && r.id === msg.id ? { ...r, shown: r.shown + step } : r)), 70);
-    return () => clearTimeout(t);
-  }, [reveal, messages]);
+    let rafId = 0;
+    let lastTime = performance.now();
+    let floatShown = reveal.shown;
+    const totalLen = msg.content.length;
+    // 全文を約 0.9〜2.2 秒で滑らかに流し込む速度 (文字数に応じて自動調整)
+    const charsPerMs = Math.max(0.09, Math.min(0.85, totalLen / 1600));
+
+    const tick = (now: number) => {
+      const dt = Math.min(50, Math.max(8, now - lastTime));
+      lastTime = now;
+      floatShown = Math.min(totalLen, floatShown + dt * charsPerMs);
+      const nextShown = Math.ceil(floatShown);
+
+      setReveal(prev => {
+        if (!prev || prev.id !== msg.id) return null;
+        if (nextShown >= totalLen) return null;
+        return prev.shown === nextShown ? prev : { id: msg.id, shown: nextShown };
+      });
+
+      if (isNearBottomRef.current && scrollRef.current) {
+        const el = scrollRef.current;
+        const target = el.scrollHeight - el.clientHeight;
+        const diff = target - el.scrollTop;
+        if (diff > 1) {
+          el.scrollTop += diff * 0.25;
+        }
+      }
+
+      if (nextShown < totalLen) {
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [reveal?.id, messages]);
 
   const addImages = async (files: File[]) => {
     const list = files.filter(f => f.type.startsWith('image/')).slice(0, 4 - images.length);
@@ -641,23 +670,15 @@ export default function AiTab({
       });
     } finally {
       setLoading(false);
+      setLoadingThreadId(null);
       onJobFinished?.();
     }
   };
 
   const clearHistory = async () => {
-    if (messages.length === 0) return;
-    const ok = await confirmDialog({
-      title: 'このチャットを削除しますか？',
-      message: '現在開いているスレッドのチャット内容がすべて消去されます。',
-      confirmLabel: '削除する',
-      danger: true,
-    });
-    if (!ok) return;
-    setMessages([]);
-    setReveal(null);
-    await syncThreadToServer(activeThreadId, { messages: [] });
-    toast('チャットを削除しました', { kind: 'success' });
+    const target = threads.find(t => t.id === activeThreadId);
+    if (!target) return;
+    await deleteThread(target);
   };
 
   const activeThread = threads.find(t => t.id === activeThreadId);
@@ -756,19 +777,17 @@ export default function AiTab({
                     >
                       <Pencil className="w-3 h-3" />
                     </button>
-                    {threads.length > 1 && (
-                      <button
-                        type="button"
-                        onClick={e => {
-                          e.stopPropagation();
-                          deleteThread(t);
-                        }}
-                        className="p-1 rounded text-stone-500 hover:text-red-400"
-                        title="スレッドを削除"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={e => {
+                        e.stopPropagation();
+                        deleteThread(t);
+                      }}
+                      className="p-1 rounded text-stone-500 hover:text-red-400"
+                      title="セッションを削除"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
                   </div>
                 )}
               </div>
@@ -843,8 +862,8 @@ export default function AiTab({
 
             <button
               onClick={clearHistory}
-              disabled={messages.length === 0}
-              title="チャットを削除"
+              disabled={!activeThread}
+              title="このチャットセッションを削除"
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-stone-800 bg-stone-900 text-stone-300 hover:text-red-300 hover:border-red-900/70 hover:bg-red-950/30 disabled:opacity-40"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -1041,7 +1060,7 @@ export default function AiTab({
                     <div className="whitespace-pre-wrap">{msg.content}</div>
                   ) : (
                     <>
-                      <div className="markdown-body overflow-x-auto">
+                      <div className={`markdown-body overflow-x-auto ${isRevealing ? 'ai-streaming' : ''}`}>
                         <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ code: CodeBlockWithCopy }}>{shown}</ReactMarkdown>
                         {isRevealing && <span className="ai-caret" />}
                       </div>

@@ -76,6 +76,7 @@ import {
   Menu,
   Umbrella,
   Undo2,
+  Redo2,
   BellRing,
   WifiOff,
   ChevronDown,
@@ -123,10 +124,13 @@ interface User {
   username: string;
   role: string;
   status: string;
+  custom_status?: string | null;
   avatar_url?: string | null;
   class_no?: number | null;
   custom_roles?: string[];
   preferences?: Record<string, any>;
+  created_at?: string | null;
+  last_active_at?: string | null;
 }
 
 interface RoleDefinition {
@@ -168,6 +172,7 @@ interface Message {
   edited_at?: string | null;
   // Discord から来たメッセージのアイコン (サーバーに保存済みの /uploads/...)
   author_avatar?: string | null;
+  is_bot?: boolean;
   client_nonce?: string | null;
   pending?: boolean;
   failed?: boolean;
@@ -456,6 +461,7 @@ export default function App() {
   const memoTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const memoPreviewRef = useRef<HTMLDivElement | null>(null);
   const memoScrollLockRef = useRef<'editor' | 'preview' | null>(null);
+  const memoScrollUnlockTimerRef = useRef<any>(null);
 
   // お知らせ & 通知ポップオーバー
   const [announcements, setAnnouncements] = useState<any[]>([]);
@@ -475,6 +481,9 @@ export default function App() {
   const [showAllOfflineMembers, setShowAllOfflineMembers] = useState(false);
   const [showCodeZoneModal, setShowCodeZoneModal] = useState(false);
   const [selectedUserForCodeZone, setSelectedUserForCodeZone] = useState<number | ''>('');
+  const [newCodeZoneTitle, setNewCodeZoneTitle] = useState('');
+  const [newCodeZoneLang, setNewCodeZoneLang] = useState('typescript');
+  const [selectedProfileMember, setSelectedProfileMember] = useState<{ kind: 'discord'; member: any } | { kind: 'asdf'; user: User } | null>(null);
 
   // アカウント同期設定のサーバー保存 (デバウンス)
   // ※ 接続設定 (方式・ポーリング間隔・プロキシ/直結経路) は端末ごとに異なる環境用のためアカウント同期せず端末ローカルに保持
@@ -609,6 +618,26 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
+  const [discordReactionUsers, setDiscordReactionUsers] = useState<Record<number, string>>({});
+  const resolvedReactionMsgIdsRef = useRef<Set<number>>(new Set());
+
+  const applyUsersList = (data: any[]) => {
+    if (!Array.isArray(data)) return;
+    const realUsers: User[] = [];
+    const dcMap: Record<number, string> = {};
+    for (const u of data) {
+      if (!u || typeof u.id !== 'number') continue;
+      if (u.id < 0 || u.custom_status === 'Discord') {
+        if (u.username) dcMap[u.id] = String(u.username);
+      } else {
+        realUsers.push(u);
+      }
+    }
+    setOnlineUsers(realUsers);
+    if (Object.keys(dcMap).length > 0) {
+      setDiscordReactionUsers(prev => ({ ...prev, ...dcMap }));
+    }
+  };
   const [discordVcs, setDiscordVcs] = useState<{ guildName: string; channelName: string; channelId: string; members: { id: string; name: string; avatarUrl: string | null }[] }[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   // 送信待ちの画像 (Ctrl+V / ドロップ / 画像ボタン)。入力欄の上に小さくプレビューする
@@ -667,6 +696,8 @@ export default function App() {
   // Phase 4 State: Collaborative Whiteboard
   const [boardStrokes, setBoardStrokes] = useState<any[]>([]);
   const [boardTexts, setBoardTexts] = useState<any[]>([]);
+  const [boardUndoStack, setBoardUndoStack] = useState<{ kind: 'stroke' | 'text'; item: any }[]>([]);
+  const [boardRedoStack, setBoardRedoStack] = useState<{ kind: 'stroke' | 'text'; item: any }[]>([]);
   const [drawColor, setDrawColor] = useState<string>('#f59e0b');
   const [brushWidth, setBrushWidth] = useState<number>(3);
   const [eraserWidth, setEraserWidth] = useState<number>(48);
@@ -1302,7 +1333,12 @@ export default function App() {
       if (msg.type === 'NEW_MESSAGE') {
         ingestNewMessageRef.current(msg.payload);
       } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
-        setMessages(prev => prev.map(m => m.id === msg.payload.messageId ? { ...m, reactions: msg.payload.reactions } : m));
+        const targetId = msg.payload?.messageId ?? msg.payload?.id;
+        if (msg.payload?.reactionUser?.id && msg.payload?.reactionUser?.username) {
+          const ru = msg.payload.reactionUser;
+          setDiscordReactionUsers(prev => ({ ...prev, [Number(ru.id)]: String(ru.username) }));
+        }
+        setMessages(prev => prev.map(m => m.id === targetId ? { ...m, reactions: msg.payload.reactions } : m));
       } else if (msg.type === 'MESSAGE_PIN_UPDATED') {
         setMessages(prev => prev.map(m => m.id === msg.payload.id ? msg.payload : m));
       } else if (msg.type === 'NOTE_UPDATED') {
@@ -1361,20 +1397,40 @@ export default function App() {
       } else if (msg.type === 'CALENDAR_DELETED') {
         setCalendarEvents(prev => prev.filter(e => e.id !== msg.payload.id));
       } else if (msg.type === 'BOARD_NEW_STROKE') {
-        setBoardStrokes(prev => [...prev, msg.payload]);
+        setBoardStrokes(prev => prev.some(s => s.id && s.id === msg.payload?.id) ? prev : [...prev, msg.payload]);
         if (canvasRef.current && activeTabRef.current === 'board') {
           const ctx = canvasRef.current.getContext('2d');
           if (ctx) drawStroke(ctx, msg.payload);
         }
       } else if (msg.type === 'BOARD_NEW_TEXT') {
-        setBoardTexts(prev => [...prev, msg.payload]);
+        setBoardTexts(prev => prev.some(t => t.id && t.id === msg.payload?.id) ? prev : [...prev, msg.payload]);
         if (canvasRef.current && activeTabRef.current === 'board') {
           const ctx = canvasRef.current.getContext('2d');
           if (ctx) drawText(ctx, msg.payload);
         }
+      } else if (msg.type === 'BOARD_DELETE_STROKE') {
+        const delId = msg.payload?.id;
+        setBoardStrokes(prev => {
+          const next = prev.filter(s => s.id !== delId);
+          if (activeTabRef.current === 'board') {
+            requestAnimationFrame(() => redrawCanvas(next, boardTexts));
+          }
+          return next;
+        });
+      } else if (msg.type === 'BOARD_DELETE_TEXT') {
+        const delId = msg.payload?.id;
+        setBoardTexts(prev => {
+          const next = prev.filter(t => t.id !== delId);
+          if (activeTabRef.current === 'board') {
+            requestAnimationFrame(() => redrawCanvas(boardStrokes, next));
+          }
+          return next;
+        });
       } else if (msg.type === 'BOARD_CLEARED') {
         setBoardStrokes([]);
         setBoardTexts([]);
+        setBoardUndoStack([]);
+        setBoardRedoStack([]);
         if (canvasRef.current) {
           const ctx = canvasRef.current.getContext('2d');
           if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
@@ -1510,7 +1566,7 @@ export default function App() {
     safeFetch('/api/users', { headers: { Authorization: `Bearer ${tk}` } })
       .then(res => (res.ok ? res.json() : null))
       .then(data => {
-        if (Array.isArray(data)) setOnlineUsers(data);
+        if (Array.isArray(data)) applyUsersList(data);
       })
       .catch(() => {});
   };
@@ -1604,7 +1660,7 @@ export default function App() {
     };
     const results = await Promise.allSettled([
       get('/api/channels').then(data => Array.isArray(data) && setChannels(data)),
-      get('/api/users').then(data => Array.isArray(data) && setOnlineUsers(data)),
+      get('/api/users').then(data => Array.isArray(data) && applyUsersList(data)),
       get('/api/discord/voice-status').then(data => data?.vcs && setDiscordVcs(data.vcs)).catch(() => {}),
       fetchDiscordServers(),
       get('/api/emojis').then(data => Array.isArray(data) && data.length > 0 && setCustomEmojisList(data)).catch(() => {}),
@@ -1674,12 +1730,27 @@ export default function App() {
     }
   }, [activeTab, token]);
 
-  // Global Shortcuts: Ctrl+K, Escape (closes all modals)
+  const handleUndoBoardRef = useRef<() => void>(() => {});
+  const handleRedoBoardRef = useRef<() => void>(() => {});
+
+  // Global Shortcuts: Ctrl+K, Escape (closes all modals), Board Undo/Redo (Ctrl+Z / Ctrl+Y)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setIsPaletteOpen(prev => !prev);
+      }
+      if (activeTabRef.current === 'board' && (e.ctrlKey || e.metaKey) && !(e.target as HTMLElement)?.closest?.('input, textarea')) {
+        if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
+          e.preventDefault();
+          handleUndoBoardRef.current();
+          return;
+        }
+        if (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey)) {
+          e.preventDefault();
+          handleRedoBoardRef.current();
+          return;
+        }
       }
       // ブラウザ標準の Tab によるフォーカス移動は使わない (補完・インデントは各入力欄で処理)
       if (e.key === 'Tab' && !e.defaultPrevented && !(e.target as HTMLElement)?.closest?.('[data-allow-tab]')) {
@@ -1702,6 +1773,7 @@ export default function App() {
         setEditingAssignment(null);
         setShowMemberProgressModalId(null);
         setFloatingAiSummary(null);
+        setSelectedProfileMember(null);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -2615,14 +2687,20 @@ export default function App() {
     toast('校正前の内容に戻しました', { kind: 'success' });
   };
 
-  // 時間割 (教科) はクラスごと。短縮・S短でも教科は同じで、時刻だけが変わる
-  const handleFetchTimetables = async (classNo = ttClassNoRef.current) => {
+  // 時間割 (教科) はクラスごと。短縮・S短は通常と同じ教科で、特別時程 (special) は一時的な専用時間割
+  const scheduleTypeRef = useRef(scheduleType);
+  scheduleTypeRef.current = scheduleType;
+  const todayScheduleRef = useRef(todaySchedule);
+  todayScheduleRef.current = todaySchedule;
+
+  const handleFetchTimetables = async (classNo = ttClassNoRef.current, schedType = scheduleTypeRef.current) => {
     if (!token) return;
     try {
-      const res = await safeFetch(`${API_BASE_URL}/api/timetables?classNo=${classNo}`, {
+      const stParam = schedType === 'special' ? 'special' : 'normal';
+      const res = await safeFetch(`${API_BASE_URL}/api/timetables?classNo=${classNo}&scheduleType=${stParam}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      if (res.ok && classNo === ttClassNoRef.current) {
+      if (res.ok && classNo === ttClassNoRef.current && schedType === scheduleTypeRef.current) {
         const data = await res.json();
         setTimetables(data);
       }
@@ -2631,12 +2709,13 @@ export default function App() {
     }
   };
 
-  // ヘッダー用: 自分のクラスの時間割
-  const fetchTodayTimetables = async () => {
+  // ヘッダー用: 自分のクラスの時間割 (今日の時程が特別時程なら special 時間割を使う)
+  const fetchTodayTimetables = async (schedType = todayScheduleRef.current) => {
     const tk = tokenRef.current;
     if (!tk) return;
     const classNo = myClassRef.current ?? 1;
-    const res = await safeFetch(`/api/timetables?classNo=${classNo}`, { headers: { Authorization: `Bearer ${tk}` } });
+    const stParam = schedType === 'special' ? 'special' : 'normal';
+    const res = await safeFetch(`/api/timetables?classNo=${classNo}&scheduleType=${stParam}`, { headers: { Authorization: `Bearer ${tk}` } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const rows = await res.json();
     if (classNo === (myClassRef.current ?? 1)) setTodayTimetables(rows);
@@ -2652,11 +2731,21 @@ export default function App() {
 
   const applyTimetableConfig = (config: Partial<TimetableConfig>) => {
     if (!config || !config.schedules) return;
+    const nextActive = config.activeScheduleType || 'normal';
+    const prevActive = todayScheduleRef.current;
+    todayScheduleRef.current = nextActive;
     setTtConfig({
-      activeScheduleType: config.activeScheduleType || 'normal',
+      activeScheduleType: nextActive,
       schedules: { ...DEFAULT_CONFIG.schedules, ...config.schedules },
       dayPeriodCounts: { ...DEFAULT_CONFIG.dayPeriodCounts, ...(config.dayPeriodCounts || {}) },
+      specialDayPeriodCounts: {
+        ...(DEFAULT_CONFIG.specialDayPeriodCounts || { 1: 4, 2: 4, 3: 4, 4: 4, 5: 4 }),
+        ...(config.specialDayPeriodCounts || {}),
+      },
     });
+    if (nextActive !== prevActive) {
+      fetchTodayTimetables(nextActive).catch(() => {});
+    }
   };
   const applyTimetableConfigRef = useRef(applyTimetableConfig);
   applyTimetableConfigRef.current = applyTimetableConfig;
@@ -2666,16 +2755,16 @@ export default function App() {
     fetchTodayTimetables().catch(() => {});
   };
 
-  // クラス切替時・ログイン時に時間割を取り直す
+  // クラス切替・時程タブ切替・ログイン時に時間割を取り直す
   useEffect(() => {
-    handleFetchTimetables(ttClassNo);
-  }, [ttClassNo, token]);
+    handleFetchTimetables(ttClassNo, scheduleType);
+  }, [ttClassNo, scheduleType, token]);
 
   const myClassNo = currentUser?.class_no ?? null;
   useEffect(() => {
-    fetchTodayTimetables().catch(() => {});
+    fetchTodayTimetables(todaySchedule).catch(() => {});
     if (myClassNo) setTtClassNo(myClassNo);
-  }, [myClassNo, token]);
+  }, [myClassNo, todaySchedule, token]);
 
   // 日付が変わったら「今日の時程」を取り直す (前日の短縮時程が残らないように)
   const todayKey = ymd(now);
@@ -2688,20 +2777,41 @@ export default function App() {
     if (!token || !subject.trim()) return null;
     setTtSaveStatus('保存中…');
     try {
+      const stParam = scheduleType === 'special' ? 'special' : 'normal';
       const res = await safeFetch('/api/timetables', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ dayOfWeek: day, period, subject: subject.trim(), classNo: ttClassNo, ...extra }),
+        body: JSON.stringify({ dayOfWeek: day, period, subject: subject.trim(), classNo: ttClassNo, scheduleType: stParam, ...extra }),
       });
       if (!res.ok) throw new Error();
       const row: TimetableItem = await res.json();
       setTimetables(prev => [...prev.filter(t => !(t.day_of_week === day && t.period === period)), row]);
       if (ttClassNo === (myClassRef.current ?? 1)) fetchTodayTimetables().catch(() => {});
-      setTtSaveStatus(`${ttClassNo}組 ${DAY_LABELS[day]}曜${period}限 を「${row.subject}」に保存しました`);
+      setTtSaveStatus(`${ttClassNo}組 ${DAY_LABELS[day]}曜${period}限${scheduleType === 'special' ? ' (特別時程)' : ''} を「${row.subject}」に保存しました`);
       return row;
     } catch {
       setTtSaveStatus('保存に失敗しました');
       return null;
+    }
+  };
+
+  const handleCopyNormalToSpecial = async () => {
+    if (!token) return;
+    setTtSaveStatus('通常時間割をコピー中…');
+    try {
+      const res = await safeFetch('/api/timetables/special-copy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ classNo: ttClassNo }),
+      });
+      if (!res.ok) throw new Error();
+      await handleFetchTimetables(ttClassNo, 'special');
+      if (ttClassNo === (myClassRef.current ?? 1)) fetchTodayTimetables().catch(() => {});
+      setTtSaveStatus(`${ttClassNo}組の通常時間割を特別時程にコピーしました`);
+      toast('通常時間割を特別時程にコピーしました', { kind: 'success' });
+    } catch {
+      setTtSaveStatus('コピーに失敗しました');
+      toast('コピーに失敗しました', { kind: 'error' });
     }
   };
 
@@ -2719,7 +2829,7 @@ export default function App() {
     const cell = selectedTtCell || { day: newTtDay, period: newTtPeriod };
     const row = await saveTimetableSubject(cell.day, cell.period, subj);
     if (!row) return;
-    const lastPeriod = periodCountFor(ttConfig, cell.day);
+    const lastPeriod = periodCountFor(ttConfig, cell.day, scheduleType);
     const nextPeriod = cell.period < lastPeriod ? cell.period + 1 : 1;
     const nextDay = cell.period < lastPeriod ? cell.day : (cell.day < 5 ? cell.day + 1 : 1);
     setSelectedTtCell({ day: nextDay, period: nextPeriod });
@@ -3185,46 +3295,100 @@ export default function App() {
     }
   };
 
-  // メモの Markdown エディタ ⇔ プレビュー スクロール同期 (requestAnimationFrame で最適化)
+  // メモの Markdown エディタ ⇔ プレビュー スクロール同期 (目次リンクジャンプ時の逆流防止付き)
   const memoScrollRafRef = useRef<number | null>(null);
   const handleMemoEditorScroll = () => {
-    if (memoScrollLockRef.current === 'preview') return;
     const ed = memoTextareaRef.current;
     const pr = memoPreviewRef.current;
     if (!ed || !pr) return;
+    if (pr.dataset.anchorJumping === '1' || memoScrollLockRef.current === 'preview') return;
     const edMax = ed.scrollHeight - ed.clientHeight;
     const prMax = pr.scrollHeight - pr.clientHeight;
     if (edMax <= 0 || prMax <= 0) return;
     memoScrollLockRef.current = 'editor';
+    clearTimeout(memoScrollUnlockTimerRef.current);
     if (memoScrollRafRef.current) cancelAnimationFrame(memoScrollRafRef.current);
     memoScrollRafRef.current = requestAnimationFrame(() => {
-      pr.scrollTop = (ed.scrollTop / edMax) * prMax;
-      memoScrollLockRef.current = null;
+      if (pr.dataset.anchorJumping !== '1') {
+        pr.scrollTop = (ed.scrollTop / edMax) * prMax;
+      }
       memoScrollRafRef.current = null;
+      memoScrollUnlockTimerRef.current = setTimeout(() => {
+        if (memoScrollLockRef.current === 'editor') memoScrollLockRef.current = null;
+      }, 150);
     });
   };
 
   const handleMemoPreviewScroll = () => {
-    if (memoScrollLockRef.current === 'editor') return;
     const ed = memoTextareaRef.current;
     const pr = memoPreviewRef.current;
     if (!ed || !pr) return;
+    if (pr.dataset.anchorJumping === '1' || memoScrollLockRef.current === 'editor') return;
     const edMax = ed.scrollHeight - ed.clientHeight;
     const prMax = pr.scrollHeight - pr.clientHeight;
     if (edMax <= 0 || prMax <= 0) return;
     memoScrollLockRef.current = 'preview';
+    clearTimeout(memoScrollUnlockTimerRef.current);
     if (memoScrollRafRef.current) cancelAnimationFrame(memoScrollRafRef.current);
     memoScrollRafRef.current = requestAnimationFrame(() => {
-      ed.scrollTop = (pr.scrollTop / prMax) * edMax;
-      memoScrollLockRef.current = null;
+      if (pr.dataset.anchorJumping !== '1') {
+        ed.scrollTop = (pr.scrollTop / prMax) * edMax;
+      }
       memoScrollRafRef.current = null;
+      memoScrollUnlockTimerRef.current = setTimeout(() => {
+        if (memoScrollLockRef.current === 'preview') memoScrollLockRef.current = null;
+      }, 150);
     });
   };
 
-  // 曜日ごとに 5限 / 6限 を切り替え
-  const handleToggleDayPeriods = (day: number) => {
-    const next = periodCountFor(ttConfig, day) === 6 ? 5 : 6;
-    saveTimetableConfig({ dayPeriodCounts: { [day]: next } }, `${DAY_LABELS[day]}曜日を ${next}限授業にしました`);
+  const handleDownloadCodeZone = () => {
+    const extMap: Record<string, string> = {
+      typescript: 'ts',
+      javascript: 'js',
+      python: 'py',
+      html: 'html',
+      css: 'css',
+      json: 'json',
+      markdown: 'md',
+      sql: 'sql',
+      cpp: 'cpp',
+      csharp: 'cs',
+      rust: 'rs',
+      go: 'go',
+      php: 'php',
+      shell: 'sh',
+    };
+    const ext = extMap[memoLanguage] || 'txt';
+    const rawName = (memoTitle || `code_slot_${selectedSlotIndex}`).trim().replace(/[\\/:*?"<>|]/g, '_');
+    const filename = rawName.endsWith(`.${ext}`) ? rawName : `${rawName}.${ext}`;
+    const mime = ext === 'html' ? 'text/html;charset=utf-8' : 'text/plain;charset=utf-8';
+    const blob = new Blob([memoContent], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast(`${filename} をダウンロードしました`, { kind: 'success' });
+  };
+
+  // 曜日ごとに授業時間数 (1〜6限) を切り替え (特別時程は specialDayPeriodCounts に保存)
+  const handleToggleDayPeriods = (day: number, explicitCount?: number) => {
+    const current = periodCountFor(ttConfig, day, scheduleType);
+    const next = explicitCount ?? (current <= 1 ? 6 : current - 1);
+    if (scheduleType === 'special') {
+      saveTimetableConfig(
+        { specialDayPeriodCounts: { [day]: next } },
+        `特別時程の${DAY_LABELS[day]}曜日を ${next}限授業にしました`
+      );
+    } else {
+      saveTimetableConfig(
+        { dayPeriodCounts: { [day]: next } },
+        `${DAY_LABELS[day]}曜日を ${next}限授業にしました`
+      );
+    }
   };
 
   const handleCreateTimetableEntry = async (e: React.FormEvent) => {
@@ -3754,17 +3918,14 @@ export default function App() {
     }
   }, [activeTab, isTimelapsePlaying]);
 
-  // 画面座標 → キャンバス内部座標 (1400x800)。表示サイズ・縦横比が端末ごとに違ってもズレないよう
-  // object-contain の余白 (レターボックス) を考慮して変換する
+  // 画面座標 → キャンバス内部座標 (1400x800)。キャンバス表示領域いっぱいに描画できるよう実寸比で1:1変換する
   const getCanvasCoords = (e: { clientX: number; clientY: number }) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
-    const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height);
-    const offsetX = (rect.width - canvas.width * scale) / 2;
-    const offsetY = (rect.height - canvas.height * scale) / 2;
-    const x = (e.clientX - rect.left - offsetX) / scale;
-    const y = (e.clientY - rect.top - offsetY) / scale;
+    if (rect.width <= 0 || rect.height <= 0) return { x: 0, y: 0 };
+    const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
+    const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
     return {
       x: Math.round(Math.min(Math.max(x, 0), canvas.width) * 10) / 10,
       y: Math.round(Math.min(Math.max(y, 0), canvas.height) * 10) / 10,
@@ -3834,7 +3995,7 @@ export default function App() {
       else return;
     }
     try {
-      await safeFetch(`${API_BASE_URL}/api/board/stroke`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/board/stroke`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -3846,6 +4007,11 @@ export default function App() {
           points
         })
       });
+      if (res.ok) {
+        const saved = await res.json();
+        setBoardUndoStack(prev => [...prev, { kind: 'stroke', item: saved }]);
+        setBoardRedoStack([]);
+      }
     } catch (err) {
       console.error('Stroke save error:', err);
     }
@@ -3856,7 +4022,7 @@ export default function App() {
     const { x, y } = getCanvasCoords(e);
 
     try {
-      await safeFetch(`${API_BASE_URL}/api/board/text`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/board/text`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -3864,11 +4030,88 @@ export default function App() {
         },
         body: JSON.stringify({ x, y, text: newBoardText })
       });
+      if (res.ok) {
+        const saved = await res.json();
+        setBoardUndoStack(prev => [...prev, { kind: 'text', item: saved }]);
+        setBoardRedoStack([]);
+      }
       setNewBoardText('');
     } catch (err) {
       console.error(err);
     }
   };
+
+  const handleUndoBoard = async () => {
+    if (!token || boardUndoStack.length === 0) return;
+    const last = boardUndoStack[boardUndoStack.length - 1];
+    setBoardUndoStack(prev => prev.slice(0, -1));
+    setBoardRedoStack(prev => [...prev, last]);
+    try {
+      const endpoint = last.kind === 'stroke'
+        ? `${API_BASE_URL}/api/board/stroke/${last.item.id}`
+        : `${API_BASE_URL}/api/board/text/${last.item.id}`;
+      await safeFetch(endpoint, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (last.kind === 'stroke') {
+        setBoardStrokes(prev => {
+          const next = prev.filter(s => s.id !== last.item.id);
+          redrawCanvas(next, boardTexts);
+          return next;
+        });
+      } else {
+        setBoardTexts(prev => {
+          const next = prev.filter(t => t.id !== last.item.id);
+          redrawCanvas(boardStrokes, next);
+          return next;
+        });
+      }
+    } catch (err) {
+      console.error('Board undo error:', err);
+    }
+  };
+  handleUndoBoardRef.current = handleUndoBoard;
+
+  const handleRedoBoard = async () => {
+    if (!token || boardRedoStack.length === 0) return;
+    const last = boardRedoStack[boardRedoStack.length - 1];
+    setBoardRedoStack(prev => prev.slice(0, -1));
+    try {
+      if (last.kind === 'stroke') {
+        const res = await safeFetch(`${API_BASE_URL}/api/board/stroke`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            color: last.item.color,
+            width: last.item.width,
+            points: typeof last.item.points === 'string' ? JSON.parse(last.item.points) : last.item.points,
+          }),
+        });
+        if (res.ok) {
+          const saved = await res.json();
+          setBoardUndoStack(prev => [...prev, { kind: 'stroke', item: saved }]);
+        }
+      } else {
+        const res = await safeFetch(`${API_BASE_URL}/api/board/text`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            x: last.item.x,
+            y: last.item.y,
+            text: last.item.text,
+          }),
+        });
+        if (res.ok) {
+          const saved = await res.json();
+          setBoardUndoStack(prev => [...prev, { kind: 'text', item: saved }]);
+        }
+      }
+    } catch (err) {
+      console.error('Board redo error:', err);
+    }
+  };
+  handleRedoBoardRef.current = handleRedoBoard;
 
   const handleClearBoard = async () => {
     if (!token) return;
@@ -4246,7 +4489,7 @@ export default function App() {
   const nowForStatus = now;
   const todayRows = todayTimetables.filter(t => t.day_of_week === nowForStatus.getDay());
   const schoolStatus = computeSchoolStatus(nowForStatus, ttConfig, todayRows);
-  const todaySlots = daySlots(ttConfig, nowForStatus.getDay(), todayRows);
+  const todaySlots = daySlots(ttConfig, nowForStatus.getDay(), todayRows, todaySchedule);
   const todayItems = todayRows
     .filter(t => t.items && t.items.trim())
     .sort((a, b) => a.period - b.period)
@@ -4271,7 +4514,49 @@ export default function App() {
   const unreadAnnouncements = announcements.filter(a => new Date(a.created_at).getTime() > lastReadAnnouncementTime).length;
   const pendingLinkRequests = discordLinkRequests.filter(r => r.status === 'pending');
   const totalNotifications = urgentHomework + unreadAnnouncements + (currentUser.role === 'admin' ? pendingLinkRequests.length : 0);
-  const nameOfUser = (id: number) => userById.get(id)?.username;
+
+  // Discord サーバーメンバーから pseudoId -> 表示名 & Bot名セットを構築
+  const { discordMemberByPseudoId, discordBotNames } = (() => {
+    const map = new Map<number, string>();
+    const bots = new Set<string>();
+    for (const srv of discordServers) {
+      for (const m of srv.members || []) {
+        const dname = m.displayName || m.username;
+        if (m.id && dname) {
+          const pid = -Math.abs(Array.from(String(m.id)).reduce((acc, c) => ((acc << 5) - acc + c.charCodeAt(0)) | 0, 0)) || -1;
+          map.set(pid, dname);
+        }
+        if (m.isBot) {
+          if (m.displayName) bots.add(m.displayName);
+          if (m.username) bots.add(m.username);
+        }
+      }
+    }
+    return { discordMemberByPseudoId: map, discordBotNames: bots };
+  })();
+
+  const nameOfUser = (id: number): string | undefined => {
+    const asdf = userById.get(id)?.username;
+    if (asdf) return asdf.replace(/^\[Discord\]\s*/, '');
+    const dc = discordReactionUsers[id] || discordMemberByPseudoId.get(id);
+    if (dc) return dc.replace(/^\[Discord\]\s*/, '');
+    return undefined;
+  };
+
+  const resolveMessageReactionUsers = async (messageId: number) => {
+    if (!token || messageId <= 0 || resolvedReactionMsgIdsRef.current.has(messageId)) return;
+    resolvedReactionMsgIdsRef.current.add(messageId);
+    try {
+      const res = await safeFetch(`/api/messages/${messageId}/reaction-users`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data?.users && typeof data.users === 'object') {
+        setDiscordReactionUsers(prev => ({ ...prev, ...data.users }));
+      }
+    } catch {}
+  };
   const activeChannelObj = channels.find(c => c.id === activeChannelId);
   const activeChannelName = activeChannelObj?.name || 'chat';
   const customEmojisMap = new Map(customEmojisList.map(e => [e.name.toLowerCase(), e.url]));
@@ -4654,7 +4939,9 @@ export default function App() {
                 {schoolStatus.sub && <span className="text-stone-400 text-[10px] hidden xl:inline">({schoolStatus.sub})</span>}
                 {todayItems.length > 0 && <Backpack className="w-3 h-3 text-stone-400 hidden sm:block" />}
                 {todaySchedule !== 'normal' && (
-                  <span className="text-[9px] px-1 rounded bg-amber-500 text-black font-bold">{todaySchedule === 'short' ? '短縮' : 'S短'}</span>
+                  <span className="text-[9px] px-1 rounded bg-amber-500 text-black font-bold">
+                    {todaySchedule === 'short' ? '短縮' : todaySchedule === 'special' ? '特別' : 'S短'}
+                  </span>
                 )}
               </>
             }
@@ -5410,6 +5697,11 @@ export default function App() {
                                     {displayName}
                                   </span>
                                   {fromDiscord && <DiscordBadge className="self-center -ml-1" />}
+                                  {(m.is_bot || isGemini || discordBotNames.has(displayName)) && (
+                                    <span className="self-center -ml-1 text-[9px] px-1 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono font-bold leading-none shrink-0">
+                                      BOT
+                                    </span>
+                                  )}
                                   <span className="text-[11px] text-stone-500">{timeLabel}</span>
                                   {m.is_pinned && (
                                     <span className="flex items-center gap-0.5 text-[10px] text-amber-400 bg-amber-400/10 px-1.5 rounded border border-amber-400/20">
@@ -5557,6 +5849,7 @@ export default function App() {
                                   nameOf={nameOfUser}
                                   onToggle={emoji => handleToggleReaction(m.id, emoji)}
                                   customEmojis={customEmojisMap}
+                                  onResolveUnknown={() => resolveMessageReactionUsers(m.id)}
                                 />
                               )}
                             </div>
@@ -6064,13 +6357,8 @@ export default function App() {
                                   <button
                                     key={m.id}
                                     type="button"
-                                    onClick={() => {
-                                      const insert = `@${name} `;
-                                      setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
-                                      if (window.innerWidth < 1024) setIsMembersCollapsed(true);
-                                      requestAnimationFrame(() => chatInputRef.current?.focus());
-                                    }}
-                                    title={`@${name} をメンション`}
+                                    onClick={() => setSelectedProfileMember({ kind: 'discord', member: m })}
+                                    title={`${name} のプロフィール・ロールを見る`}
                                     className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left text-stone-200"
                                   >
                                     <div className="relative shrink-0">
@@ -6118,13 +6406,8 @@ export default function App() {
                                   <button
                                     key={m.id}
                                     type="button"
-                                    onClick={() => {
-                                      const insert = `@${name} `;
-                                      setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
-                                      if (window.innerWidth < 1024) setIsMembersCollapsed(true);
-                                      requestAnimationFrame(() => chatInputRef.current?.focus());
-                                    }}
-                                    title={`@${name} をメンション`}
+                                    onClick={() => setSelectedProfileMember({ kind: 'discord', member: m })}
+                                    title={`${name} のプロフィール・ロールを見る`}
                                     className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left text-stone-500"
                                   >
                                     <div className="relative shrink-0">
@@ -6197,13 +6480,8 @@ export default function App() {
                             <button
                               key={u.id}
                               type="button"
-                              onClick={() => {
-                                const insert = `@${u.username} `;
-                                setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
-                                if (window.innerWidth < 1024) setIsMembersCollapsed(true);
-                                requestAnimationFrame(() => chatInputRef.current?.focus());
-                              }}
-                              title={`@${u.username} をメンション`}
+                              onClick={() => setSelectedProfileMember({ kind: 'asdf', user: u })}
+                              title={`${u.username} のプロフィール・ロールを見る`}
                               className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-stone-800/60 text-sm text-left ${
                                 group === 'offline' ? 'text-stone-600' : 'text-stone-200'
                               }`}
@@ -6278,23 +6556,27 @@ export default function App() {
                 <div className="text-[11px] font-mono uppercase tracking-wider text-stone-500 px-2 mb-2 font-bold flex items-center justify-between shrink-0 border-t border-stone-800/80 pt-3">
                   <span>専用コードゾーン</span>
                   <div className="flex items-center gap-1">
-                    {currentUser.role === 'admin' && (
-                      <button
-                        type="button"
-                        onClick={() => setShowCodeZoneModal(true)}
-                        className="p-1 text-stone-400 hover:text-amber-400 hover:bg-stone-800 rounded transition"
-                        title="コードゾーンを管理・追加"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedUserForCodeZone(currentUser.id);
+                        setNewCodeZoneTitle('');
+                        setNewCodeZoneLang('typescript');
+                        setShowCodeZoneModal(true);
+                      }}
+                      className="p-1 text-stone-400 hover:text-amber-400 hover:bg-stone-800 rounded transition"
+                      title="コードゾーンを追加"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                    </button>
                     <Code className="w-3.5 h-3.5 text-stone-500" />
                   </div>
                 </div>
                 <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1">
                   {memoSlots.filter(s => s.slot_index >= 11).map(slot => {
                     const isMySlot = slot.assigned_user_id === currentUser?.id;
-                    const assignedName = (slot as any).assigned_username || `ユーザー${slot.assigned_user_id || ''}`;
+                    const assignedName = (slot as any).assigned_username || (slot.assigned_user_id ? userById.get(slot.assigned_user_id)?.username : '') || `ユーザー${slot.assigned_user_id || ''}`;
+                    const zoneTitle = (selectedSlotIndex === slot.slot_index ? memoTitle : slot.title) || assignedName;
                     return (
                       <div
                         key={slot.slot_index}
@@ -6310,7 +6592,12 @@ export default function App() {
                           className="flex items-center gap-2 truncate min-w-0 flex-1 text-left"
                         >
                           <Avatar name={assignedName} url={slot.assigned_user_id ? userById.get(slot.assigned_user_id)?.avatar_url : null} size="w-5 h-5 text-[10px]" />
-                          <span className="truncate font-bold text-white">{assignedName}</span>
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-bold text-white">{zoneTitle}</div>
+                            <div className="text-[10px] text-stone-500 truncate">
+                              {assignedName} · {((slot as any).language || 'ts').toUpperCase()}
+                            </div>
+                          </div>
                         </button>
                         <div className="flex items-center gap-1 shrink-0 ml-2">
                           {isMySlot ? (
@@ -6318,14 +6605,14 @@ export default function App() {
                           ) : (
                             <Lock className="w-3 h-3 text-stone-600" />
                           )}
-                          {currentUser.role === 'admin' && (
+                          {(currentUser.role === 'admin' || isMySlot) && (
                             <button
                               type="button"
                               onClick={async (e) => {
                                 e.stopPropagation();
                                 const ok = await confirmDialog({
-                                  title: `コードゾーン #${slot.slot_index} を削除しますか？`,
-                                  message: `${assignedName} に割り当てられた専用コードゾーンを削除します。保存されているコード内容は完全に消去されます。`,
+                                  title: `コードゾーン「${zoneTitle}」を削除しますか？`,
+                                  message: `${assignedName} の専用コードゾーン (#${slot.slot_index}) を削除します。保存されているコード内容は完全に消去されます。`,
                                   confirmLabel: '削除する',
                                   danger: true,
                                 });
@@ -6345,7 +6632,7 @@ export default function App() {
                                 }
                               }}
                               className="opacity-0 group-hover:opacity-100 p-1 text-stone-500 hover:text-red-400 hover:bg-red-950/40 rounded transition"
-                              title="このコードゾーンを削除 (管理者のみ)"
+                              title="このコードゾーンを削除"
                             >
                               <Trash2 className="w-3 h-3" />
                             </button>
@@ -6506,6 +6793,16 @@ export default function App() {
                         <option value="php">PHP</option>
                         <option value="shell">Shell</option>
                       </select>
+                      <button
+                        type="button"
+                        onClick={handleDownloadCodeZone}
+                        disabled={!memoContent}
+                        className="btn-chip text-[11px] disabled:opacity-40"
+                        title="コードをファイルとしてダウンロード (.html / .ts / .py 等)"
+                      >
+                        <Download className="w-3.5 h-3.5 text-amber-400" />
+                        <span className="hidden sm:inline">DL</span>
+                      </button>
                     </div>
                   )}
 
@@ -6751,6 +7048,7 @@ export default function App() {
             }}
             onJobFinished={() => {
               setIsAiJobRunning(false);
+              setAiJobProgressText(null);
               if (activeTab !== 'ai') {
                 setHasUnreadAiResult(true);
               }
@@ -7192,6 +7490,27 @@ export default function App() {
               </div>
 
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleUndoBoard}
+                  disabled={boardUndoStack.length === 0 || isTimelapsePlaying}
+                  className="px-2.5 py-1.5 rounded-xl bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-amber-400 flex items-center gap-1 transition disabled:opacity-35"
+                  title="元に戻す (Ctrl+Z)"
+                >
+                  <Undo2 className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline text-xs">元に戻す</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRedoBoard}
+                  disabled={boardRedoStack.length === 0 || isTimelapsePlaying}
+                  className="px-2.5 py-1.5 rounded-xl bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-amber-400 flex items-center gap-1 transition disabled:opacity-35"
+                  title="やり直す (Ctrl+Y)"
+                >
+                  <Redo2 className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline text-xs">やり直し</span>
+                </button>
+
                 {isTimelapsePlaying ? (
                   <button
                     onClick={stopTimelapse}
@@ -7231,7 +7550,7 @@ export default function App() {
             </div>
 
             {/* Canvas Area */}
-            <div className="flex-1 relative border border-stone-800/80 rounded-2xl bg-[#0C0D10] overflow-hidden flex items-center justify-center cursor-crosshair">
+            <div className="flex-1 relative border border-stone-800/80 rounded-2xl bg-[#0C0D10] overflow-hidden cursor-crosshair">
               <canvas
                 ref={canvasRef}
                 width={BOARD_WIDTH}
@@ -7242,7 +7561,7 @@ export default function App() {
                 onPointerCancel={finishStroke}
                 onClick={handleAddBoardText}
                 style={{ touchAction: 'none' }}
-                className="w-full h-full object-contain select-none"
+                className="w-full h-full block select-none"
               />
 
               {/* 共有クリップボード (折りたたみ可) */}
@@ -7404,6 +7723,8 @@ export default function App() {
         {activeTab === 'help' && (
           <div className="flex-1 min-h-0 flex anim-tab">
             <HelpTab
+              safeFetch={safeFetch}
+              token={token}
               onAskAi={q => {
                 setActiveTab('ai');
                 toast(q || 'AI タブを開きました', { kind: 'success' });
@@ -9333,13 +9654,248 @@ export default function App() {
         </div>
       )}
 
-      {/* お知らせ作成モーダル (admin限定) */}
-      {showCodeZoneModal && currentUser.role === 'admin' && (
+      {/* メンバー プロフィール・Bio・ロール表示モーダル */}
+      {selectedProfileMember && (() => {
+        const isDiscord = selectedProfileMember.kind === 'discord';
+        const dm = isDiscord ? selectedProfileMember.member : null;
+        const au = !isDiscord ? selectedProfileMember.user : null;
+        const displayName = isDiscord ? (dm.displayName || dm.username) : au!.username;
+        const subUsername = isDiscord
+          ? (dm.globalName && dm.globalName !== dm.username ? `${dm.globalName} (@${dm.username})` : `@${dm.username}`)
+          : `@${au!.username}`;
+        const avatarUrl = isDiscord ? (dm.avatarUrl ? toProxiedMediaUrl(dm.avatarUrl, token) : null) : au!.avatar_url;
+        const bannerColor = (isDiscord && dm.bannerColor) ? dm.bannerColor : (isDiscord ? '#5865F2' : '#f59e0b');
+        const status = isDiscord ? (dm.status || 'offline') : (au!.status || 'offline');
+        const statusLabel =
+          status === 'online' ? 'オンライン' :
+          status === 'idle' || status === 'away' ? '離席中' :
+          status === 'dnd' ? '取り込み中' : 'オフライン';
+        const statusDot =
+          status === 'online' ? 'bg-emerald-400' :
+          status === 'idle' || status === 'away' ? 'bg-amber-400' :
+          status === 'dnd' ? 'bg-rose-400' : 'bg-stone-500';
+
+        // 所有ロール一覧 (色付き)
+        const roleBadges: { id: string; name: string; color: string }[] = isDiscord
+          ? (Array.isArray(dm.roleDetails) && dm.roleDetails.length > 0
+              ? dm.roleDetails
+              : (Array.isArray(dm.roles) ? dm.roles.map((r: string, idx: number) => ({ id: String(idx), name: r, color: '#94a3b8' })) : []))
+          : (() => {
+              const ids = Array.from(new Set([au!.role, ...(Array.isArray(au!.custom_roles) ? au!.custom_roles : [])].filter(Boolean)));
+              return ids.map(rid => {
+                const def = roleDefs.find(d => d.id === rid);
+                if (def) return { id: def.id, name: def.name, color: def.color || '#f59e0b' };
+                if (rid === 'admin') return { id: 'admin', name: '管理者 (Admin)', color: '#f59e0b' };
+                if (rid === 'member') return { id: 'member', name: 'メンバー', color: '#94a3b8' };
+                return { id: rid, name: rid, color: '#38bdf8' };
+              });
+            })();
+
+        const createdAtStr = isDiscord ? dm.createdAt : au!.created_at;
+        const joinedAtStr = isDiscord ? dm.joinedAt : null;
+        const premiumSinceStr = isDiscord ? dm.premiumSince : null;
+        const clientPlatforms: string[] = isDiscord && Array.isArray(dm.clientStatus) ? dm.clientStatus : [];
+        const platformLabels: Record<string, string> = { desktop: 'PC (デスクトップ)', mobile: 'スマホ (モバイル)', web: 'ブラウザ (Web)' };
+        const activities: { name: string; type: number; details?: string | null; state?: string | null }[] =
+          isDiscord && Array.isArray(dm.activities) ? dm.activities : [];
+
+        return (
+          <div
+            className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade"
+            onClick={() => setSelectedProfileMember(null)}
+          >
+            <div
+              onClick={e => e.stopPropagation()}
+              className="w-full max-w-sm bg-[#111214] border border-stone-800 rounded-2xl overflow-hidden shadow-2xl text-xs anim-pop"
+            >
+              {/* バナー */}
+              <div className="h-20 relative" style={{ background: `linear-gradient(135deg, ${bannerColor}, #18191c)` }}>
+                <button
+                  type="button"
+                  onClick={() => setSelectedProfileMember(null)}
+                  className="absolute top-2.5 right-2.5 p-1.5 rounded-full bg-black/50 text-stone-300 hover:text-white hover:bg-black/70 transition"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* アイコン + バッジ */}
+              <div className="px-5 pb-5 relative">
+                <div className="flex items-end justify-between -mt-10 mb-3">
+                  <div className="relative">
+                    <div className="p-1 rounded-full bg-[#111214]">
+                      {avatarUrl ? (
+                        <img src={avatarUrl} alt="" className="w-16 h-16 rounded-full object-cover" />
+                      ) : (
+                        <Avatar name={displayName} url={null} size="w-16 h-16 text-xl" />
+                      )}
+                    </div>
+                    <span className={`absolute bottom-1.5 right-1.5 w-4 h-4 rounded-full border-[3px] border-[#111214] ${statusDot}`} title={statusLabel} />
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    {isDiscord ? (
+                      <span className="px-2 py-0.5 rounded-md bg-[#5865F2]/20 border border-[#5865F2]/40 text-indigo-300 font-bold text-[10px] flex items-center gap-1">
+                        <DiscordIcon className="w-3 h-3" /> Discord
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-300 font-bold text-[10px]">
+                        asdfbase
+                      </span>
+                    )}
+                    {isDiscord && dm.isBot && (
+                      <span className="px-1.5 py-0.5 rounded bg-indigo-500 text-white font-mono font-bold text-[10px]">
+                        BOT
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* 名前 & タグ */}
+                <div className="bg-[#18191D] border border-stone-800/90 rounded-xl p-3.5 space-y-3">
+                  <div>
+                    <div className="text-base font-bold text-white flex items-center gap-1.5 flex-wrap">
+                      <span>{displayName}</span>
+                      {!isDiscord && au?.class_no && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono">
+                          {au.class_no}組
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-stone-400 font-mono text-[11px]">{subUsername}</div>
+                    {isDiscord && dm.nickname && dm.nickname !== dm.username && (
+                      <div className="text-[10px] text-stone-500 mt-0.5">ニックネーム: {dm.nickname}</div>
+                    )}
+                  </div>
+
+                  {/* ステータス & 接続クライアント */}
+                  <div className="pt-2 border-t border-stone-800/80 space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-stone-400 font-bold uppercase text-[10px]">ステータス</span>
+                      <span className="flex items-center gap-1.5 text-stone-200 font-medium">
+                        <span className={`w-2 h-2 rounded-full ${statusDot}`} />
+                        {statusLabel}
+                      </span>
+                    </div>
+                    {clientPlatforms.length > 0 && (
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-stone-400 font-bold uppercase text-[10px]">接続端末</span>
+                        <span className="text-stone-300">{clientPlatforms.map(p => platformLabels[p] || p).join(' / ')}</span>
+                      </div>
+                    )}
+                    {(isDiscord ? dm.customStatus : au?.custom_status) && (
+                      <div className="p-2 rounded-lg bg-stone-900/80 border border-stone-800 text-stone-200 text-[11px]">
+                        💬 {isDiscord ? dm.customStatus : au?.custom_status}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* ボイスチャンネル参加状況 */}
+                  {isDiscord && (dm.inVoice || dm.voiceChannelName) && (
+                    <div className="pt-2 border-t border-stone-800/80">
+                      <div className="text-[10px] font-bold uppercase text-emerald-400 mb-1 flex items-center gap-1">
+                        <Volume2 className="w-3 h-3" /> ボイスチャンネル参加中
+                      </div>
+                      <div className="text-stone-200 font-medium text-[11px] bg-emerald-950/30 border border-emerald-800/50 rounded-lg px-2.5 py-1.5">
+                        🔊 {dm.voiceChannelName || 'VC 接続中'}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* アクティビティ (プレイ中のゲーム・Spotify 等) */}
+                  {activities.length > 0 && (
+                    <div className="pt-2 border-t border-stone-800/80 space-y-1.5">
+                      <div className="text-[10px] font-bold uppercase text-stone-400">アクティビティ</div>
+                      {activities.map((act, i) => (
+                        <div key={i} className="p-2 rounded-lg bg-stone-900/90 border border-stone-800/80 space-y-0.5">
+                          <div className="font-bold text-amber-300 text-[11px]">{act.name}</div>
+                          {act.details && <div className="text-stone-300 text-[10px]">{act.details}</div>}
+                          {act.state && <div className="text-stone-400 text-[10px]">{act.state}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* 所有ロール一覧 */}
+                  <div className="pt-2 border-t border-stone-800/80 space-y-1.5">
+                    <div className="text-[10px] font-bold uppercase text-stone-400 flex items-center justify-between">
+                      <span>所有ロール</span>
+                      <span className="font-mono text-stone-500">{roleBadges.length}</span>
+                    </div>
+                    {roleBadges.length === 0 ? (
+                      <div className="text-stone-500 text-[11px]">ロールなし</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto pr-1">
+                        {roleBadges.map(r => (
+                          <span
+                            key={r.id + r.name}
+                            className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#111214] border border-stone-800 text-stone-200 text-[11px] font-medium"
+                          >
+                            <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: r.color || '#94a3b8' }} />
+                            <span>{r.name}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* アカウント作成日・サーバー参加日 */}
+                  {(createdAtStr || joinedAtStr || premiumSinceStr) && (
+                    <div className="pt-2 border-t border-stone-800/80 grid grid-cols-2 gap-2 text-[10px]">
+                      {createdAtStr && (
+                        <div className="p-2 rounded-lg bg-[#111214] border border-stone-800/70">
+                          <div className="text-stone-400 font-bold mb-0.5">{isDiscord ? 'Discord 登録日' : 'asdfbase 登録日'}</div>
+                          <div className="text-stone-200 font-mono">
+                            {new Date(createdAtStr).toLocaleDateString('ja-JP', { year: 'numeric', month: 'short', day: 'numeric' })}
+                          </div>
+                        </div>
+                      )}
+                      {joinedAtStr && (
+                        <div className="p-2 rounded-lg bg-[#111214] border border-stone-800/70">
+                          <div className="text-stone-400 font-bold mb-0.5">サーバー参加日</div>
+                          <div className="text-stone-200 font-mono">
+                            {new Date(joinedAtStr).toLocaleDateString('ja-JP', { year: 'numeric', month: 'short', day: 'numeric' })}
+                          </div>
+                        </div>
+                      )}
+                      {premiumSinceStr && (
+                        <div className="col-span-2 p-2 rounded-lg bg-fuchsia-950/20 border border-fuchsia-800/40 text-fuchsia-300">
+                          🚀 サーバーブースト開始: {new Date(premiumSinceStr).toLocaleDateString('ja-JP')}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* アクション: @メンションする */}
+                  <div className="pt-2 border-t border-stone-800/80 flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const insert = `@${displayName} `;
+                        setChatInput(prev => (prev && !prev.endsWith(' ') ? `${prev} ${insert}` : `${prev}${insert}`));
+                        setSelectedProfileMember(null);
+                        if (window.innerWidth < 1024) setIsMembersCollapsed(true);
+                        requestAnimationFrame(() => chatInputRef.current?.focus());
+                      }}
+                      className="w-full py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs transition flex items-center justify-center gap-1.5"
+                    >
+                      <MessageSquare className="w-3.5 h-3.5" /> @{displayName} をメンションする
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* 専用コードゾーン作成モーダル (何個でも作成可能) */}
+      {showCodeZoneModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setShowCodeZoneModal(false)}>
           <div onClick={e => e.stopPropagation()} className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
             <div className="flex items-center justify-between border-b border-stone-800 pb-2.5">
               <div className="font-bold text-white text-sm flex items-center gap-2">
-                <Code className="w-4 h-4 text-amber-400" /> 専用コードゾーンの作成・割り当て
+                <Code className="w-4 h-4 text-amber-400" /> 専用コードゾーンの作成
               </div>
               <button onClick={() => setShowCodeZoneModal(false)} className="text-stone-500 hover:text-white">
                 <X className="w-4 h-4" />
@@ -9347,26 +9903,63 @@ export default function App() {
             </div>
 
             <p className="text-stone-400 leading-relaxed">
-              ユーザーを選択して「作成」を押すと、そのユーザー専用のMonacoエディタ（コードゾーン）が作成されます。
+              専用のMonacoエディタ（コードゾーン）を何個でも追加できます。用途や言語ごとに分けて作成できます。
             </p>
 
             <div className="space-y-3">
+              {currentUser.role === 'admin' && (
+                <div>
+                  <label className="block text-stone-300 font-bold mb-1.5">割り当て先ユーザー</label>
+                  <select
+                    value={selectedUserForCodeZone}
+                    onChange={e => setSelectedUserForCodeZone(e.target.value === '' ? '' : Number(e.target.value))}
+                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                  >
+                    <option value="">ユーザーを選択してください</option>
+                    {onlineUsers.map(u => {
+                      const zoneCount = memoSlots.filter(s => s.slot_index >= 11 && s.assigned_user_id === u.id).length;
+                      return (
+                        <option key={u.id} value={u.id}>
+                          {u.username} {zoneCount > 0 ? `(現在 ${zoneCount} 個)` : ''}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+              )}
+
               <div>
-                <label className="block text-stone-300 font-bold mb-1.5">割り当て先ユーザー</label>
+                <label className="block text-stone-300 font-bold mb-1.5">タイトル (任意)</label>
+                <input
+                  type="text"
+                  value={newCodeZoneTitle}
+                  onChange={e => setNewCodeZoneTitle(e.target.value)}
+                  placeholder="例: Webサイト試作 / Python練習"
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white placeholder-stone-600 focus:outline-none focus:border-amber-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-stone-300 font-bold mb-1.5">初期言語</label>
                 <select
-                  value={selectedUserForCodeZone}
-                  onChange={e => setSelectedUserForCodeZone(e.target.value === '' ? '' : Number(e.target.value))}
+                  value={newCodeZoneLang}
+                  onChange={e => setNewCodeZoneLang(e.target.value)}
                   className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
                 >
-                  <option value="">ユーザーを選択してください</option>
-                  {onlineUsers.map(u => {
-                    const hasZone = memoSlots.some(s => s.slot_index >= 11 && s.assigned_user_id === u.id);
-                    return (
-                      <option key={u.id} value={u.id} disabled={hasZone}>
-                        {u.username} {hasZone ? '(作成済み)' : ''}
-                      </option>
-                    );
-                  })}
+                  <option value="typescript">TypeScript</option>
+                  <option value="javascript">JavaScript</option>
+                  <option value="html">HTML</option>
+                  <option value="css">CSS</option>
+                  <option value="python">Python</option>
+                  <option value="json">JSON</option>
+                  <option value="markdown">Markdown</option>
+                  <option value="sql">SQL</option>
+                  <option value="cpp">C++</option>
+                  <option value="csharp">C#</option>
+                  <option value="rust">Rust</option>
+                  <option value="go">Go</option>
+                  <option value="php">PHP</option>
+                  <option value="shell">Shell</option>
                 </select>
               </div>
 
@@ -9380,22 +9973,31 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  disabled={selectedUserForCodeZone === ''}
+                  disabled={currentUser.role === 'admin' && selectedUserForCodeZone === ''}
                   onClick={async () => {
-                    if (selectedUserForCodeZone === '') return;
+                    const targetId = currentUser.role === 'admin' ? selectedUserForCodeZone : currentUser.id;
+                    if (!targetId) return;
                     try {
                       const res = await safeFetch('/api/notes/code-zones', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                        body: JSON.stringify({ targetUserId: selectedUserForCodeZone }),
+                        body: JSON.stringify({
+                          targetUserId: targetId,
+                          title: newCodeZoneTitle.trim() || undefined,
+                          language: newCodeZoneLang,
+                        }),
                       });
                       if (!res.ok) {
                         const err = await res.json().catch(() => ({}));
                         throw new Error(err.error || '作成失敗');
                       }
+                      const created = await res.json();
                       toast('専用コードゾーンを作成しました', { kind: 'success' });
                       setShowCodeZoneModal(false);
-                      setSelectedUserForCodeZone('');
+                      setNewCodeZoneTitle('');
+                      if (created?.slot_index) {
+                        selectMemoSlot(created);
+                      }
                     } catch (err: any) {
                       toast(`エラー: ${err.message}`, { kind: 'error' });
                     }
@@ -9613,7 +10215,7 @@ export default function App() {
                   )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-stone-400" title="短縮・S短でも教科は同じで、時刻だけが変わります">時刻を表示する時程:</span>
+                  <span className="text-stone-400" title="短縮・S短は時刻のみ変わり、特別時程は一時的な時間割・時限数(2時間授業など)を設定できます">編集・表示する時程:</span>
                   {(Object.keys(SCHEDULE_LABELS) as ScheduleType[]).map(t => (
                     <button
                       key={t}
@@ -9638,6 +10240,21 @@ export default function App() {
                     <CalendarClock className="w-3.5 h-3.5" /> {isEditingPeriods ? '閉じる' : '時刻を編集'}
                   </button>
                 </div>
+
+                {scheduleType === 'special' && (
+                  <div className="p-2.5 rounded-xl bg-indigo-950/30 border border-indigo-800/50 flex flex-wrap items-center justify-between gap-2 text-[11px] text-indigo-200">
+                    <div>
+                      <span className="font-bold text-indigo-300">特別時程モード:</span> 2時間授業の日・行事・学活など、一時的な時間割と授業時間数 (1〜6限) を通常の時間割とは別に編集できます。
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleCopyNormalToSpecial}
+                      className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-200 font-bold shrink-0 transition"
+                    >
+                      通常時間割からコピー
+                    </button>
+                  </div>
+                )}
 
                 {isEditingPeriods && periodDraft && (
                   <div className="p-3 rounded-xl bg-[#16181D] border border-stone-800 space-y-2 anim-fade">
@@ -9682,15 +10299,22 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <button
-                                onClick={() => handleToggleDayPeriods(day)}
-                                title="5限 / 6限 を切り替え"
-                                className={`mt-0.5 px-1.5 rounded text-[10px] font-bold border ${
-                                  periodCountFor(ttConfig, day) === 5 ? 'bg-sky-500/15 border-sky-500/40 text-sky-300' : 'border-stone-700 text-stone-400 hover:text-white'
+                              <select
+                                value={periodCountFor(ttConfig, day, scheduleType)}
+                                onChange={e => handleToggleDayPeriods(day, Number(e.target.value))}
+                                title="その曜日の授業時間数 (1〜6限) を変更"
+                                className={`mt-0.5 px-1 py-0.5 rounded text-[10px] font-bold border bg-[#111214] cursor-pointer focus:outline-none ${
+                                  periodCountFor(ttConfig, day, scheduleType) < 6
+                                    ? 'border-sky-500/40 text-sky-300'
+                                    : 'border-stone-700 text-stone-400 hover:text-white'
                                 }`}
                               >
-                                {periodCountFor(ttConfig, day)}限まで
-                              </button>
+                                {[1, 2, 3, 4, 5, 6].map(cnt => (
+                                  <option key={cnt} value={cnt}>
+                                    {cnt}限まで
+                                  </option>
+                                ))}
+                              </select>
                             </th>
                           );
                         })}
@@ -9707,7 +10331,7 @@ export default function App() {
                               {pt && <div className="text-[10px] text-stone-500 tabular-nums">{pt.start}〜{pt.end}</div>}
                             </td>
                             {[1, 2, 3, 4, 5].map(day => {
-                              const off = period > periodCountFor(ttConfig, day);
+                              const off = period > periodCountFor(ttConfig, day, scheduleType);
                               const existing = timetables.find(tt => tt.day_of_week === day && tt.period === period);
                               const isSelected = selectedTtCell?.day === day && selectedTtCell?.period === period;
                               if (off) {
@@ -9745,7 +10369,7 @@ export default function App() {
                         );
                       })}
                       {fixedRow('帰りの会', day => {
-                        const c = closingFor(editDef, periodCountFor(ttConfig, day));
+                        const c = closingFor(editDef, periodCountFor(ttConfig, day, scheduleType));
                         return <span className="tabular-nums">{c.start}〜{c.end}</span>;
                       })}
                     </tbody>

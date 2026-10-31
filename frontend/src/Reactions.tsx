@@ -16,24 +16,42 @@ export function renderReactionEmoji(emoji: string, customEmojis?: Map<string, st
 
 function ReactionChip({
   emoji,
-  names,
+  userIds,
+  nameOf,
   count,
   mine,
   customEmojis,
   onToggle,
+  onResolveUnknown,
 }: {
   emoji: string;
-  names: string[];
+  userIds: number[];
+  nameOf: (userId: number) => string | undefined;
   count: number;
   mine: boolean;
   customEmojis?: Map<string, string>;
   onToggle: () => void;
+  onResolveUnknown?: () => void;
 }) {
   const [showModal, setShowModal] = useState(false);
   const [peek, setPeek] = useState(false);
   const timer = useRef<any>(null);
   const longPressed = useRef(false);
   const rootRef = useRef<HTMLSpanElement>(null);
+
+  const items = userIds.map(id => ({
+    id,
+    name: nameOf(id),
+    isDiscord: id < 0,
+  }));
+  const names = items.map(it => it.name).filter((n): n is string => Boolean(n));
+  const unknown = count - names.length;
+
+  useEffect(() => {
+    if (unknown > 0 && onResolveUnknown) {
+      onResolveUnknown();
+    }
+  }, [unknown, onResolveUnknown]);
 
   // 長押しで開いた一覧は、どこかを触ると閉じる
   useEffect(() => {
@@ -52,8 +70,6 @@ function ReactionChip({
   }, [peek, showModal]);
   useEffect(() => () => clearTimeout(timer.current), []);
 
-  const unknown = count - names.length;
-
   return (
     <span ref={rootRef} className="relative group/rx inline-block">
       <button
@@ -68,6 +84,7 @@ function ReactionChip({
         }}
         onContextMenu={e => {
           e.preventDefault();
+          if (unknown > 0 && onResolveUnknown) onResolveUnknown();
           setShowModal(true);
         }}
         onTouchStart={() => {
@@ -75,6 +92,7 @@ function ReactionChip({
           clearTimeout(timer.current);
           timer.current = setTimeout(() => {
             longPressed.current = true;
+            if (unknown > 0 && onResolveUnknown) onResolveUnknown();
             setShowModal(true);
             navigator.vibrate?.(10);
           }, LONG_PRESS_MS);
@@ -95,7 +113,7 @@ function ReactionChip({
       {(showModal || peek) && (
         <div
           role="dialog"
-          className="absolute bottom-full left-0 mb-1.5 z-40 w-max min-w-[12rem] max-w-[18rem] max-h-48 overflow-y-auto p-2.5 rounded-xl bg-[#16181D] border border-stone-700 shadow-2xl text-xs text-stone-200 anim-pop space-y-1.5"
+          className="absolute bottom-full left-0 mb-1.5 z-40 w-max min-w-[13rem] max-w-[19rem] max-h-52 overflow-y-auto p-2.5 rounded-xl bg-[#16181D] border border-stone-700 shadow-2xl text-xs text-stone-200 anim-pop space-y-1.5"
         >
           <div className="flex items-center justify-between pb-1 border-b border-stone-800 text-[11px] font-bold text-stone-400">
             <span className="flex items-center gap-1.5">
@@ -114,17 +132,21 @@ function ReactionChip({
             </button>
           </div>
           <div className="space-y-1">
-            {names.map((name, idx) => (
-              <div key={idx} className="flex items-center gap-1.5 py-0.5 px-1 rounded hover:bg-stone-800/50">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
-                <span className="truncate text-stone-200 font-medium">{name}</span>
+            {items.map((it, idx) => (
+              <div key={idx} className="flex items-center justify-between gap-2 py-0.5 px-1 rounded hover:bg-stone-800/50">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${it.isDiscord ? 'bg-[#5865F2]' : 'bg-amber-400'}`} />
+                  <span className="truncate text-stone-200 font-medium">
+                    {it.name || (it.isDiscord ? `Discord メンバー (#${Math.abs(it.id) % 10000})` : `メンバー (#${it.id})`)}
+                  </span>
+                </div>
+                {it.isDiscord && (
+                  <span className="text-[9px] px-1 py-0.2 rounded bg-[#5865F2]/20 text-indigo-300 border border-[#5865F2]/30 shrink-0">
+                    Discord
+                  </span>
+                )}
               </div>
             ))}
-            {unknown > 0 && (
-              <div className="text-[10px] text-stone-500 px-1 italic">
-                ほか {unknown} 人 (Discord / 過去のメンバー)
-              </div>
-            )}
           </div>
         </div>
       )}
@@ -133,13 +155,15 @@ function ReactionChip({
       {!showModal && !peek && (
         <span
           role="tooltip"
-          className="hidden group-hover/rx:block absolute bottom-full left-0 mb-1.5 z-30 w-max max-w-[16rem] px-2.5 py-1 rounded-lg bg-[#16181D] border border-stone-700 shadow-xl text-[11px] text-stone-200 leading-relaxed pointer-events-none anim-fade"
+          className="hidden group-hover/rx:block absolute bottom-full left-0 mb-1.5 z-30 w-max max-w-[18rem] px-2.5 py-1.5 rounded-lg bg-[#16181D] border border-stone-700 shadow-xl text-[11px] text-stone-200 leading-relaxed pointer-events-none anim-fade"
         >
           <span className="mr-1 align-middle">{renderReactionEmoji(emoji, customEmojis, 'w-3.5 h-3.5')}</span>
           <b className="text-white">
-            {names.length > 0 ? names.slice(0, 3).join('、') + (names.length > 3 || unknown > 0 ? ` ほか${names.length - 3 + unknown}人` : '') : `${count}人`}
+            {names.length > 0
+              ? names.slice(0, 6).join('、') + (names.length > 6 || unknown > 0 ? ` ほか${Math.max(0, names.length - 6) + unknown}人` : '')
+              : `${count}人`}
           </b>
-          <span className="text-stone-400 text-[10px] ml-1">(右クリックで全員表示)</span>
+          <span className="text-stone-400 text-[10px] ml-1">(右クリックで一覧)</span>
         </span>
       )}
     </span>
@@ -152,12 +176,14 @@ export function ReactionBar({
   nameOf,
   customEmojis,
   onToggle,
+  onResolveUnknown,
 }: {
   reactions: Record<string, number[]>;
   meId?: number;
   nameOf: (userId: number) => string | undefined;
   customEmojis?: Map<string, string>;
   onToggle: (emoji: string) => void;
+  onResolveUnknown?: () => void;
 }) {
   const entries = Object.entries(reactions).filter(([, ids]) => ids.length > 0);
   if (entries.length === 0) return null;
@@ -167,11 +193,13 @@ export function ReactionBar({
         <ReactionChip
           key={emoji}
           emoji={emoji}
-          names={userIds.map(id => nameOf(id)).filter((n): n is string => Boolean(n))}
+          userIds={userIds.map(Number)}
+          nameOf={nameOf}
           count={userIds.length}
           mine={meId !== undefined && userIds.includes(meId)}
           customEmojis={customEmojis}
           onToggle={() => onToggle(emoji)}
+          onResolveUnknown={onResolveUnknown}
         />
       ))}
     </div>
