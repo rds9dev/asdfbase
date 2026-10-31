@@ -7645,10 +7645,80 @@ export default function App() {
                   <div className="max-w-3xl mx-auto space-y-6">
                     <div className="border-b border-stone-800/80 pb-4">
                       <div className="flex items-center gap-2 mb-1">
-                        <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-xs font-mono font-bold border border-amber-500/40">v2.5.0</span>
-                        <h2 className="text-xl sm:text-2xl font-bold font-['Space_Grotesk'] text-white">大型アップデート パッチノート</h2>
+                        <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-xs font-mono font-bold border border-amber-500/40">v2.6.0</span>
+                        <h2 className="text-xl sm:text-2xl font-bold font-['Space_Grotesk'] text-white">最新アップデート パッチノート</h2>
                       </div>
-                      <p className="text-xs text-stone-400">Discord連携の全面刷新・リアクションの改善・AI機能強化・メモと時程の拡充</p>
+                      <p className="text-xs text-stone-400">メンバープロフィール詳細・ボードの元に戻す/やり直し・特別時程対応・コードゾーンDLなど14項目の機能追加＆改善</p>
+                    </div>
+
+                    {/* v2.6.0: 今回の最新アップデート */}
+                    <div className="p-4 rounded-2xl bg-amber-500/5 border border-amber-500/30 space-y-3">
+                      <div className="flex items-center gap-2 text-sm font-bold text-amber-400">
+                        <Sparkles className="w-4 h-4" />
+                        <span>v2.6.0 アップデート内容 (最新)</span>
+                      </div>
+                      <ul className="space-y-2 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
+                        <li>
+                          <b>メンバープロフィール・Bio・ロール確認モーダル</b>:
+                          メンバー一覧のユーザー（Discord / asdfbase）をクリックすると、Discord風のプロフィールモーダルが開き、バナー色、アバター、所有ロール一覧（各ロールカラー付き）、接続端末（PC/スマホ/Web）、カスタムステータス・アクティビティ、VC接続状況、アカウント作成日、サーバー参加日を確認し、ワンクリックでメンションできるようになりました。
+                        </li>
+                        <li>
+                          <b>ホワイトボードの元に戻す (Undo)・やり直し (Redo) & 1:1キャンバス</b>:
+                          描いた線やテキストをツールバーボタンまたは <kbd className="px-1.5 py-0.5 rounded bg-stone-800 border border-stone-700 text-[10px] font-mono">Ctrl + Z</kbd> / <kbd className="px-1.5 py-0.5 rounded bg-stone-800 border border-stone-700 text-[10px] font-mono">Ctrl + Y</kbd> で取り消し・再適用できるようになりました。キャンバスの余白計算を改善し、画面横幅いっぱいに描画可能で描画位置も正確に1:1で一致するようになりました。
+                        </li>
+                        <li>
+                          <b>特別時程のバリエーション対応（2時間授業等）& 通常時間割からのコピー</b>:
+                          2時間授業や行事・学活などに対応するため、各曜日の授業時間数（1〜6限）を自由に切り替えられる専用の特別時程（special）時間割を新設。「通常時間割からコピー」ボタンでワンクリックで基本の時間割を複製して手軽に編集できるようになりました。ヘッダーのバッジも特別時程時は「特別」と表示されます。
+                        </li>
+                        <li>
+                          <b>ヘルプ画面でその場でAIに質問・回答表示</b>:
+                          AIタブに画面遷移することなく、ヘルプタブ内の入力欄から直接アプリの使い方や機能について質問でき、画面内にインラインで回答が表示されるようになりました。
+                        </li>
+                        <li>
+                          <b>コードゾーンの無制限作成 & 言語別ファイルダウンロード</b>:
+                          1人あたりのコードゾーン作成数制限を撤廃し、用途や言語ごとに何個でも作成可能になりました。タイトルや言語の事前指定にも対応し、エディタツールバーの「DL」ボタンから選択言語に応じた拡張子（<code>.html</code>, <code>.ts</code>, <code>.py</code> など）でファイルとして直接ダウンロードできるようになりました。
+                        </li>
+                        <li>
+                          <b>リアクションの名前解決（「ほか N 人」の解消）</b>:
+                          リアクションチップのホバー・クリック時に、Discord側のメンバーやサーバー参加者の表示名が正しく一覧表示されるようになりました。
+                        </li>
+                        <li>
+                          <b>絵文字の拡大表示（ジャンボ絵文字）</b>:
+                          絵文字のみのメッセージや <code>:melting_face:</code>・<code>:swim:</code> 等のショートコード、Unicode絵文字が特大サイズで大きく表示されるようになりました。
+                        </li>
+                        <li>
+                          <b>AIストリーミングの滑らかなアニメーション & 完了時の表示クリア</b>:
+                          AI回答中の文字出力がガタつかず滑らかに流れるタイピングアニメーションを導入し、「思考中・ツールを実行中…」が完了後に残ってしまう問題を解消しました。
+                        </li>
+                        <li>
+                          <b>Botメッセージへの「BOT」バッジ表示</b>:
+                          Discord Botからのメッセージに、Discordアイコンの横に紫色の「BOT」バッジが表示されるようになりました。
+                        </li>
+                        <li>
+                          <b>AIチャットの履歴削除 ＝ セッション完全削除</b>:
+                          履歴削除操作で現在の会話セッションを完全にリセット・削除するように統一しました。
+                        </li>
+                        <li>
+                          <b>Markdown目次内アンカーリンクのジャンプ後の巻き戻り防止</b>:
+                          目次から見出しへ飛んだ際にエディタ側のスクロール同期で元の位置に引き戻されてしまう挙動を修正しました。
+                        </li>
+                        <li>
+                          <b>Webhookメッセージ編集時の再送信</b>:
+                          編集時に古いメッセージを削除した上で新しい内容を送信し、Discord側にも確実に編集が反映されるようになりました。
+                        </li>
+                        <li>
+                          <b>asdfbaseメンバー一覧の正確化</b>:
+                          Discord疑似ユーザーが asdfbase メンバー一覧に混ざって表示されないようフィルタリングを分離しました。
+                        </li>
+                      </ul>
+                    </div>
+
+                    {/* 過去バージョン (v2.5.0) */}
+                    <div className="border-t border-stone-800/80 pt-4">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="px-2 py-0.5 rounded-full bg-stone-800 text-stone-300 text-xs font-mono font-bold border border-stone-700">v2.5.0</span>
+                        <h3 className="text-base font-bold text-stone-300">前回アップデート</h3>
+                      </div>
                     </div>
 
                     {/* 1. Discord連携・メッセージ送受信 */}
