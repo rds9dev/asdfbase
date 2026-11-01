@@ -783,13 +783,15 @@ async function syncDiscordHistory(opts) {
     // 古いメッセージを同期しないよう、直近指定時間以内のみを対象にする (デフォルト2時間)
     const maxAgeHours = opts?.maxAgeHours ?? 2;
     const oldestAllowedTime = Date.now() - maxAgeHours * 60 * 60 * 1000;
-    const fetchLimit = Math.min(Math.max(opts?.limit || 20, 5), 50);
+    const fetchLimit = Math.min(Math.max(opts?.limit || 20, 5), 30);
     let syncedMessages = 0;
     let checkedChannels = 0;
     for (const [discordChannelId, targets] of byDiscordCh.entries()) {
         try {
             const ch = (await client.channels.fetch(discordChannelId).catch(() => null));
             if (!ch || !('messages' in ch) || !isGuildAllowed(ch.guildId))
+                continue;
+            if (opts?.guildId && ch.guildId && ch.guildId !== opts.guildId)
                 continue;
             checkedChannels++;
             const fetched = await ch.messages.fetch({ limit: fetchLimit }).catch(() => null);
@@ -810,6 +812,8 @@ async function syncDiscordHistory(opts) {
                 const added = await processDiscordMessage(msg, targets, true);
                 syncedMessages += added;
             }
+            // Discord API レートリミット & サーバー負荷緩和のための微小ウェイト
+            await new Promise(r => setTimeout(r, 60));
         }
         catch (err) {
             console.warn(`[discord] syncDiscordHistory failed for ${discordChannelId}:`, err.message);
@@ -838,7 +842,7 @@ async function handleDiscordEdit(msg) {
     await deps.ingestEdit(full.id, text);
 }
 // asdfbase のメッセージを連携先の Discord チャンネルへ送信 (Webhook によるアイコン・名前直接反映)。送った Discord メッセージを返す (空なら未送信)
-async function relayToDiscordBot(asdfChannelId, username, content, replyTargetDiscordMessageId, avatarUrl) {
+async function relayToDiscordBot(asdfChannelId, username, content, replyTargetDiscordMessageId, avatarUrl, replyQuote) {
     if (!client || !connected || !deps)
         return [];
     const targets = (await getBindings()).filter(b => b.asdfChannelId === asdfChannelId);
@@ -864,13 +868,14 @@ async function relayToDiscordBot(asdfChannelId, username, content, replyTargetDi
                 continue;
             const guild = ch.guild;
             const mentionResolvedText = await resolveDiscordMentions(guild, isVideoMsg ? VIDEO_NOTICE : text);
-            const body = mentionResolvedText.slice(0, 2000);
+            const body = mentionResolvedText.slice(0, 1900);
+            const fullContent = (replyQuote ? `${replyQuote}${body}` : body) || (files.length > 0 ? '' : ' ');
             const webhook = await getOrCreateWebhook(ch);
             if (webhook) {
                 const payload = {
                     username: username.slice(0, 80),
                     avatarURL: resolvedAvatarUrl,
-                    content: body || (files.length > 0 ? '' : ' '),
+                    content: fullContent.slice(0, 2000),
                     files: isVideoMsg ? [] : files,
                     allowedMentions: { parse: ['users', 'roles', 'everyone'] },
                 };
@@ -884,7 +889,7 @@ async function relayToDiscordBot(asdfChannelId, username, content, replyTargetDi
             // Webhook が使えない場合のフォールバック (Bot送信)
             if ('send' in ch) {
                 const payload = {
-                    content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000),
+                    content: `**${username}**${fullContent ? `: ${fullContent}` : ''}`.slice(0, 2000),
                     files: isVideoMsg ? [] : files,
                     allowedMentions: { parse: ['users', 'roles', 'everyone'] },
                 };
@@ -995,8 +1000,40 @@ async function editRelayedOnDiscord(links, username, content, avatarUrl) {
             const ch = (await client.channels.fetch(l.discordChannelId));
             if (!ch || !isGuildAllowed(ch.guildId))
                 continue;
+            const guild = ch.guild;
+            const mentionResolvedText = await resolveDiscordMentions(guild, isVideoMsg ? VIDEO_NOTICE : text);
+            const body = mentionResolvedText.slice(0, 2000);
             const webhook = await getOrCreateWebhook(ch);
-            // 1. 元メッセージを削除
+            // 1. Webhook でその場編集を試みる (新規再投稿による順序狂い・スレッド破壊を防止)
+            if (webhook) {
+                try {
+                    const payload = {
+                        content: body || (files.length > 0 ? '' : ' '),
+                        files: isVideoMsg ? [] : files,
+                        allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+                    };
+                    await webhook.editMessage(l.discordMessageId, payload);
+                    ourWebhookIds.add(webhook.id);
+                    // メッセージIDはそのまま維持
+                    continue;
+                }
+                catch (err) {
+                    console.warn(`[discord] webhook.editMessage failed for ${l.discordMessageId}, trying bot edit/delete fallback:`, err.message);
+                }
+            }
+            // 2. 通常Botメッセージとして編集を試みる
+            if ('messages' in ch) {
+                const oldMsg = await ch.messages.fetch(l.discordMessageId).catch(() => null);
+                if (oldMsg && oldMsg.editable) {
+                    await oldMsg.edit({
+                        content: `**${username}**${body ? `: ${body}` : ''}`.slice(0, 2000),
+                        files: isVideoMsg ? [] : files,
+                        allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+                    });
+                    continue;
+                }
+            }
+            // 3. 編集がどうしてもできない場合のみ削除して再送信フォールバック
             let deletedOld = false;
             if (webhook) {
                 try {
@@ -1011,10 +1048,6 @@ async function editRelayedOnDiscord(links, username, content, avatarUrl) {
                     await oldMsg.delete().catch(() => { });
                 }
             }
-            // 2. 新しいメッセージを送信
-            const guild = ch.guild;
-            const mentionResolvedText = await resolveDiscordMentions(guild, isVideoMsg ? VIDEO_NOTICE : text);
-            const body = mentionResolvedText.slice(0, 2000);
             if (webhook) {
                 const payload = {
                     username: username.slice(0, 80),

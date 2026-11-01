@@ -4,6 +4,8 @@ import {
   VolumeX,
   MicOff,
   Monitor,
+  Video,
+  Tv,
   Search,
   Edit3,
   X,
@@ -447,6 +449,10 @@ export default function App() {
   const initialConnectionGraceRef = useRef<number>(Date.now() + 4000);
   const lastAiToastTimeRef = useRef<number>(0);
   const [showRoleManagerModal, setShowRoleManagerModal] = useState<boolean>(false);
+  const [selectedRoleManagerId, setSelectedRoleManagerId] = useState<string>('member');
+  const [roleManagerTab, setRoleManagerTab] = useState<'display' | 'permissions' | 'members'>('display');
+  const [roleMemberSearch, setRoleMemberSearch] = useState<string>('');
+  const [isCreatingRole, setIsCreatingRole] = useState<boolean>(false);
   const [newRoleIdInput, setNewRoleIdInput] = useState<string>('');
   const [newRoleNameInput, setNewRoleNameInput] = useState<string>('');
   const [newRoleColorInput, setNewRoleColorInput] = useState<string>('#10b981');
@@ -1145,10 +1151,10 @@ export default function App() {
     } else if (isActiveChannel) {
       setMessages(prev => {
         const next = mergeIncomingMessage(prev, newMsg);
-        // 最下部を見ている間は、画面に持つメッセージを直近400件に抑える (上へスクロールすれば再取得)
-        if (next.length > 500 && isNearBottomRef.current) {
+        // 最下部を見ている間は、画面に持つメッセージを直近100件に抑えてDOMの肥大化を防ぐ (上へスクロールすれば再取得)
+        if (next.length > 150 && isNearBottomRef.current) {
           setHasMoreMessages(true);
-          return next.slice(-400);
+          return next.slice(-100);
         }
         return next;
       });
@@ -1996,8 +2002,8 @@ export default function App() {
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     isNearBottomRef.current = nearBottom && !hasNewerRef.current;
     if (nearBottom && newBelowCount > 0 && !hasNewerMessages) setNewBelowCount(0);
-    // 上端付近で自動的に過去ログ読み込み
-    if (el.scrollTop < 80 && hasMoreMessages && !isLoadingMoreMessages && !chatSearchQuery) {
+    // 最上端付近での過去ログ読み込み (過剰フェッチ・スクロール時の急激な雪だるまロードを防止)
+    if (el.scrollTop < 20 && hasMoreMessages && !isLoadingMoreMessages && !chatSearchQuery) {
       handleLoadMoreMessages();
     }
     // 過去の位置を見ている時は、下端で新しい側を読み込む
@@ -3270,7 +3276,18 @@ export default function App() {
   const handleDeleteRoleDef = async (roleId: string) => {
     try {
       await saveRoleDefsToServer(roleDefs.filter(r => r.id !== roleId || r.system));
+      if (selectedRoleManagerId === roleId) setSelectedRoleManagerId('member');
       toast('ロールを削除しました', { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message, { kind: 'error' });
+    }
+  };
+
+  const handleUpdateRoleDef = async (roleId: string, patch: Partial<{ name: string; color: string; permissions: string[] }>) => {
+    try {
+      const nextRoles = roleDefs.map(r => (r.id === roleId ? { ...r, ...patch } : r));
+      await saveRoleDefsToServer(nextRoles);
+      toast('ロール設定を保存しました', { kind: 'success' });
     } catch (err: any) {
       toast(err.message, { kind: 'error' });
     }
@@ -5167,6 +5184,18 @@ export default function App() {
                     <div className="flex items-center gap-0.5 shrink-0">
                       <button
                         type="button"
+                        onClick={handleMarkAllRead}
+                        className={`p-1 rounded transition ${
+                          totalUnread > 0
+                            ? 'text-amber-400 hover:text-amber-300 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30'
+                            : 'text-stone-500 hover:text-stone-300 hover:bg-stone-800'
+                        }`}
+                        title="すべてのチャンネルを既読にする (Shift + Esc)"
+                      >
+                        <CheckCheck className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => handleSyncDiscordHistory(selectedServer ? { guildId: selectedServer.id } : undefined)}
                         disabled={isSyncingDiscordHistory}
                         className="p-1 hover:text-indigo-300 rounded text-stone-400 hover:bg-stone-800 disabled:opacity-40"
@@ -5375,53 +5404,131 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* ボイスチャンネル (VC): チャンネル一覧の一番下に配置 */}
+                    {/* ボイスチャンネル (VC): Discord完全再現のチャンネルツリー表示 */}
                     {(() => {
-                      const relevantVcs = discordVcs.filter(vc => {
-                        if (!selectedServer) return true;
-                        return vc.guildName === selectedServer.name || (selectedServer.voiceChannels && selectedServer.voiceChannels.some((v: any) => v.id === vc.channelId));
-                      });
-                      if (relevantVcs.length === 0) return null;
+                      type VcItem = { id: string; name: string; members: any[] };
+                      const vcList: VcItem[] = [];
+
+                      if (selectedServer && Array.isArray(selectedServer.voiceChannels) && selectedServer.voiceChannels.length > 0) {
+                        for (const svc of selectedServer.voiceChannels) {
+                          const active = discordVcs.find(d => String(d.channelId) === String(svc.id));
+                          vcList.push({
+                            id: svc.id,
+                            name: svc.name,
+                            members: active ? active.members : (svc.members || []),
+                          });
+                        }
+                      } else {
+                        // サーバー未選択時は現在アクティブなVCを抽出
+                        for (const avc of discordVcs) {
+                          if (selectedServer && avc.guildName !== selectedServer.name) continue;
+                          vcList.push({
+                            id: avc.channelId,
+                            name: avc.channelName,
+                            members: avc.members || [],
+                          });
+                        }
+                      }
+
+                      if (vcList.length === 0) return null;
+                      const totalMembers = vcList.reduce((acc, v) => acc + (v.members?.length || 0), 0);
+
                       return (
-                        <div className="pt-2 border-t border-stone-800/60 space-y-1">
-                          <div className="text-[10px] uppercase tracking-wider text-stone-500 font-extrabold px-1.5 flex items-center justify-between">
+                        <div className="pt-2.5 mt-2 border-t border-stone-800/80 space-y-1">
+                          <div className="text-[10px] uppercase tracking-wider text-stone-400 font-extrabold px-1.5 py-0.5 flex items-center justify-between">
                             <span className="flex items-center gap-1.5">
-                              <Volume2 className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                              <Volume2 className="w-3.5 h-3.5 text-stone-400" />
                               <span>ボイスチャンネル</span>
                             </span>
-                            <span className="text-[9px] text-emerald-400 font-bold bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/20">
-                              {relevantVcs.reduce((s, v) => s + (v.members?.length || 0), 0)}人
-                            </span>
+                            {totalMembers > 0 && (
+                              <span className="text-[9px] text-emerald-300 font-bold bg-emerald-500/20 px-1.5 py-0.2 rounded-full border border-emerald-500/30">
+                                {totalMembers}人
+                              </span>
+                            )}
                           </div>
-                          <div className="space-y-1">
-                            {relevantVcs.map(vc => (
-                              <div key={vc.channelId} className="p-2 rounded-lg bg-[#14161C] border border-stone-800/60 space-y-1.5">
-                                <div className="text-xs font-bold text-stone-300 flex items-center gap-1.5 truncate">
-                                  <Radio className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                                  <span className="truncate">{vc.channelName}</span>
+
+                          <div className="space-y-0.5">
+                            {vcList.map(vc => {
+                              const hasMembers = Array.isArray(vc.members) && vc.members.length > 0;
+                              return (
+                                <div key={vc.id} className="rounded-lg overflow-hidden group">
+                                  {/* チャンネル行 */}
+                                  <div
+                                    className={`w-full px-2 py-1.5 rounded-lg flex items-center justify-between text-left transition select-none ${
+                                      hasMembers
+                                        ? 'text-stone-200 bg-stone-900/60 font-semibold'
+                                        : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/50'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <Volume2 className={`w-4 h-4 shrink-0 ${hasMembers ? 'text-emerald-400' : 'text-stone-500 group-hover:text-stone-400'}`} />
+                                      <span className="text-xs truncate">{vc.name}</span>
+                                    </div>
+                                    {hasMembers && (
+                                      <span className="text-[10px] text-stone-500 shrink-0 font-mono">
+                                        {vc.members.length}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {/* 参加メンバー一覧 (Discord風ツリーインデント) */}
+                                  {hasMembers && (
+                                    <div className="pl-6 pr-1 py-1 space-y-1 border-l-2 border-stone-800 ml-3.5 my-0.5">
+                                      {vc.members.map((m: any) => (
+                                        <div
+                                          key={m.id}
+                                          className="flex items-center justify-between py-1 px-1.5 rounded-md hover:bg-stone-800/60 transition group/member"
+                                        >
+                                          <div className="flex items-center gap-2 min-w-0">
+                                            {m.avatarUrl ? (
+                                              <img
+                                                src={toProxiedMediaUrl(m.avatarUrl, token)}
+                                                alt=""
+                                                className={`w-5 h-5 rounded-full object-cover shrink-0 ${
+                                                  m.speaking ? 'ring-2 ring-emerald-400 ring-offset-1 ring-offset-[#0C0D10]' : ''
+                                                }`}
+                                              />
+                                            ) : (
+                                              <div className={`w-5 h-5 rounded-full bg-stone-800 flex items-center justify-center text-[9px] font-bold text-stone-300 shrink-0 ${
+                                                m.speaking ? 'ring-2 ring-emerald-400 ring-offset-1 ring-offset-[#0C0D10]' : ''
+                                              }`}>
+                                                {String(m.name || '?').slice(0, 1)}
+                                              </div>
+                                            )}
+                                            <span className={`text-[11px] truncate ${m.speaking ? 'text-emerald-300 font-bold' : 'text-stone-300'}`}>
+                                              {m.name}
+                                            </span>
+                                          </div>
+
+                                          <div className="flex items-center gap-1 shrink-0 text-stone-500">
+                                            {m.streaming && (
+                                              <span className="flex items-center gap-0.5 text-[9px] font-bold text-red-400 bg-red-500/15 border border-red-500/30 px-1 py-0.2 rounded" title="画面共有 / 配信中">
+                                                <Tv className="w-2.5 h-2.5" /> LIVE
+                                              </span>
+                                            )}
+                                            {m.video && (
+                                              <span title="カメラON" className="inline-flex">
+                                                <Video className="w-3 h-3 text-emerald-400" />
+                                              </span>
+                                            )}
+                                            {m.muted && (
+                                              <span title="マイクミュート" className="inline-flex">
+                                                <MicOff className="w-3 h-3 text-red-400" />
+                                              </span>
+                                            )}
+                                            {m.deafened && (
+                                              <span title="スピーカーミュート" className="inline-flex">
+                                                <VolumeX className="w-3 h-3 text-red-400" />
+                                              </span>
+                                            )}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
                                 </div>
-                                <div className="flex flex-wrap gap-1 pl-1">
-                                  {vc.members.map((m: any) => (
-                                    <span
-                                      key={m.id}
-                                      className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border ${
-                                        m.speaking
-                                          ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold shadow'
-                                          : 'bg-stone-800/80 border-stone-700/60 text-stone-300'
-                                      }`}
-                                      title={`${m.name}${m.speaking ? ' (マイクON/発話中)' : ' (ミュート)'}`}
-                                    >
-                                      {m.avatarUrl ? (
-                                        <img src={toProxiedMediaUrl(m.avatarUrl, token)} alt="" className="w-3.5 h-3.5 rounded-full object-cover" />
-                                      ) : (
-                                        <span className={`w-1.5 h-1.5 rounded-full ${m.speaking ? 'bg-emerald-400 animate-ping' : 'bg-stone-500'}`} />
-                                      )}
-                                      <span className="max-w-[75px] truncate">{m.name}</span>
-                                    </span>
-                                  ))}
-                                </div>
-                              </div>
-                            ))}
+                              );
+                            })}
                           </div>
                         </div>
                       );
@@ -5516,14 +5623,6 @@ export default function App() {
                       <Search className="w-3.5 h-3.5" />
                     </button>
                   )}
-
-                  <button
-                    onClick={handleMarkAllRead}
-                    className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-amber-400 hover:border-stone-600"
-                    title="すべてのチャンネルを既読にする (Shift + Esc)"
-                  >
-                    <CheckCheck className="w-3.5 h-3.5" />
-                  </button>
 
                   <button
                     onClick={() => setIsMembersCollapsed(!isMembersCollapsed)}
@@ -5741,12 +5840,8 @@ export default function App() {
                                         e.preventDefault();
                                         handleEditMessage(m.id);
                                       }
-                                      if (e.shiftKey && e.key === 'Escape') {
-        e.preventDefault();
-        handleMarkAllReadRef.current?.();
-        return;
-      }
-      if (e.key === 'Escape') {
+                                      if (e.key === 'Escape') {
+                                        e.preventDefault();
                                         e.stopPropagation();
                                         cancelEditing();
                                       }
@@ -8341,12 +8436,12 @@ export default function App() {
                             <Link className="w-3 h-3" /> 簡単チャンネル紐付け・サーバー管理
                           </button>
                           <button
-                            onClick={() => handleSyncDiscordHistory()}
+                            onClick={() => handleSyncDiscordHistory(selectedServer ? { guildId: selectedServer.id } : (discordServers[0] ? { guildId: discordServers[0].id } : undefined))}
                             disabled={isSyncingDiscordHistory}
                             className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 font-bold flex items-center gap-1.5 disabled:opacity-40"
                           >
                             <RefreshCw className={`w-3 h-3 ${isSyncingDiscordHistory ? 'animate-spin' : ''}`} />
-                            {isSyncingDiscordHistory ? '履歴同期中…' : '未取得の過去履歴を同期 (ダウンタイム補完)'}
+                            {isSyncingDiscordHistory ? '履歴同期中…' : `${selectedServer ? selectedServer.name : 'Discord'} の履歴を同期`}
                           </button>
                         </div>
                       </div>
@@ -9098,14 +9193,17 @@ export default function App() {
             <div className="space-y-2.5">
               <div className="flex items-center justify-between">
                 <span className="font-bold text-stone-300">Bot が参加している Discord サーバー ({discordServers.length})</span>
-                <button
-                  onClick={() => handleSyncDiscordHistory()}
-                  disabled={isSyncingDiscordHistory}
-                  className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 font-bold flex items-center gap-1.5 disabled:opacity-40"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingDiscordHistory ? 'animate-spin' : ''}`} />
-                  {isSyncingDiscordHistory ? '過去履歴を取得中…' : 'Botダウンタイム中の未取得履歴を一括取得'}
-                </button>
+                {selectedServer && (
+                  <button
+                    onClick={() => handleSyncDiscordHistory({ guildId: selectedServer.id })}
+                    disabled={isSyncingDiscordHistory}
+                    className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 font-bold flex items-center gap-1.5 disabled:opacity-40"
+                    title={`#${selectedServer.name} の過去履歴を同期`}
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isSyncingDiscordHistory ? 'animate-spin' : ''}`} />
+                    {isSyncingDiscordHistory ? '履歴同期中…' : `${selectedServer.name} の未取得履歴を同期`}
+                  </button>
+                )}
               </div>
               {discordServers.length === 0 ? (
                 <div className="p-4 rounded-xl bg-[#16181D] border border-stone-800 text-stone-500 text-center">
@@ -9139,18 +9237,30 @@ export default function App() {
                           <span>VC接続 {(srv.voiceChannels || []).reduce((acc: number, vc: any) => acc + vc.members.length, 0)}人</span>
                         </div>
                       </div>
-                      {currentUser.role === 'admin' && (
+                      <div className="flex items-center gap-1.5 shrink-0">
                         <button
-                          onClick={() => handleToggleApproveGuild(gid, !srv.approved)}
-                          className={`px-3 py-1.5 rounded-xl border font-bold text-[11px] transition shrink-0 ${
-                            srv.approved
-                              ? 'bg-emerald-950/40 border-emerald-800 text-emerald-300 hover:bg-stone-800'
-                              : 'bg-stone-800 border-stone-700 text-stone-300 hover:border-amber-500/50'
-                          }`}
+                          type="button"
+                          onClick={() => handleSyncDiscordHistory({ guildId: gid })}
+                          disabled={isSyncingDiscordHistory}
+                          className="px-2.5 py-1.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 font-bold text-[11px] transition flex items-center gap-1 disabled:opacity-40"
+                          title="このサーバーの未取得履歴を同期"
                         >
-                          {srv.approved ? '承認済み (解除)' : 'サーバーを承認'}
+                          <RefreshCw className={`w-3 h-3 ${isSyncingDiscordHistory ? 'animate-spin' : ''}`} />
+                          <span>履歴同期</span>
                         </button>
-                      )}
+                        {currentUser.role === 'admin' && (
+                          <button
+                            onClick={() => handleToggleApproveGuild(gid, !srv.approved)}
+                            className={`px-3 py-1.5 rounded-xl border font-bold text-[11px] transition ${
+                              srv.approved
+                                ? 'bg-emerald-950/40 border-emerald-800 text-emerald-300 hover:bg-stone-800'
+                                : 'bg-stone-800 border-stone-700 text-stone-300 hover:border-amber-500/50'
+                            }`}
+                          >
+                            {srv.approved ? '承認済み (解除)' : 'サーバーを承認'}
+                          </button>
+                        )}
+                      </div>
                     </div>
 
                     {/* VC 状況 */}
@@ -9611,118 +9721,424 @@ export default function App() {
         );
       })()}
 
-      {/* ロール管理・メンバー割り当てモーダル (admin限定) */}
-      {showRoleManagerModal && currentUser.role === 'admin' && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setShowRoleManagerModal(false)}>
-          <div onClick={e => e.stopPropagation()} className="w-full max-w-lg max-h-[85vh] overflow-y-auto bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
-            <div className="flex items-center justify-between border-b border-stone-800 pb-2.5">
-              <div className="font-bold text-white text-sm flex items-center gap-2">
-                <Shield className="w-4 h-4 text-amber-400" /> ロール管理・権限割り当て (管理者専用)
-              </div>
-              <button onClick={() => setShowRoleManagerModal(false)} className="text-stone-500 hover:text-white">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+      {/* ロール管理・メンバー割り当てモーダル (admin限定): Discord風2ペイン設定画面 */}
+      {showRoleManagerModal && currentUser.role === 'admin' && (() => {
+        const currentRole = roleDefs.find(r => r.id === selectedRoleManagerId) || roleDefs[0];
+        const currentRoleId = currentRole ? currentRole.id : 'member';
+        const isSystem = Boolean(currentRole?.system);
+        const membersWithRole = onlineUsers.filter(u => {
+          if (currentRoleId === 'admin') return u.role === 'admin';
+          if (currentRoleId === 'member') return true;
+          return Array.isArray(u.custom_roles) && u.custom_roles.includes(currentRoleId);
+        });
 
-            <form onSubmit={handleAddRoleDef} className="p-3.5 rounded-xl bg-[#16181D] border border-stone-800 space-y-2.5">
-              <div className="font-bold text-stone-200">新しいロールを追加</div>
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="text"
-                  placeholder="ロール名 (例: 生徒会 / 放送委員)"
-                  required
-                  value={newRoleNameInput}
-                  onChange={e => setNewRoleNameInput(e.target.value)}
-                  className="flex-1 min-w-[140px] bg-[#111214] border border-stone-800 rounded-xl px-3 py-1.5 text-white focus:outline-none focus:border-amber-500"
-                />
-                <input
-                  type="text"
-                  placeholder="ID (任意: council)"
-                  value={newRoleIdInput}
-                  onChange={e => setNewRoleIdInput(e.target.value)}
-                  className="w-28 bg-[#111214] border border-stone-800 rounded-xl px-2.5 py-1.5 text-white focus:outline-none focus:border-amber-500"
-                />
-                <input
-                  type="color"
-                  value={newRoleColorInput}
-                  onChange={e => setNewRoleColorInput(e.target.value)}
-                  className="w-9 h-8 rounded-lg bg-transparent border border-stone-700 cursor-pointer"
-                  title="ロールの色"
-                />
-                <button type="submit" className="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold">
-                  追加
+        const ROLE_PERMS = [
+          { id: 'view', label: 'チャンネルの閲覧', desc: 'チャンネル一覧の表示および過去メッセージ履歴の閲覧を許可' },
+          { id: 'send', label: 'メッセージの送信', desc: 'テキストチャンネルへの新規メッセージ送信や返信を許可' },
+          { id: 'attach', label: 'ファイルの添付', desc: '画像やファイル、クリップボード画像のアップロードを許可' },
+          { id: 'reactions', label: 'リアクションの追加', desc: 'メッセージへの絵文字リアクションの付与を許可' },
+          { id: 'voice', label: 'ボイスチャット接続', desc: 'ボイスチャンネルへの接続および通話・マイク発言を許可' },
+          { id: 'manage_messages', label: 'メッセージの管理', desc: '他ユーザーのメッセージ削除やピン留め操作を許可' },
+        ];
+
+        return (
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-5 anim-fade" onClick={() => setShowRoleManagerModal(false)}>
+            <div onClick={e => e.stopPropagation()} className="w-full max-w-4xl h-[88vh] bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl text-xs flex flex-col overflow-hidden anim-pop">
+              {/* モーダルヘッダー */}
+              <div className="flex items-center justify-between px-5 py-3.5 border-b border-stone-800 shrink-0 bg-[#0C0D10]">
+                <div className="flex items-center gap-2">
+                  <Shield className="w-4 h-4 text-amber-400" />
+                  <span className="font-bold text-white text-sm">ロール管理・権限設定 (Discord風)</span>
+                </div>
+                <button type="button" onClick={() => setShowRoleManagerModal(false)} className="text-stone-500 hover:text-white transition">
+                  <X className="w-4 h-4" />
                 </button>
               </div>
-            </form>
 
-            <div className="space-y-1.5">
-              <div className="font-bold text-stone-300">登録済みロール一覧</div>
-              {roleDefs.length === 0 ? (
-                <div className="text-stone-500 py-2">カスタムロールはまだありません</div>
-              ) : (
-                <div className="flex flex-wrap gap-1.5">
-                  {roleDefs.map(r => (
-                    <div key={r.id} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#16181D] border border-stone-800">
-                      <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: r.color }} />
-                      <span className="text-white font-bold">{r.name}</span>
-                      <span className="text-[10px] text-stone-500">({r.id})</span>
-                      {!r.system && (
+              {/* 2ペインメインコンテンツ */}
+              <div className="flex-1 flex flex-col sm:flex-row min-h-0 overflow-hidden">
+                {/* 左サイドバー: ロール一覧 & 新規作成 */}
+                <div className="w-full sm:w-60 shrink-0 bg-[#0E0F12] border-b sm:border-b-0 sm:border-r border-stone-800 flex flex-col p-3 space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsCreatingRole(true)}
+                    className="w-full py-2 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold flex items-center justify-center gap-1.5 shadow-sm transition"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> ロールを作成
+                  </button>
+
+                  <div className="text-[10px] uppercase tracking-wider text-stone-500 font-extrabold px-1 pt-1">
+                    ロール一覧 ({roleDefs.length})
+                  </div>
+
+                  <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+                    {roleDefs.map(r => {
+                      const count = onlineUsers.filter(u => {
+                        if (r.id === 'admin') return u.role === 'admin';
+                        if (r.id === 'member') return true;
+                        return Array.isArray(u.custom_roles) && u.custom_roles.includes(r.id);
+                      }).length;
+
+                      const isSelected = !isCreatingRole && selectedRoleManagerId === r.id;
+                      return (
                         <button
-                          onClick={() => handleDeleteRoleDef(r.id)}
-                          className="text-stone-500 hover:text-red-400 ml-1"
-                          title="ロールを削除"
+                          key={r.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedRoleManagerId(r.id);
+                            setIsCreatingRole(false);
+                          }}
+                          className={`w-full px-2.5 py-2 rounded-xl text-left font-bold transition flex items-center justify-between gap-2 group ${
+                            isSelected
+                              ? 'bg-amber-500/15 border border-amber-500/40 text-amber-200'
+                              : 'text-stone-300 hover:text-white hover:bg-stone-800/60 border border-transparent'
+                          }`}
                         >
-                          <X className="w-3 h-3" />
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: r.color }} />
+                            <span className="truncate">{r.name}</span>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {r.system && (
+                              <span className="text-[9px] px-1 rounded bg-stone-800 text-stone-400 font-mono">SYS</span>
+                            )}
+                            <span className="text-[10px] text-stone-500 font-mono">{count}</span>
+                          </div>
                         </button>
-                      )}
-                    </div>
-                  ))}
+                      );
+                    })}
+                  </div>
                 </div>
-              )}
-            </div>
 
-            <div className="space-y-2 border-t border-stone-800 pt-3">
-              <div className="font-bold text-stone-300">メンバーへのロール割り当て (クリックでON/OFF)</div>
-              <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
-                {onlineUsers.map(u => {
-                  const uRoles = Array.isArray(u.custom_roles) ? u.custom_roles : [];
-                  return (
-                    <div key={u.id} className="p-2.5 rounded-xl bg-[#16181D] border border-stone-800 flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <Avatar name={u.username} url={u.avatar_url} size="w-6 h-6 text-[10px]" />
-                        <span className="text-white font-bold truncate">{u.username}</span>
-                        {u.role === 'admin' && (
-                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold">ADMIN</span>
+                {/* 右メインパネル: 選択されたロールの設定 or 新規作成 */}
+                <div className="flex-1 flex flex-col min-w-0 bg-[#111214] overflow-hidden">
+                  {isCreatingRole ? (
+                    /* 新規ロール作成パネル */
+                    <div className="flex-1 p-6 overflow-y-auto space-y-5">
+                      <div className="border-b border-stone-800 pb-3 flex items-center justify-between">
+                        <div>
+                          <h3 className="font-bold text-white text-base">新しいロールの作成</h3>
+                          <p className="text-xs text-stone-400 mt-0.5">役職や班、権限グループを作成してメンバーに付与できます</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setIsCreatingRole(false)}
+                          className="px-3 py-1.5 rounded-lg border border-stone-700 text-stone-300 hover:bg-stone-800 text-xs"
+                        >
+                          戻る
+                        </button>
+                      </div>
+
+                      <form onSubmit={handleAddRoleDef} className="max-w-md space-y-4">
+                        <div>
+                          <label className="block text-stone-300 font-bold mb-1.5">ロール名</label>
+                          <input
+                            type="text"
+                            required
+                            placeholder="例: 生徒会 / 放送委員 / イベント係"
+                            value={newRoleNameInput}
+                            onChange={e => setNewRoleNameInput(e.target.value)}
+                            className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-stone-300 font-bold mb-1.5">ロールID (半角英数)</label>
+                          <input
+                            type="text"
+                            required
+                            placeholder="council"
+                            value={newRoleIdInput}
+                            onChange={e => setNewRoleIdInput(e.target.value)}
+                            className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-500"
+                          />
+                          <p className="mt-1 text-[11px] text-stone-500">システム内部および権限判定で使用されます</p>
+                        </div>
+
+                        <div>
+                          <label className="block text-stone-300 font-bold mb-1.5">ロールカラー</label>
+                          <div className="flex items-center gap-3">
+                            <input
+                              type="color"
+                              value={newRoleColorInput}
+                              onChange={e => setNewRoleColorInput(e.target.value)}
+                              className="w-12 h-10 rounded-xl bg-transparent border border-stone-700 cursor-pointer"
+                            />
+                            <div className="flex flex-wrap gap-1.5">
+                              {['#f43f5e', '#f59e0b', '#10b981', '#06b6d4', '#6366f1', '#ec4899', '#8b5cf6'].map(c => (
+                                <button
+                                  key={c}
+                                  type="button"
+                                  onClick={() => setNewRoleColorInput(c)}
+                                  className="w-6 h-6 rounded-full border border-white/20 transition hover:scale-110"
+                                  style={{ backgroundColor: c }}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="pt-3">
+                          <button
+                            type="submit"
+                            className="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold shadow-md transition"
+                          >
+                            この設定でロールを作成
+                          </button>
+                        </div>
+                      </form>
+                    </div>
+                  ) : currentRole ? (
+                    /* 既存ロールの詳細設定 & タブ */
+                    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+                      {/* 上部ヘッダー & タブバー */}
+                      <div className="border-b border-stone-800 shrink-0 bg-[#0E0F12] px-6 pt-4">
+                        <div className="flex items-center justify-between mb-3">
+                          <div className="flex items-center gap-2.5">
+                            <span className="w-3.5 h-3.5 rounded-full shadow" style={{ backgroundColor: currentRole.color }} />
+                            <h3 className="font-bold text-white text-base">{currentRole.name}</h3>
+                            <span className="text-[11px] text-stone-500 font-mono">({currentRole.id})</span>
+                          </div>
+                          {!isSystem && (
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteRoleDef(currentRole.id)}
+                              className="px-2.5 py-1 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 text-[11px] font-bold flex items-center gap-1 transition"
+                            >
+                              <Trash2 className="w-3 h-3" /> ロールを削除
+                            </button>
+                          )}
+                        </div>
+
+                        {/* タブバー */}
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setRoleManagerTab('display')}
+                            className={`px-3 py-2 border-b-2 font-bold text-xs transition flex items-center gap-1.5 ${
+                              roleManagerTab === 'display'
+                                ? 'border-amber-400 text-amber-300'
+                                : 'border-transparent text-stone-400 hover:text-stone-200'
+                            }`}
+                          >
+                            <Settings className="w-3.5 h-3.5" /> 表示設定
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRoleManagerTab('permissions')}
+                            className={`px-3 py-2 border-b-2 font-bold text-xs transition flex items-center gap-1.5 ${
+                              roleManagerTab === 'permissions'
+                                ? 'border-amber-400 text-amber-300'
+                                : 'border-transparent text-stone-400 hover:text-stone-200'
+                            }`}
+                          >
+                            <Lock className="w-3.5 h-3.5" /> 権限設定
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRoleManagerTab('members')}
+                            className={`px-3 py-2 border-b-2 font-bold text-xs transition flex items-center gap-1.5 ${
+                              roleManagerTab === 'members'
+                                ? 'border-amber-400 text-amber-300'
+                                : 'border-transparent text-stone-400 hover:text-stone-200'
+                            }`}
+                          >
+                            <Users className="w-3.5 h-3.5" /> メンバー管理 ({membersWithRole.length})
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* タブコンテンツ */}
+                      <div className="flex-1 p-6 overflow-y-auto">
+                        {roleManagerTab === 'display' && (
+                          <div className="max-w-md space-y-5">
+                            <div>
+                              <label className="block text-stone-300 font-bold mb-1.5">ロール名</label>
+                              <input
+                                type="text"
+                                value={currentRole.name}
+                                onChange={e => {
+                                  const val = e.target.value;
+                                  setRoleDefs(prev => prev.map(r => r.id === currentRole.id ? { ...r, name: val } : r));
+                                }}
+                                onBlur={() => handleUpdateRoleDef(currentRole.id, { name: currentRole.name })}
+                                className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white font-bold focus:outline-none focus:border-amber-500"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-stone-300 font-bold mb-1.5">ロールカラー</label>
+                              <div className="flex items-center gap-3">
+                                <input
+                                  type="color"
+                                  value={currentRole.color}
+                                  onChange={e => {
+                                    const col = e.target.value;
+                                    setRoleDefs(prev => prev.map(r => r.id === currentRole.id ? { ...r, color: col } : r));
+                                  }}
+                                  onBlur={() => handleUpdateRoleDef(currentRole.id, { color: currentRole.color })}
+                                  className="w-12 h-10 rounded-xl bg-transparent border border-stone-700 cursor-pointer"
+                                />
+                                <div className="flex flex-wrap gap-1.5">
+                                  {['#f43f5e', '#f59e0b', '#10b981', '#06b6d4', '#6366f1', '#ec4899', '#8b5cf6', '#64748b'].map(c => (
+                                    <button
+                                      key={c}
+                                      type="button"
+                                      onClick={() => {
+                                        setRoleDefs(prev => prev.map(r => r.id === currentRole.id ? { ...r, color: c } : r));
+                                        handleUpdateRoleDef(currentRole.id, { color: c });
+                                      }}
+                                      className="w-6 h-6 rounded-full border border-white/20 transition hover:scale-110"
+                                      style={{ backgroundColor: c }}
+                                    />
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div>
+                              <label className="block text-stone-300 font-bold mb-1.5">ロールID (変更不可)</label>
+                              <input
+                                type="text"
+                                disabled
+                                value={currentRole.id}
+                                className="w-full bg-stone-900/50 border border-stone-800 rounded-xl px-3 py-2 text-stone-500 font-mono select-none"
+                              />
+                            </div>
+                          </div>
+                        )}
+
+                        {roleManagerTab === 'permissions' && (
+                          <div className="space-y-4 max-w-2xl">
+                            <div className="text-stone-400 text-xs pb-1">
+                              このロールを持つメンバーに付与する権限を設定します。管理者 (admin) は全権限が自動的に許可されます。
+                            </div>
+
+                            <div className="space-y-2">
+                              {ROLE_PERMS.map(p => {
+                                const isAllowed = currentRole.id === 'admin' || (Array.isArray((currentRole as any).permissions) ? (currentRole as any).permissions.includes(p.id) : true);
+                                return (
+                                  <div
+                                    key={p.id}
+                                    className="p-3.5 rounded-xl bg-[#16181D] border border-stone-800/80 flex items-center justify-between gap-4"
+                                  >
+                                    <div className="min-w-0">
+                                      <div className="font-bold text-white text-xs">{p.label}</div>
+                                      <div className="text-[11px] text-stone-500 mt-0.5">{p.desc}</div>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      disabled={currentRole.id === 'admin'}
+                                      onClick={() => {
+                                        if (currentRole.id === 'admin') return;
+                                        const curPerms: string[] = Array.isArray((currentRole as any).permissions) ? (currentRole as any).permissions : ['view', 'send', 'attach', 'reactions', 'voice'];
+                                        const nextPerms = isAllowed ? curPerms.filter(x => x !== p.id) : [...curPerms, p.id];
+                                        setRoleDefs(prev => prev.map(r => r.id === currentRole.id ? { ...r, permissions: nextPerms } : r));
+                                        handleUpdateRoleDef(currentRole.id, { permissions: nextPerms });
+                                      }}
+                                      className={`w-11 h-6 rounded-full transition relative shrink-0 p-0.5 ${
+                                        isAllowed ? 'bg-emerald-500' : 'bg-stone-800 border border-stone-700'
+                                      } ${currentRole.id === 'admin' ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                    >
+                                      <div className={`w-5 h-5 rounded-full bg-white transition-transform ${isAllowed ? 'translate-x-5' : 'translate-x-0'}`} />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        {roleManagerTab === 'members' && (
+                          <div className="space-y-4 max-w-2xl">
+                            {/* メンバー検索 */}
+                            <div className="flex items-center gap-2 bg-[#16181D] border border-stone-800 rounded-xl px-3 py-1.5">
+                              <Search className="w-3.5 h-3.5 text-stone-500" />
+                              <input
+                                type="text"
+                                placeholder="メンバーを検索..."
+                                value={roleMemberSearch}
+                                onChange={e => setRoleMemberSearch(e.target.value)}
+                                className="bg-transparent text-white focus:outline-none text-xs flex-1"
+                              />
+                              {roleMemberSearch && (
+                                <button onClick={() => setRoleMemberSearch('')} className="text-stone-500 hover:text-white">
+                                  <X className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+
+                            {/* メンバー一覧 */}
+                            <div className="space-y-1.5 max-h-[50vh] overflow-y-auto pr-1">
+                              {onlineUsers
+                                .filter(u => !roleMemberSearch || u.username.toLowerCase().includes(roleMemberSearch.toLowerCase()))
+                                .map(u => {
+                                  const uRoles = Array.isArray(u.custom_roles) ? u.custom_roles : [];
+                                  const hasRole = currentRole.id === 'admin'
+                                    ? u.role === 'admin'
+                                    : currentRole.id === 'member'
+                                    ? true
+                                    : uRoles.includes(currentRole.id);
+
+                                  return (
+                                    <div
+                                      key={u.id}
+                                      className="p-2.5 rounded-xl bg-[#16181D] border border-stone-800/80 flex items-center justify-between gap-3"
+                                    >
+                                      <div className="flex items-center gap-2.5 min-w-0">
+                                        <Avatar name={u.username} url={u.avatar_url} size="w-7 h-7 text-xs" />
+                                        <div className="min-w-0">
+                                          <div className="font-bold text-white text-xs truncate flex items-center gap-1.5">
+                                            <span>{u.username}</span>
+                                            {u.role === 'admin' && (
+                                              <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-bold">ADMIN</span>
+                                            )}
+                                          </div>
+                                          <div className="text-[10px] text-stone-500 truncate">
+                                            {uRoles.length > 0
+                                              ? uRoles.map(rid => roleDefs.find(rd => rd.id === rid)?.name || rid).join(', ')
+                                              : 'ロールなし'}
+                                          </div>
+                                        </div>
+                                      </div>
+
+                                      <button
+                                        type="button"
+                                        disabled={currentRole.system}
+                                        onClick={() => handleToggleUserCustomRole(u, currentRole.id)}
+                                        className={`px-3 py-1 rounded-lg font-bold text-xs transition border flex items-center gap-1 shrink-0 ${
+                                          hasRole
+                                            ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-400'
+                                            : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-white hover:border-stone-700'
+                                        } ${currentRole.system ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                      >
+                                        {hasRole ? (
+                                          <>
+                                            <Check className="w-3 h-3 text-amber-400" />
+                                            <span>付与済み</span>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <Plus className="w-3 h-3" />
+                                            <span>ロールを付与</span>
+                                          </>
+                                        )}
+                                      </button>
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          </div>
                         )}
                       </div>
-                      <div className="flex flex-wrap gap-1">
-                        {roleDefs.filter(r => !r.system).map(r => {
-                          const has = uRoles.includes(r.id);
-                          return (
-                            <button
-                              key={r.id}
-                              type="button"
-                              onClick={() => handleToggleUserCustomRole(u, r.id)}
-                              className={`px-2 py-0.5 rounded-md border text-[10px] font-bold transition flex items-center gap-1 ${
-                                has
-                                  ? 'bg-amber-500/20 border-amber-500 text-amber-200'
-                                  : 'bg-stone-900 border-stone-800 text-stone-500 hover:text-stone-300'
-                              }`}
-                            >
-                              <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: r.color }} />
-                              {r.name}
-                            </button>
-                          );
-                        })}
-                      </div>
                     </div>
-                  );
-                })}
+                  ) : null}
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* メンバー プロフィール・Bio・ロール表示モーダル */}
       {selectedProfileMember && (() => {

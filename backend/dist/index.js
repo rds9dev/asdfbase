@@ -175,13 +175,24 @@ async function relayMessage(msg) {
         if ((await getSetting('notify_messages_enabled', 'on')) !== 'on')
             return false;
         let targetDiscordMsgId = null;
+        let replyQuote = '';
         if (msg.reply_to_id) {
             const linkRes = await db_js_1.pool.query(`SELECT discord_message_id FROM discord_message_links WHERE asdf_message_id = $1 LIMIT 1`, [msg.reply_to_id]);
             if (linkRes.rows.length > 0) {
                 targetDiscordMsgId = linkRes.rows[0].discord_message_id;
             }
+            const origRes = await db_js_1.pool.query(`SELECT username, content FROM messages WHERE id = $1 LIMIT 1`, [msg.reply_to_id]);
+            if (origRes.rows.length > 0) {
+                const origUser = origRes.rows[0].username || 'unknown';
+                let origText = (origRes.rows[0].content || '').trim().split('\n')[0] || '';
+                if (/!\[[^\]]*\]\([^)\s]+\)/.test(origText))
+                    origText = '[画像]';
+                if (origText.length > 80)
+                    origText = origText.slice(0, 80) + '…';
+                replyQuote = `> **@${origUser}**: ${origText}\n`;
+            }
         }
-        const sent = await (0, discord_js_1.relayToDiscordBot)(msg.channel_id, username, msg.content, targetDiscordMsgId, msg.author_avatar);
+        const sent = await (0, discord_js_1.relayToDiscordBot)(msg.channel_id, username, msg.content, targetDiscordMsgId, msg.author_avatar, replyQuote);
         if (sent.length > 0) {
             // あとで編集を Discord 側にも反映できるよう、送ったメッセージを覚えておく
             if (msg.id) {
@@ -202,7 +213,8 @@ async function relayMessage(msg) {
                 files.push(f);
             return '';
         }).trim();
-        await postWebhook(url, { username: `[asdfbase] ${username}`, content: text || undefined, allowed_mentions: { parse: [] } }, files);
+        const fullText = replyQuote ? `${replyQuote}${text}` : text;
+        await postWebhook(url, { username: `[asdfbase] ${username}`, content: fullText || undefined, allowed_mentions: { parse: [] } }, files);
         return true;
     }
     catch (err) {
