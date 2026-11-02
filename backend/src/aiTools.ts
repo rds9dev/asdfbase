@@ -527,23 +527,22 @@ export function createAiToolRunner(ctx: AiToolContext) {
       const q = String(args.query || '').trim();
       if (!q) throw new Error('検索語が空です');
       const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 30);
-      const params: any[] = [`%${q}%`, limit];
-      let where = `m.content ILIKE $1`;
+      const qs = new URLSearchParams({ q, limit: String(limit) });
       if (args.channel) {
         const ch = await findChannel(args.channel);
         if (!ch) throw new Error(`チャンネル「${args.channel}」が見つかりません`);
-        params.push(ch.id);
-        where += ` AND m.channel_id = $3`;
+        qs.set('channelId', String(ch.id));
       }
-      const r = await ctx.pool.query(
-        `SELECT m.id, c.name AS channel, COALESCE(u.username, m.username) AS sender, m.content, m.created_at
-         FROM messages m JOIN channels c ON c.id = m.channel_id LEFT JOIN users u ON u.id = m.user_id
-         WHERE ${where} ORDER BY m.id DESC LIMIT $2`,
-        params
-      );
+      const data: any = await api(`/api/messages/search?${qs.toString()}`);
+      const rows: any[] = Array.isArray(data?.messages) ? data.messages : [];
       return {
-        label: `チャットを検索「${q}」(${r.rows.length}件)`,
-        result: r.rows.map(m => ({ channel: m.channel, sender: m.sender, at: jstDateTime(m.created_at), content: String(m.content).slice(0, 500) })),
+        label: `チャットを検索「${q}」(${rows.length}件)`,
+        result: rows.map(m => ({
+          channel: m.channel_name || m.channel,
+          sender: m.sender_username || m.username || m.sender,
+          at: jstDateTime(m.created_at),
+          content: String(m.content || '').slice(0, 500),
+        })),
       };
     },
 
@@ -551,15 +550,14 @@ export function createAiToolRunner(ctx: AiToolContext) {
       const ch = await findChannel(args.channel);
       if (!ch) throw new Error(`チャンネル「${args.channel}」が見つかりません`);
       const limit = Math.min(Math.max(Number(args.limit) || 30, 1), 50);
-      const r = await ctx.pool.query(
-        `SELECT COALESCE(u.username, m.username) AS sender, m.content, m.created_at
-         FROM messages m LEFT JOIN users u ON u.id = m.user_id
-         WHERE m.channel_id = $1 ORDER BY m.id DESC LIMIT $2`,
-        [ch.id, limit]
-      );
+      const rows: any[] = await api(`/api/channels/${ch.id}/messages?limit=${limit}`);
       return {
         label: `#${ch.name} の会話を読む`,
-        result: r.rows.reverse().map(m => ({ sender: m.sender, at: jstDateTime(m.created_at), content: String(m.content).slice(0, 500) })),
+        result: (Array.isArray(rows) ? rows : []).map(m => ({
+          sender: m.sender_username || m.username || m.sender,
+          at: jstDateTime(m.created_at),
+          content: String(m.content || '').slice(0, 500),
+        })),
       };
     },
 

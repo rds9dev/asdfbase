@@ -508,7 +508,9 @@ export const SmartMarkdown = React.memo(function SmartMarkdown({
             return <h4 id={id} className="scroll-mt-16 font-semibold text-sm text-stone-200 mt-1 mb-0.5">{decorateInlineChildren(children, opts)}</h4>;
           },
           a: ({ href, children }) => {
-            const linkHref = href || '';
+            const rawHref = (href || '').trim();
+            const isUnsafeProtocol = /^(javascript|vbscript|data):/i.test(rawHref);
+            const linkHref = isUnsafeProtocol ? '#' : rawHref;
             const isInternal =
               linkHref.startsWith('#') ||
               (opts.onMessageLink && messageLinkId(linkHref) !== null) ||
@@ -516,7 +518,13 @@ export const SmartMarkdown = React.memo(function SmartMarkdown({
             return (
               <a
                 href={linkHref}
-                onClick={(e) => handleAnchorClick(e, linkHref)}
+                onClick={(e) => {
+                  if (isUnsafeProtocol) {
+                    e.preventDefault();
+                    return;
+                  }
+                  handleAnchorClick(e, linkHref);
+                }}
                 target={isInternal ? undefined : '_blank'}
                 rel={isInternal ? undefined : 'noreferrer noopener'}
                 className="text-sky-400 hover:underline break-all cursor-pointer"

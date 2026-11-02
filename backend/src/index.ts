@@ -178,12 +178,13 @@ export async function relayMessage(msg: { id?: number; channel_id: number; usern
         targetDiscordMsgId = linkRes.rows[0].discord_message_id;
       }
       const origRes = await pool.query(
-        `SELECT username, content FROM messages WHERE id = $1 LIMIT 1`,
+        `SELECT username, content, channel_id FROM messages WHERE id = $1 LIMIT 1`,
         [msg.reply_to_id]
       );
       if (origRes.rows.length > 0) {
         const origUser = origRes.rows[0].username || 'unknown';
-        let origText = (origRes.rows[0].content || '').trim().split('\n')[0] || '';
+        const decryptedOrig = decryptMessageContent(origRes.rows[0].content, origRes.rows[0].channel_id);
+        let origText = (decryptedOrig || '').trim().split('\n')[0] || '';
         if (/!\[[^\]]*\]\([^)\s]+\)/.test(origText)) origText = '[画像]';
         if (origText.length > 80) origText = origText.slice(0, 80) + '…';
         replyQuote = `> **@${origUser}**: ${origText}\n`;
@@ -312,6 +313,13 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 
 app.use(cors({ origin: '*' }));
 
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
 // レスポンス gzip 圧縮ミドルウェア (Node.js 標準 zlib による通信量削減)
 app.use((req, res, next) => {
   const acceptEncoding = req.headers['accept-encoding'] || '';
@@ -323,7 +331,12 @@ app.use((req, res, next) => {
       return originalSend(body);
     }
     const contentType = String(res.getHeader('content-type') || '');
-    const isCompressible = typeof body === 'string' || Buffer.isBuffer(body) || contentType.includes('json') || contentType.includes('text');
+    const isCompressible =
+      typeof body === 'string' ||
+      contentType.includes('json') ||
+      contentType.includes('text') ||
+      contentType.includes('javascript') ||
+      contentType.includes('svg');
 
     if (isCompressible) {
       const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
@@ -344,9 +357,19 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: '10mb' }));
+const INLINE_SAFE_UPLOAD_EXTS = new Set(['.webp', '.png', '.jpg', '.jpeg', '.gif', '.pdf', '.mp3', '.wav', '.ogg', '.m4a']);
 app.use('/uploads', express.static(UPLOAD_DIR, {
   maxAge: '30d',
   immutable: true,
+  setHeaders: (res, filePath) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    const ext = path.extname(filePath).toLowerCase();
+    const base = path.basename(filePath);
+    if (!INLINE_SAFE_UPLOAD_EXTS.has(ext) && base !== 'emoji-swim.svg') {
+      res.setHeader('Content-Disposition', 'attachment');
+    }
+  },
 }));
 
 const upload = multer({
@@ -605,15 +628,56 @@ app.get('/api/weather', async (req, res) => {
   res.json(await getWeather());
 });
 
+const authFailureMap = new Map<string, { count: number; resetAt: number }>();
+const AUTH_WINDOW_MS = 5 * 60 * 1000;
+const AUTH_MAX_FAILURES = 15;
+
+function isAuthRateLimited(req: Request): boolean {
+  const ip = requestMeta(req).ip || 'unknown';
+  const entry = authFailureMap.get(ip);
+  if (!entry) return false;
+  if (Date.now() > entry.resetAt) {
+    authFailureMap.delete(ip);
+    return false;
+  }
+  return entry.count >= AUTH_MAX_FAILURES;
+}
+
+function recordAuthFailure(req: Request) {
+  const ip = requestMeta(req).ip || 'unknown';
+  const now = Date.now();
+  const entry = authFailureMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    authFailureMap.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  } else {
+    entry.count++;
+  }
+}
+
+function clearAuthFailures(req: Request) {
+  const ip = requestMeta(req).ip || 'unknown';
+  authFailureMap.delete(ip);
+}
+
 // Register
 app.post('/api/auth/register', async (req, res) => {
   try {
+    if (isAuthRateLimited(req)) {
+      return res.status(429).json({ error: '試行回数が多すぎます。しばらく待ってから再試行してください' });
+    }
     const { username, password, inviteCode } = req.body;
     if (!username || !password || !inviteCode) {
       return res.status(400).json({ error: 'すべての項目を入力してください' });
     }
+    if (typeof username !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ error: '入力形式が正しくありません' });
+    }
+    if (password.length < 4 || password.length > 128) {
+      return res.status(400).json({ error: 'パスワードは4〜128文字で指定してください' });
+    }
 
     if (inviteCode !== INVITE_CODE) {
+      recordAuthFailure(req);
       return res.status(403).json({ error: '招待コードが無効です' });
     }
 
@@ -628,6 +692,7 @@ app.post('/api/auth/register', async (req, res) => {
       `INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username, role, status`,
       [username, passwordHash]
     );
+    clearAuthFailures(req);
 
     const user = result.rows[0];
     const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, {
@@ -654,25 +719,35 @@ app.post('/api/auth/register', async (req, res) => {
 // Login
 app.post('/api/auth/login', async (req, res) => {
   try {
+    if (isAuthRateLimited(req)) {
+      return res.status(429).json({ error: 'ログイン試行回数が多すぎます。5分ほど待ってから再試行してください' });
+    }
     const { username, password } = req.body;
-    if (!username || !password) {
+    if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
       return res.status(400).json({ error: 'ユーザー名とパスワードを入力してください' });
+    }
+    if (password.length > 128) {
+      recordAuthFailure(req);
+      return res.status(401).json({ error: 'ユーザー名またはパスワードが正しくありません' });
     }
 
     const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [username]);
     if (result.rows.length === 0) {
+      recordAuthFailure(req);
       return res.status(401).json({ error: 'ユーザー名またはパスワードが正しくありません' });
     }
 
     const user = result.rows[0];
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
+      recordAuthFailure(req);
       logAudit({ id: user.id, username: user.username }, 'login_failed', 'user', user.id, {
         message: 'ログイン失敗 (パスワード不一致)',
         ...requestMeta(req),
       });
       return res.status(401).json({ error: 'ユーザー名またはパスワードが正しくありません' });
     }
+    clearAuthFailures(req);
     logAudit({ id: user.id, username: user.username }, 'login', 'user', user.id, { message: 'ログイン', ...requestMeta(req) });
 
     const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, {
@@ -1515,7 +1590,7 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req: AuthRe
 });
 
 // Discord Inbound Sync Endpoint (Discord Bot -> asdfbase)
-app.post('/api/discord/webhook', async (req, res) => {
+app.post('/api/discord/webhook', authMiddleware, adminOnly, async (req, res) => {
   try {
     const { username, content, channelId, attachments } = req.body;
     if (!content && (!attachments || attachments.length === 0)) {
@@ -1549,8 +1624,19 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthR
     const { emoji } = req.body;
     const userId = req.user!.id;
 
-    const msgRes = await pool.query(`SELECT reactions FROM messages WHERE id = $1`, [messageId]);
+    const msgRes = await pool.query(`SELECT reactions, channel_id FROM messages WHERE id = $1`, [messageId]);
     if (msgRes.rows.length === 0) return res.status(404).json({ error: 'メッセージがありません' });
+
+    const chRes = await pool.query(`SELECT * FROM channels WHERE id = $1`, [msgRes.rows[0].channel_id]);
+    if (chRes.rows.length > 0) {
+      const uRes = await pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [userId]);
+      const role = uRes.rows[0]?.role || 'member';
+      const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
+      if (!(await checkServerPermission(userId, role, chRes.rows[0].server_id)) ||
+          !checkChannelViewPermission(role === 'admin', [role, ...customRoles], chRes.rows[0])) {
+        return res.status(403).json({ error: 'このチャンネルの権限がありません' });
+      }
+    }
 
     const reactions = msgRes.rows[0].reactions || {};
     const users: number[] = (reactions[emoji] || []).map((u: any) => Number(u));
@@ -1566,15 +1652,16 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthR
       `UPDATE messages SET reactions = $1 WHERE id = $2 RETURNING *`,
       [JSON.stringify(reactions), messageId]
     );
+    const decryptedUpdated = decryptMessageRow(updated.rows[0]);
 
     broadcast({
       type: 'MESSAGE_REACTION_UPDATED',
       payload: {
-        ...updated.rows[0],
+        ...decryptedUpdated,
         id: messageId,
         messageId,
-        channel_id: updated.rows[0].channel_id,
-        reactions: updated.rows[0].reactions,
+        channel_id: decryptedUpdated.channel_id,
+        reactions: decryptedUpdated.reactions,
       },
     });
 
@@ -1594,7 +1681,7 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthR
       }
     })();
 
-    res.json(updated.rows[0]);
+    res.json(decryptedUpdated);
   } catch (err) {
     res.status(500).json({ error: 'リアクション更新エラー' });
   }
@@ -1603,8 +1690,19 @@ app.post('/api/messages/:messageId/reactions', authMiddleware, async (req: AuthR
 app.get('/api/messages/:messageId/reaction-users', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const messageId = parseInt(req.params.messageId, 10);
-    const msgRes = await pool.query(`SELECT reactions FROM messages WHERE id = $1`, [messageId]);
+    const msgRes = await pool.query(`SELECT reactions, channel_id FROM messages WHERE id = $1`, [messageId]);
     if (msgRes.rows.length === 0) return res.status(404).json({ error: 'メッセージがありません' });
+
+    const chRes = await pool.query(`SELECT * FROM channels WHERE id = $1`, [msgRes.rows[0].channel_id]);
+    if (chRes.rows.length > 0) {
+      const uRes = await pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [req.user!.id]);
+      const role = uRes.rows[0]?.role || 'member';
+      const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
+      if (!(await checkServerPermission(req.user!.id, role, chRes.rows[0].server_id)) ||
+          !checkChannelViewPermission(role === 'admin', [role, ...customRoles], chRes.rows[0])) {
+        return res.status(403).json({ error: 'このチャンネルの権限がありません' });
+      }
+    }
 
     const reactions: Record<string, number[]> = msgRes.rows[0].reactions || {};
     const allIds = Array.from(new Set(Object.values(reactions).flat().map(Number).filter(n => !isNaN(n))));
@@ -1654,12 +1752,27 @@ app.get('/api/messages/:messageId/reaction-users', authMiddleware, async (req: A
 app.post('/api/messages/:messageId/pin', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const messageId = parseInt(req.params.messageId, 10);
+    const checkMsg = await pool.query(`SELECT channel_id FROM messages WHERE id = $1`, [messageId]);
+    if (checkMsg.rows.length === 0) return res.status(404).json({ error: 'メッセージがありません' });
+
+    const chRes = await pool.query(`SELECT * FROM channels WHERE id = $1`, [checkMsg.rows[0].channel_id]);
+    if (chRes.rows.length > 0) {
+      const uRes = await pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [req.user!.id]);
+      const role = uRes.rows[0]?.role || 'member';
+      const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
+      if (!(await checkServerPermission(req.user!.id, role, chRes.rows[0].server_id)) ||
+          !checkChannelWritePermission(role === 'admin', [role, ...customRoles], chRes.rows[0])) {
+        return res.status(403).json({ error: 'このチャンネルのピン留め権限がありません' });
+      }
+    }
+
     const updated = await pool.query(
       `UPDATE messages SET is_pinned = NOT is_pinned WHERE id = $1 RETURNING *`,
       [messageId]
     );
     if (updated.rows.length === 0) return res.status(404).json({ error: 'メッセージがありません' });
-    const [pinned] = await attachReplies([updated.rows[0]]);
+    const decryptedRow = decryptMessageRow(updated.rows[0]);
+    const [pinned] = await attachReplies([decryptedRow]);
     broadcast({
       type: 'MESSAGE_PIN_UPDATED',
       payload: pinned,
@@ -1687,7 +1800,7 @@ app.post('/api/messages/:messageId/pin', authMiddleware, async (req: AuthRequest
       }
     })();
 
-    res.json(updated.rows[0]);
+    res.json(pinned);
   } catch (err) {
     res.status(500).json({ error: 'ピン留め更新エラー' });
   }
@@ -2156,23 +2269,31 @@ app.post('/api/ai/chat', authMiddleware, async (req: AuthRequest, res) => {
           }
           // Check if channel name match -> fetch latest 25 messages
           const chRes = await pool.query(
-            `SELECT id, name, type FROM channels WHERE name ILIKE $1 LIMIT 1`,
+            `SELECT * FROM channels WHERE name ILIKE $1 LIMIT 1`,
             [`%${tag}%`]
           );
           if (chRes.rows.length > 0) {
             const ch = chRes.rows[0];
-            const msgsRes = await pool.query(
-              `SELECT m.id, m.content, m.created_at, COALESCE(u.username, m.username) as sender 
-               FROM messages m 
-               LEFT JOIN users u ON m.user_id = u.id 
-               WHERE m.channel_id = $1 
-               ORDER BY m.id DESC LIMIT 25`,
-              [ch.id]
-            );
-            dynamicReferences[`channel_${ch.name}_latest25`] = {
-              channel: ch,
-              messages: msgsRes.rows.reverse()
-            };
+            const uRes = await pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [req.user!.id]);
+            const role = uRes.rows[0]?.role || 'member';
+            const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
+            const canView =
+              (await checkServerPermission(req.user!.id, role, ch.server_id)) &&
+              checkChannelViewPermission(role === 'admin', [role, ...customRoles], ch);
+            if (canView) {
+              const msgsRes = await pool.query(
+                `SELECT m.id, m.channel_id, m.content, m.created_at, COALESCE(u.username, m.username) as sender 
+                 FROM messages m 
+                 LEFT JOIN users u ON m.user_id = u.id 
+                 WHERE m.channel_id = $1 
+                 ORDER BY m.id DESC LIMIT 25`,
+                [ch.id]
+              );
+              dynamicReferences[`channel_${ch.name}_latest25`] = {
+                channel: { id: ch.id, name: ch.name, type: ch.type },
+                messages: decryptMessageRows(msgsRes.rows).reverse()
+              };
+            }
           }
         }
       }
@@ -2412,11 +2533,19 @@ app.get('/api/proxy/media', async (req, res) => {
       return res.status(400).json({ error: '無効なURL形式です' });
     }
 
+    if (targetUrl.protocol !== 'https:' && targetUrl.protocol !== 'http:') {
+      return res.status(400).json({ error: '無効なプロトコルです' });
+    }
+
     // 公開静的画像（アバター・サーバーアイコン・絵文字等）は未認証でもプロキシ許可
     const isPublicDiscordAsset =
-      targetUrl.hostname === 'cdn.discordapp.com' &&
+      (targetUrl.hostname === 'cdn.discordapp.com' || targetUrl.hostname === 'media.discordapp.net') &&
       (targetUrl.pathname.startsWith('/icons/') ||
        targetUrl.pathname.startsWith('/avatars/') ||
+       targetUrl.pathname.startsWith('/embed/avatars/') ||
+       targetUrl.pathname.startsWith('/guilds/') ||
+       targetUrl.pathname.startsWith('/banners/') ||
+       targetUrl.pathname.startsWith('/stickers/') ||
        targetUrl.pathname.startsWith('/emojis/') ||
        targetUrl.pathname.startsWith('/app-icons/') ||
        targetUrl.pathname.startsWith('/channel-icons/'));
@@ -2456,11 +2585,26 @@ app.get('/api/proxy/media', async (req, res) => {
       return res.status(fetchRes.status).json({ error: `メディア取得エラー: ${fetchRes.status}` });
     }
 
-    const contentType = fetchRes.headers.get('content-type') || 'application/octet-stream';
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    const MAX_PROXY_BYTES = 25 * 1024 * 1024;
+    const contentLength = parseInt(fetchRes.headers.get('content-length') || '0', 10);
+    if (contentLength > MAX_PROXY_BYTES) {
+      return res.status(413).json({ error: 'メディアサイズが大きすぎます' });
+    }
 
     const arrayBuffer = await fetchRes.arrayBuffer();
+    if (arrayBuffer.byteLength > MAX_PROXY_BYTES) {
+      return res.status(413).json({ error: 'メディアサイズが大きすぎます' });
+    }
+
+    const contentType = (fetchRes.headers.get('content-type') || 'application/octet-stream').toLowerCase();
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox");
+    if (!contentType.startsWith('image/') && !contentType.startsWith('video/') && !contentType.startsWith('audio/')) {
+      res.setHeader('Content-Disposition', 'attachment');
+    }
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+
     res.send(Buffer.from(arrayBuffer));
   } catch (err: any) {
     console.error('Media proxy error:', err.message);
@@ -2800,7 +2944,7 @@ app.post('/api/discord/link-requests/:id/reject', authMiddleware, adminOnly, asy
 });
 
 // 同期チャンネルの解除 (削除)
-app.delete('/api/discord/bindings', authMiddleware, async (req: AuthRequest, res) => {
+app.delete('/api/discord/bindings', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
   try {
     const { discordChannelId, asdfChannelId } = req.body || {};
     const qDiscordId = (req.query.discordChannelId as string) || discordChannelId;
@@ -3614,7 +3758,7 @@ app.delete('/api/audit-logs', authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-app.post('/api/audit-logs/:id/restore', authMiddleware, async (req: AuthRequest, res) => {
+app.post('/api/audit-logs/:id/restore', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const logRes = await pool.query(`SELECT * FROM audit_logs WHERE id = $1`, [id]);
@@ -3651,11 +3795,13 @@ app.post('/api/audit-logs/:id/restore', authMiddleware, async (req: AuthRequest,
       broadcast({ type: 'HOMEWORK_CREATED', payload: formatHomework({ ...r.rows[0], done_count: 0, my_done: false }) });
     } else if (log.target_type === 'message' && log.details) {
       const details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
+      const plainContent = decryptMessageContent(details.content || '', details.channel_id);
+      const encryptedContent = encryptMessageContent(plainContent, details.channel_id);
       const r = await pool.query(
         `INSERT INTO messages (channel_id, user_id, username, content, created_at) VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, NOW())) RETURNING *`,
-        [details.channel_id, details.author_id || null, details.author || 'unknown', details.content || '', details.created_at || null]
+        [details.channel_id, details.author_id || null, details.author || 'unknown', encryptedContent, details.created_at || null]
       );
-      broadcast({ type: 'NEW_MESSAGE', payload: { ...r.rows[0], sender_username: details.author } });
+      broadcast({ type: 'NEW_MESSAGE', payload: { ...r.rows[0], content: plainContent, sender_username: details.author } });
     }
     logAudit(req.user!, 'restore', log.target_type, log.target_id, { message: `ログ #${id} (${log.action}) から復元` });
 
@@ -3668,7 +3814,7 @@ app.post('/api/audit-logs/:id/restore', authMiddleware, async (req: AuthRequest,
 });
 
 // Discord Webhook Settings & Test
-app.get('/api/settings/webhook', authMiddleware, async (req: AuthRequest, res) => {
+app.get('/api/settings/webhook', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
   try {
     const webhookUrl = await getDiscordWebhookUrl();
     res.json({ webhookUrl });
@@ -3677,9 +3823,12 @@ app.get('/api/settings/webhook', authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
-app.post('/api/settings/webhook', authMiddleware, async (req: AuthRequest, res) => {
+app.post('/api/settings/webhook', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
   try {
     const { webhookUrl } = req.body;
+    if (webhookUrl && !/^https:\/\/(discord|discordapp)\.com\/api\/webhooks\//.test(String(webhookUrl))) {
+      return res.status(400).json({ error: 'Discord Webhook URL の形式が正しくありません' });
+    }
     await pool.query(
       `INSERT INTO system_settings (key, value, updated_at) 
        VALUES ('discord_webhook_url', $1, NOW()) 
@@ -3698,12 +3847,15 @@ app.get('/api/discord/voice-status', authMiddleware, (_req, res) => {
   res.json({ vcs: lastDiscordVoiceStatus });
 });
 
-app.post('/api/webhook/test', authMiddleware, async (req: AuthRequest, res) => {
+app.post('/api/webhook/test', authMiddleware, adminOnly, async (req: AuthRequest, res) => {
   try {
     const { webhookUrl } = req.body;
     const targetUrl = webhookUrl || await getDiscordWebhookUrl();
     if (!targetUrl) {
       return res.status(400).json({ error: 'Discord Webhook URLが設定されていません' });
+    }
+    if (!/^https:\/\/(discord|discordapp)\.com\/api\/webhooks\//.test(String(targetUrl))) {
+      return res.status(400).json({ error: 'Discord Webhook URL の形式が正しくありません' });
     }
 
     const response = await fetch(targetUrl, {
@@ -3728,9 +3880,10 @@ app.post('/api/webhook/test', authMiddleware, async (req: AuthRequest, res) => {
 // Discord / 通知連携設定 (重要通知 Webhook・メッセージ Webhook・ON/OFF・Bot状態)
 app.get('/api/settings/integrations', authMiddleware, async (req: AuthRequest, res) => {
   try {
+    const isAdmin = req.user?.role === 'admin';
     res.json({
-      importantWebhookUrl: await getDiscordWebhookUrl(),
-      messageWebhookUrl: await getSetting('discord_message_webhook_url', ''),
+      importantWebhookUrl: isAdmin ? await getDiscordWebhookUrl() : '',
+      messageWebhookUrl: isAdmin ? await getSetting('discord_message_webhook_url', '') : '',
       importantEnabled: (await getSetting('notify_important_enabled', 'on')) === 'on',
       messagesEnabled: (await getSetting('notify_messages_enabled', 'on')) === 'on',
       bot: await getDiscordStatus(),
@@ -3791,6 +3944,12 @@ app.post('/api/settings/integrations/test', authMiddleware, adminOnly, async (re
 app.post('/api/auth/change-password', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+      return res.status(400).json({ error: 'パスワードを入力してください' });
+    }
+    if (newPassword.length < 4 || newPassword.length > 128 || currentPassword.length > 128) {
+      return res.status(400).json({ error: 'パスワードは4〜128文字で指定してください' });
+    }
     const userId = req.user!.id;
 
     const userRes = await pool.query(`SELECT password_hash FROM users WHERE id = $1`, [userId]);
@@ -4417,26 +4576,32 @@ async function handleClientMessage(user: { id: number; username: string }, connI
   if (msg.type === 'SEND_MESSAGE') {
     const { channelId, content, attachments, replyToId, clientNonce } = msg;
     const chRes = await pool.query(`SELECT * FROM channels WHERE id = $1`, [channelId]);
-    if (chRes.rows.length > 0) {
-      const uRes = await pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [user.id]);
-      const role = uRes.rows[0]?.role || 'member';
-      const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
-      const userRoles = [role, ...customRoles];
-      if (!checkChannelWritePermission(role === 'admin', userRoles, chRes.rows[0])) {
-        return;
-      }
+    if (chRes.rows.length === 0) return;
+
+    const uRes = await pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [user.id]);
+    const role = uRes.rows[0]?.role || 'member';
+    const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
+    const userRoles = [role, ...customRoles];
+    if (!(await checkServerPermission(user.id, role, chRes.rows[0].server_id))) {
+      return;
     }
+    if (!checkChannelWritePermission(role === 'admin', userRoles, chRes.rows[0])) {
+      return;
+    }
+
+    const plainContent = String(content || '');
+    const encryptedContent = encryptMessageContent(plainContent, channelId);
     const result = await pool.query(
       `INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [channelId, user.id, user.username, content, JSON.stringify(attachments || []), replyToId || null]
+      [channelId, user.id, user.username, encryptedContent, JSON.stringify(attachments || []), replyToId || null]
     );
     const userAvatar = await getUserAvatar(user.id);
-    const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: user.username, author_avatar: userAvatar, client_nonce: clientNonce || null }]);
+    const [savedMessage] = await attachReplies([{ ...result.rows[0], content: plainContent, sender_username: user.username, author_avatar: userAvatar, client_nonce: clientNonce || null }]);
     broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
     const relayed = await relayMessage(savedMessage);
-    if (String(content).includes('@everyone') && !relayed) {
-      notifyImportant(`📢 ${user.username} から全員への連絡`, String(content));
+    if (plainContent.includes('@everyone') && !relayed) {
+      notifyImportant(`📢 ${user.username} から全員への連絡`, plainContent);
     }
 
     replyAsGemini(channelId, savedMessage);
@@ -4724,7 +4889,9 @@ async function removeUnreferencedUploads(contents: string[]) {
   const names = new Set<string>();
   for (const c of contents) {
     for (const m of c.matchAll(/\/uploads\/([A-Za-z0-9._-]+)/g)) {
-      if (!m[1].startsWith('avatar-')) names.add(m[1]);
+      if (!m[1].startsWith('avatar-') && !m[1].startsWith('discord-avatar-') && !m[1].startsWith('emoji-')) {
+        names.add(m[1]);
+      }
     }
   }
   let removed = 0;
@@ -4771,12 +4938,12 @@ async function runRetention() {
                    ) t WHERE t.rn <= 30
                  )
                ORDER BY m.id LIMIT 500
-             ) RETURNING content`,
+             ) RETURNING content, channel_id`,
             [channelIds, days]
           );
           if (del.rows.length === 0) break;
           deletedMessages += del.rows.length;
-          deletedFiles += await removeUnreferencedUploads(del.rows.map(r => r.content));
+          deletedFiles += await removeUnreferencedUploads(del.rows.map(r => decryptMessageContent(r.content, r.channel_id)));
         }
       }
     }
@@ -4976,7 +5143,7 @@ server.listen(PORT, async () => {
             [shouldBePinned, l.asdf_message_id]
           )).rows;
           for (const r of updated) {
-            const [pinned] = await attachReplies([r]);
+            const [pinned] = await attachReplies([decryptMessageRow(r)]);
             broadcast({ type: 'MESSAGE_PIN_UPDATED', payload: pinned });
           }
         }

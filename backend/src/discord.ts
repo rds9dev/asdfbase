@@ -138,6 +138,7 @@ export async function approveDiscordGuild(guildId: string) {
     await deps.setSetting(APPROVED_GUILDS_KEY, JSON.stringify(approvedGuildIds));
   }
   rebuildAllowedGuildIds();
+  invalidateDiscordServerCache();
   await refreshDiscordCommands();
 }
 
@@ -147,6 +148,7 @@ export async function removeApprovedDiscordGuild(guildId: string) {
   approvedGuildIds = approvedGuildIds.filter(id => id !== guildId);
   await deps.setSetting(APPROVED_GUILDS_KEY, JSON.stringify(approvedGuildIds));
   rebuildAllowedGuildIds();
+  invalidateDiscordServerCache();
 }
 
 async function getBindings(): Promise<DiscordBinding[]> {
@@ -163,6 +165,7 @@ async function getBindings(): Promise<DiscordBinding[]> {
 
 async function saveBindings(list: DiscordBinding[]) {
   bindingsCache = list;
+  invalidateDiscordServerCache();
   await deps!.setSetting(BINDINGS_KEY, JSON.stringify(list));
 }
 
@@ -452,7 +455,7 @@ async function resolveGuildIcon(guild: any): Promise<string | null> {
   if (!guild?.icon) return null;
   const rawUrl = guild.iconURL({ extension: 'png', size: 128 });
   if (!rawUrl) return null;
-  const key = `guild-${guild.id}-${guild.icon}`;
+  const key = `guild-${guild.id}-${guild.icon}`.replace(/[^A-Za-z0-9_-]/g, '');
   if (deps?.uploadDir) {
     const localWebpPath = path.join(deps.uploadDir, `discord-avatar-${key}.webp`);
     if (fs.existsSync(localWebpPath)) {
@@ -475,7 +478,7 @@ async function resolveMemberAvatar(m: any): Promise<string | null> {
     const hash = m.avatar || m.user?.avatar || 'default';
     const rawUrl = m.displayAvatarURL({ extension: 'png', size: 64 });
     if (!rawUrl) return null;
-    const key = `member-${m.id}-${hash}`;
+    const key = `member-${m.id}-${hash}`.replace(/[^A-Za-z0-9_-]/g, '');
     if (deps?.uploadDir) {
       const localWebpPath = path.join(deps.uploadDir, `discord-avatar-${key}.webp`);
       if (fs.existsSync(localWebpPath)) {
@@ -484,7 +487,7 @@ async function resolveMemberAvatar(m: any): Promise<string | null> {
     }
     if (deps?.saveAvatar && !avatarSaveInProgress.has(key)) {
       avatarSaveInProgress.add(key);
-      deps.saveAvatar(key, rawUrl).finally(() => {
+      deps.saveAvatar(key, rawUrl).catch(() => {}).finally(() => {
         avatarSaveInProgress.delete(key);
       });
     }
