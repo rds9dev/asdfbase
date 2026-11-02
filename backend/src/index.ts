@@ -319,11 +319,15 @@ app.use((req, res, next) => {
 
   const originalSend = res.send.bind(res);
   res.send = function (body: any) {
-    if (!body || req.method === 'HEAD') return originalSend(body);
+    if (!body || req.method === 'HEAD' || (typeof body === 'object' && !Buffer.isBuffer(body))) {
+      return originalSend(body);
+    }
     const contentType = String(res.getHeader('content-type') || '');
-    if (typeof body === 'string' || Buffer.isBuffer(body) || contentType.includes('json') || contentType.includes('text')) {
-      const buf = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'object' ? JSON.stringify(body) : String(body));
-      if (buf.length > 512) {
+    const isCompressible = typeof body === 'string' || Buffer.isBuffer(body) || contentType.includes('json') || contentType.includes('text');
+
+    if (isCompressible) {
+      const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
+      if (buf.length > 512 && !res.getHeader('Content-Encoding')) {
         zlib.gzip(buf, (err, compressed) => {
           if (err) return originalSend(body);
           res.setHeader('Content-Encoding', 'gzip');
@@ -334,12 +338,6 @@ app.use((req, res, next) => {
       }
     }
     return originalSend(body);
-  };
-
-  const originalJson = res.json.bind(res);
-  res.json = function (obj: any) {
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    return res.send(obj);
   };
 
   next();
