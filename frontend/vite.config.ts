@@ -34,6 +34,39 @@ export default defineConfig({
       workbox: {
         // API はキャッシュしない (古いメモ等が表示されるのを防ぐ)
         navigateFallbackDenylist: [/^\/api\//, /^\/uploads\//],
+        cleanupOutdatedCaches: true,
+        runtimeCaching: [
+          {
+            urlPattern: /^\/uploads\/.*/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'uploads-cache',
+              expiration: {
+                maxEntries: 100,
+                maxAgeSeconds: 7 * 24 * 60 * 60, // 7 days
+                purgeOnQuotaError: true,
+              },
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+            },
+          },
+          {
+            urlPattern: /^https:\/\/cdn\.discordapp\.com\/.*/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'discord-cdn-cache',
+              expiration: {
+                maxEntries: 150,
+                maxAgeSeconds: 3 * 24 * 60 * 60, // 3 days
+                purgeOnQuotaError: true,
+              },
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+            },
+          },
+        ],
       }
     })
   ],

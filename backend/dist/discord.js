@@ -11,6 +11,7 @@ exports.getBoundAsdfChannelIds = getBoundAsdfChannelIds;
 exports.isDiscordBotConfigured = isDiscordBotConfigured;
 exports.getDiscordStatus = getDiscordStatus;
 exports.refreshDiscordCommands = refreshDiscordCommands;
+exports.invalidateDiscordServerCache = invalidateDiscordServerCache;
 exports.getDiscordServers = getDiscordServers;
 exports.getDiscordGuildStatus = getDiscordGuildStatus;
 exports.getDiscordVoiceStatus = getDiscordVoiceStatus;
@@ -310,6 +311,12 @@ function formatEmbeds(embeds) {
     }
     return parts;
 }
+// サーバー情報キャッシュ (TTL: 15秒)
+let cachedDiscordServers = null;
+let pendingServersPromise = null;
+function invalidateDiscordServerCache() {
+    cachedDiscordServers = null;
+}
 async function resolveGuildIcon(guild) {
     if (!guild?.icon)
         return null;
@@ -317,22 +324,32 @@ async function resolveGuildIcon(guild) {
     if (!rawUrl)
         return null;
     if (deps?.saveAvatar) {
-        const saved = await deps.saveAvatar(`guild-${guild.id}-${guild.icon}`, rawUrl).catch(() => null);
-        if (saved)
-            return saved;
+        const key = `guild-${guild.id}-${guild.icon}`;
+        // 非同期でバックグラウンド保存を走らせつつ、即座にプロキシURLを返す
+        deps.saveAvatar(key, rawUrl).catch(() => { });
     }
     return `/api/proxy/media?url=${encodeURIComponent(rawUrl)}`;
 }
+// アバターの取得: ブロッキングを排除して即時プロキシURLを返し、バックグラウンドでローカルWebP化
+const avatarSaveInProgress = new Set();
 async function resolveMemberAvatar(m) {
     try {
         const hash = m.avatar || m.user?.avatar || 'default';
         const rawUrl = m.displayAvatarURL({ extension: 'png', size: 64 });
         if (!rawUrl)
             return null;
-        if (deps?.saveAvatar) {
-            const saved = await deps.saveAvatar(`member-${m.id}-${hash}`, rawUrl).catch(() => null);
-            if (saved)
-                return saved;
+        const key = `member-${m.id}-${hash}`;
+        if (deps?.uploadDir) {
+            const localWebpPath = path_1.default.join(deps.uploadDir, `discord-avatar-${key}.webp`);
+            if (fs_1.default.existsSync(localWebpPath)) {
+                return `/uploads/discord-avatar-${key}.webp`;
+            }
+        }
+        if (deps?.saveAvatar && !avatarSaveInProgress.has(key)) {
+            avatarSaveInProgress.add(key);
+            deps.saveAvatar(key, rawUrl).finally(() => {
+                avatarSaveInProgress.delete(key);
+            });
         }
         return `/api/proxy/media?url=${encodeURIComponent(rawUrl)}`;
     }
@@ -341,191 +358,207 @@ async function resolveMemberAvatar(m) {
     }
 }
 async function getDiscordServers(includeUnapproved = false) {
-    if (!client || !connected)
-        return [];
-    const bindings = deps ? await getBindings() : [];
-    const servers = [];
-    for (const guild of client.guilds.cache.values()) {
-        const approved = isGuildAllowed(guild.id);
-        if (!includeUnapproved && !approved)
-            continue;
-        const iconUrl = await resolveGuildIcon(guild);
-        // ボイスチャンネル情報
-        const voiceChannels = [];
-        const voiceMemberIds = new Set();
-        const speakingMemberIds = new Set();
-        for (const channel of guild.channels.cache.values()) {
-            if (channel.isVoiceBased()) {
-                const rawMembers = Array.from(channel.members.values());
-                const vcMembers = await Promise.all(rawMembers.map(async (m) => {
-                    const muted = Boolean(m.voice?.mute || m.voice?.selfMute || m.voice?.serverMute);
-                    const deafened = Boolean(m.voice?.deaf || m.voice?.selfDeaf || m.voice?.serverDeaf);
-                    const speaking = !muted && !deafened;
-                    const streaming = Boolean(m.voice?.streaming);
-                    const video = Boolean(m.voice?.selfVideo);
-                    voiceMemberIds.add(m.id);
-                    if (speaking)
-                        speakingMemberIds.add(m.id);
-                    return {
+    if (!client || !connected) {
+        // 接続直後などで connected が一時的にずれていても cache があれば利用
+        if (!client?.guilds?.cache || client.guilds.cache.size === 0)
+            return [];
+    }
+    // 15秒以内の有効なキャッシュがあればそれを返す
+    const now = Date.now();
+    if (cachedDiscordServers && now - cachedDiscordServers.time < 15000) {
+        if (includeUnapproved)
+            return cachedDiscordServers.data;
+        return cachedDiscordServers.data.filter(s => s.approved);
+    }
+    if (pendingServersPromise) {
+        const res = await pendingServersPromise;
+        if (includeUnapproved)
+            return res;
+        return res.filter(s => s.approved);
+    }
+    pendingServersPromise = (async () => {
+        try {
+            const bindings = deps ? await getBindings() : [];
+            const servers = [];
+            for (const guild of client.guilds.cache.values()) {
+                const approved = isGuildAllowed(guild.id);
+                const iconUrl = await resolveGuildIcon(guild);
+                // ボイスチャンネル情報
+                const voiceChannels = [];
+                const voiceMemberIds = new Set();
+                const speakingMemberIds = new Set();
+                for (const channel of guild.channels.cache.values()) {
+                    if (channel.isVoiceBased()) {
+                        const rawMembers = Array.from(channel.members.values());
+                        const vcMembers = [];
+                        for (const m of rawMembers) {
+                            const muted = Boolean(m.voice?.mute || m.voice?.selfMute || m.voice?.serverMute);
+                            const deafened = Boolean(m.voice?.deaf || m.voice?.selfDeaf || m.voice?.serverDeaf);
+                            const speaking = !muted && !deafened;
+                            const streaming = Boolean(m.voice?.streaming);
+                            const video = Boolean(m.voice?.selfVideo);
+                            voiceMemberIds.add(m.id);
+                            if (speaking)
+                                speakingMemberIds.add(m.id);
+                            vcMembers.push({
+                                id: m.id,
+                                name: m.displayName || m.user.globalName || m.user.username,
+                                avatarUrl: await resolveMemberAvatar(m),
+                                muted,
+                                deafened,
+                                speaking,
+                                streaming,
+                                video,
+                            });
+                        }
+                        if (vcMembers.length > 0) {
+                            voiceChannels.push({
+                                guildId: guild.id,
+                                guildName: guild.name,
+                                channelName: channel.name,
+                                channelId: channel.id,
+                                members: vcMembers,
+                            });
+                        }
+                    }
+                }
+                // テキスト & アナウンスチャンネル一覧 (キャッシュ優先で即座に取得)
+                const textChannels = [];
+                const channelCollection = guild.channels.cache;
+                const asdfChannels = deps?.listAsdfChannels ? await deps.listAsdfChannels().catch(() => []) : [];
+                const asdfMap = new Map(asdfChannels.map(c => [c.id, c.name]));
+                for (const channel of channelCollection.values()) {
+                    if (!channel)
+                        continue;
+                    const chType = channel.type;
+                    if (chType === 0 || chType === 5 || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
+                        const binding = bindings.find(b => b.discordChannelId === channel.id);
+                        const boundChId = binding ? binding.asdfChannelId : null;
+                        const parent = channel.parent;
+                        const parentPos = parent ? ((parent.rawPosition ?? parent.position) ?? 0) : 999;
+                        const chPos = (channel.rawPosition ?? channel.position) ?? 0;
+                        textChannels.push({
+                            id: channel.id,
+                            name: channel.name,
+                            parentId: channel.parentId || parent?.id || null,
+                            parentName: parent?.name || null,
+                            parentPosition: parentPos,
+                            position: chPos,
+                            type: chType,
+                            boundAsdfChannelId: boundChId,
+                            boundAsdfChannelName: boundChId ? (asdfMap.get(boundChId) || null) : null,
+                        });
+                    }
+                }
+                textChannels.sort((a, b) => {
+                    const pPosA = a.parentPosition ?? 999;
+                    const pPosB = b.parentPosition ?? 999;
+                    if (pPosA !== pPosB)
+                        return pPosA - pPosB;
+                    const posA = a.position ?? 0;
+                    const posB = b.position ?? 0;
+                    if (posA !== posB)
+                        return posA - posB;
+                    return a.name.localeCompare(b.name, 'ja');
+                });
+                // メンバー & オンライン状態
+                const rawMemberList = Array.from(guild.members.cache.values());
+                let onlineCount = 0;
+                for (const m of rawMemberList) {
+                    const st = m.presence?.status || 'offline';
+                    if (st !== 'offline' || voiceMemberIds.has(m.id))
+                        onlineCount++;
+                }
+                // オンラインまたはVC参加中を優先して最大300名
+                const sortedRaw = rawMemberList
+                    .sort((a, b) => {
+                    const aVc = voiceMemberIds.has(a.id) ? 0 : 1;
+                    const bVc = voiceMemberIds.has(b.id) ? 0 : 1;
+                    if (aVc !== bVc)
+                        return aVc - bVc;
+                    const order = { online: 0, idle: 1, dnd: 2, offline: 3 };
+                    const aSt = order[a.presence?.status || 'offline'] ?? 3;
+                    const bSt = order[b.presence?.status || 'offline'] ?? 3;
+                    return aSt - bSt;
+                })
+                    .slice(0, 300);
+                const members = [];
+                for (const m of sortedRaw) {
+                    const presence = m.presence;
+                    const status = (presence?.status || (voiceMemberIds.has(m.id) ? 'online' : 'offline'));
+                    const acts = presence?.activities || [];
+                    const customAct = acts.find(a => a.type === 4);
+                    const customStatus = customAct ? [customAct.emoji?.name, customAct.state].filter(Boolean).join(' ') || null : null;
+                    const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2 || a.type === 3 || a.type === 5);
+                    const activityText = gameAct ? `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}` : customStatus;
+                    const activities = acts
+                        .filter(a => a.type !== 4)
+                        .map(a => ({
+                        name: a.name,
+                        type: a.type,
+                        details: a.details || null,
+                        state: a.state || null,
+                    }));
+                    const sortedRoles = Array.from(m.roles.cache.values())
+                        .filter(r => r.name !== '@everyone')
+                        .sort((a, b) => b.position - a.position);
+                    const roleDetails = sortedRoles.map(r => ({
+                        id: r.id,
+                        name: r.name,
+                        color: r.hexColor && r.hexColor !== '#000000' ? r.hexColor : '#94a3b8',
+                    }));
+                    const topRoleColor = roleDetails.find(r => r.color && r.color !== '#94a3b8')?.color || null;
+                    const bannerColor = (m.displayHexColor && m.displayHexColor !== '#000000' ? m.displayHexColor : null) ||
+                        (m.user.hexAccentColor || null);
+                    const clientStatus = presence?.clientStatus ? Object.keys(presence.clientStatus) : [];
+                    members.push({
                         id: m.id,
-                        name: m.displayName || m.user.globalName || m.user.username,
+                        username: m.user.username,
+                        globalName: m.user.globalName || null,
+                        nickname: m.nickname || null,
+                        displayName: m.displayName || m.user.globalName || m.user.username,
                         avatarUrl: await resolveMemberAvatar(m),
-                        muted,
-                        deafened,
-                        speaking,
-                        streaming,
-                        video,
-                    };
-                }));
-                if (vcMembers.length > 0) {
-                    voiceChannels.push({
-                        guildId: guild.id,
-                        guildName: guild.name,
-                        channelName: channel.name,
-                        channelId: channel.id,
-                        members: vcMembers,
+                        bannerColor,
+                        topRoleColor,
+                        status,
+                        activity: activityText,
+                        customStatus,
+                        activities,
+                        clientStatus,
+                        roles: sortedRoles.map(r => r.name),
+                        roleDetails,
+                        createdAt: m.user.createdAt ? m.user.createdAt.toISOString() : null,
+                        joinedAt: m.joinedAt ? m.joinedAt.toISOString() : null,
+                        premiumSince: m.premiumSince ? m.premiumSince.toISOString() : null,
+                        voiceChannelName: m.voice?.channel?.name || null,
+                        isBot: m.user.bot,
+                        inVoice: voiceMemberIds.has(m.id),
+                        speaking: speakingMemberIds.has(m.id),
                     });
                 }
-            }
-        }
-        // テキスト & アナウンスチャンネル一覧 (簡単紐付け・サーバー別同期用)
-        const textChannels = [];
-        let channelCollection = guild.channels.cache;
-        try {
-            channelCollection = await guild.channels.fetch();
-        }
-        catch {
-            channelCollection = guild.channels.cache;
-        }
-        const asdfChannels = deps?.listAsdfChannels ? await deps.listAsdfChannels().catch(() => []) : [];
-        const asdfMap = new Map(asdfChannels.map(c => [c.id, c.name]));
-        for (const channel of channelCollection.values()) {
-            if (!channel)
-                continue;
-            // GuildText (0) or GuildAnnouncement (5) or isTextBased
-            const chType = channel.type;
-            if (chType === 0 || chType === 5 || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
-                const binding = bindings.find(b => b.discordChannelId === channel.id);
-                const boundChId = binding ? binding.asdfChannelId : null;
-                const parent = channel.parent;
-                const parentPos = parent ? ((parent.rawPosition ?? parent.position) ?? 0) : 999;
-                const chPos = (channel.rawPosition ?? channel.position) ?? 0;
-                textChannels.push({
-                    id: channel.id,
-                    name: channel.name,
-                    parentId: channel.parentId || parent?.id || null,
-                    parentName: parent?.name || null,
-                    parentPosition: parentPos,
-                    position: chPos,
-                    type: chType,
-                    boundAsdfChannelId: boundChId,
-                    boundAsdfChannelName: boundChId ? (asdfMap.get(boundChId) || null) : null,
+                servers.push({
+                    id: guild.id,
+                    name: guild.name,
+                    iconUrl,
+                    approved,
+                    memberCount: guild.memberCount || rawMemberList.length,
+                    onlineCount,
+                    members,
+                    voiceChannels,
+                    textChannels,
                 });
             }
+            cachedDiscordServers = { time: Date.now(), data: servers };
+            return servers;
         }
-        // チャンネルを Discord と同じカテゴリ位置・チャンネル位置順でソート
-        textChannels.sort((a, b) => {
-            const pPosA = a.parentPosition ?? 999;
-            const pPosB = b.parentPosition ?? 999;
-            if (pPosA !== pPosB)
-                return pPosA - pPosB;
-            const posA = a.position ?? 0;
-            const posB = b.position ?? 0;
-            if (posA !== posB)
-                return posA - posB;
-            return a.name.localeCompare(b.name, 'ja');
-        });
-        // メンバー & オンライン状態
-        let memberCollection = guild.members.cache;
-        if (guild.members.cache.size <= 2) {
-            memberCollection = await guild.members.fetch({ time: 3500 }).catch(() => guild.members.cache);
+        finally {
+            pendingServersPromise = null;
         }
-        const rawMemberList = Array.from(memberCollection.values());
-        let onlineCount = 0;
-        for (const m of rawMemberList) {
-            const st = m.presence?.status || 'offline';
-            if (st !== 'offline' || voiceMemberIds.has(m.id))
-                onlineCount++;
-        }
-        // オンラインまたはVC参加中のメンバーを優先して取得 (オフライン含め最大300名)
-        const sortedRaw = rawMemberList
-            .sort((a, b) => {
-            const aVc = voiceMemberIds.has(a.id) ? 0 : 1;
-            const bVc = voiceMemberIds.has(b.id) ? 0 : 1;
-            if (aVc !== bVc)
-                return aVc - bVc;
-            const order = { online: 0, idle: 1, dnd: 2, offline: 3 };
-            const aSt = order[a.presence?.status || 'offline'] ?? 3;
-            const bSt = order[b.presence?.status || 'offline'] ?? 3;
-            return aSt - bSt;
-        })
-            .slice(0, 300);
-        const members = await Promise.all(sortedRaw.map(async (m) => {
-            const presence = m.presence;
-            const status = (presence?.status || (voiceMemberIds.has(m.id) ? 'online' : 'offline'));
-            const acts = presence?.activities || [];
-            const customAct = acts.find(a => a.type === 4);
-            const customStatus = customAct ? [customAct.emoji?.name, customAct.state].filter(Boolean).join(' ') || null : null;
-            const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2 || a.type === 3 || a.type === 5);
-            const activityText = gameAct
-                ? `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}`
-                : customStatus;
-            const activities = acts
-                .filter(a => a.type !== 4)
-                .map(a => ({
-                name: a.name,
-                type: a.type,
-                details: a.details || null,
-                state: a.state || null,
-            }));
-            const sortedRoles = Array.from(m.roles.cache.values())
-                .filter(r => r.name !== '@everyone')
-                .sort((a, b) => b.position - a.position);
-            const roleDetails = sortedRoles.map(r => ({
-                id: r.id,
-                name: r.name,
-                color: r.hexColor && r.hexColor !== '#000000' ? r.hexColor : '#94a3b8',
-            }));
-            const bannerColor = (m.displayHexColor && m.displayHexColor !== '#000000' ? m.displayHexColor : null) ||
-                (m.user.hexAccentColor || null);
-            const clientStatus = presence?.clientStatus ? Object.keys(presence.clientStatus) : [];
-            return {
-                id: m.id,
-                username: m.user.username,
-                globalName: m.user.globalName || null,
-                nickname: m.nickname || null,
-                displayName: m.displayName || m.user.globalName || m.user.username,
-                avatarUrl: await resolveMemberAvatar(m),
-                bannerColor,
-                status,
-                activity: activityText,
-                customStatus,
-                activities,
-                clientStatus,
-                roles: sortedRoles.map(r => r.name),
-                roleDetails,
-                createdAt: m.user.createdAt ? m.user.createdAt.toISOString() : null,
-                joinedAt: m.joinedAt ? m.joinedAt.toISOString() : null,
-                premiumSince: m.premiumSince ? m.premiumSince.toISOString() : null,
-                voiceChannelName: m.voice?.channel?.name || null,
-                isBot: m.user.bot,
-                inVoice: voiceMemberIds.has(m.id),
-                speaking: speakingMemberIds.has(m.id),
-            };
-        }));
-        servers.push({
-            id: guild.id,
-            name: guild.name,
-            iconUrl,
-            approved,
-            memberCount: guild.memberCount || rawMemberList.length,
-            onlineCount,
-            members,
-            voiceChannels,
-            textChannels,
-        });
-    }
-    return servers;
+    })();
+    const allServers = await pendingServersPromise;
+    if (includeUnapproved)
+        return allServers;
+    return allServers.filter(s => s.approved);
 }
 async function getDiscordGuildStatus() {
     if (!client || !connected) {
@@ -794,15 +827,27 @@ async function syncDiscordHistory(opts) {
             if (opts?.guildId && ch.guildId && ch.guildId !== opts.guildId)
                 continue;
             checkedChannels++;
-            const fetched = await ch.messages.fetch({ limit: fetchLimit }).catch(() => null);
+            // 紐付き先チャンネルのメッセージ数が30件未満なら、日付制限を無視して30件まで遡る
+            let isLowFrequencyChannel = false;
+            if (deps.getMessageCount) {
+                for (const t of targets) {
+                    const count = await deps.getMessageCount(t.asdfChannelId).catch(() => 30);
+                    if (count < 30) {
+                        isLowFrequencyChannel = true;
+                        break;
+                    }
+                }
+            }
+            const channelFetchLimit = isLowFrequencyChannel ? 30 : fetchLimit;
+            const fetched = await ch.messages.fetch({ limit: channelFetchLimit }).catch(() => null);
             if (!fetched)
                 continue;
             const sorted = Array.from(fetched.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
             for (const msg of sorted) {
                 if (isOurEchoMessage(msg))
                     continue;
-                // 古いメッセージ (2時間以上前) はスキップ
-                if (msg.createdTimestamp < oldestAllowedTime)
+                // 30件未満のチャンネルでない場合は、古いメッセージ (指定時間以上前) はスキップ
+                if (!isLowFrequencyChannel && msg.createdTimestamp < oldestAllowedTime)
                     continue;
                 if (deps.isDiscordMessageSynced) {
                     const already = await deps.isDiscordMessageSynced(msg.id);

@@ -118,6 +118,7 @@ import { setFaviconBadge } from './favicon';
 import AiTab from './AiTab';
 import TestScoresTab from './TestScoresTab';
 import HelpTab from './HelpTab';
+import { LATEST_PATCH_VERSION, PATCH_NOTES } from './patchNotes';
 import { WeatherDetail, WeatherHoverSummary, weatherIcon, type WeatherInfo } from './WeatherPanel';
 import { CalendarHoverSummary, CalendarPanel, monthRange, ymd, type CalendarEvent } from './CalendarPanel';
 
@@ -384,6 +385,13 @@ export default function App() {
   // Chat UI State (Mention, Search, Edit, Member Panel, Responsive)
   const [chatSearchQuery, setChatSearchQuery] = useState('');
   const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [searchFilterHasImage, setSearchFilterHasImage] = useState(false);
+  const [searchFilterHasFile, setSearchFilterHasFile] = useState(false);
+  const [searchFilterHasLink, setSearchFilterHasLink] = useState(false);
+  const [searchFilterPinned, setSearchFilterPinned] = useState(false);
+  const [searchFilterCurrentChannelOnly, setSearchFilterCurrentChannelOnly] = useState(true);
+  const [backendSearchResults, setBackendSearchResults] = useState<any[] | null>(null);
+  const [isSearchingBackend, setIsSearchingBackend] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
   const [editingContent, setEditingContent] = useState('');
   const [replyToMessage, setReplyToMessage] = useState<Message | null>(null);
@@ -414,6 +422,19 @@ export default function App() {
   const [linkDiscordChannelId, setLinkDiscordChannelId] = useState<string>('');
   const [linkAsdfChannelId, setLinkAsdfChannelId] = useState<string>('new');
   const [linkNewChannelName, setLinkNewChannelName] = useState<string>('');
+
+  // サーバー並び替え順 (ユーザー設定)
+  const [serverOrder, setServerOrder] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('asdf_server_order');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
+  // サーバー権限モーダル
+  const [serverPermModalGuild, setServerPermModalGuild] = useState<any | null>(null);
+  const [serverPermAllowedRoles, setServerPermAllowedRoles] = useState<string[]>([]);
+  const [serverPermAllowedUsers, setServerPermAllowedUsers] = useState<number[]>([]);
+  const [isSavingServerPerm, setIsSavingServerPerm] = useState(false);
 
   const discordUsernames = useMemo(() => {
     const s = new Set<string>();
@@ -545,7 +566,12 @@ export default function App() {
     try {
       const result = await Notification.requestPermission();
       setNotifyPermission(result);
-      if (result === 'granted') toast('通知をオンにしました', { kind: 'success' });
+      if (result === 'granted') {
+        setNotifyBannerDismissed(true);
+        LS.set('asdf_notify_banner_dismissed', '1');
+        syncPreferencesToServer({ notifyBannerDismissed: true });
+        toast('通知をオンにしました', { kind: 'success' });
+      }
       else if (result === 'denied') toast('通知がブロックされました。アドレスバーのサイト設定から許可できます', { kind: 'error' });
     } catch (_) {}
   };
@@ -726,6 +752,7 @@ export default function App() {
   // Phase 4 State: Ctrl+K Command Palette
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
+  const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
   const [calcResult, setCalcResult] = useState<string | null>(null);
 
   
@@ -738,6 +765,20 @@ export default function App() {
   const [memoLanguage, setMemoLanguage] = useState<string>('typescript');
   // その他タブのサブタブ ('scores' | 'patch_notes')
   const [moreSubTab, setMoreSubTab] = useState<'scores' | 'patch_notes'>('scores');
+  const [seenPatchVersion, setSeenPatchVersion] = useState<string>(() => localStorage.getItem('asdf_seen_patch_version') || '');
+  const hasUnreadPatchNotes = seenPatchVersion !== LATEST_PATCH_VERSION;
+  // ホワイトボード インラインテキスト配置
+  const [boardInlineText, setBoardInlineText] = useState<{ x: number; y: number; clientX: number; clientY: number; text: string } | null>(null);
+
+  // パッチノートを閲覧したら未読状態を解除
+  useEffect(() => {
+    if (activeTab === 'more' && moreSubTab === 'patch_notes') {
+      if (seenPatchVersion !== LATEST_PATCH_VERSION) {
+        localStorage.setItem('asdf_seen_patch_version', LATEST_PATCH_VERSION);
+        setSeenPatchVersion(LATEST_PATCH_VERSION);
+      }
+    }
+  }, [activeTab, moreSubTab, seenPatchVersion]);
   // Discord チャンネル同期一覧のアコーディオン展開状態 & 検索
   const [expandedServerBindings, setExpandedServerBindings] = useState<Record<string, boolean>>({});
   const [serverBindingSearch, setServerBindingSearch] = useState<string>('');
@@ -1034,6 +1075,14 @@ export default function App() {
         LS.set('asdf_last_read_announcement', String(next));
         return next;
       });
+    }
+    if (Array.isArray(prefs.serverOrder)) {
+      setServerOrder(prefs.serverOrder);
+      try { localStorage.setItem('asdf_server_order', JSON.stringify(prefs.serverOrder)); } catch (_) {}
+    }
+    if (typeof prefs.notifyBannerDismissed === 'boolean') {
+      setNotifyBannerDismissed(prefs.notifyBannerDismissed);
+      LS.set('asdf_notify_banner_dismissed', prefs.notifyBannerDismissed ? '1' : '0');
     }
     if (isInitial) {
       if (typeof prefs.activeTab === 'string' && TABS.some(t => t.id === prefs.activeTab)) {
@@ -2400,6 +2449,54 @@ export default function App() {
   // オンライン復帰時: 送れなかったメッセージを自動で再送
   retryFailedMessagesRef.current = () => {
     messages.filter(m => m.failed && m.client_nonce).forEach(m => handleRetryMessage(m));
+  };
+
+  // メッセージ全文検索 (バックエンド DB 全件検索 & フィルター)
+  const executeBackendSearch = async (
+    query = chatSearchQuery,
+    currChOnly = searchFilterCurrentChannelOnly,
+    hasImg = searchFilterHasImage,
+    hasF = searchFilterHasFile,
+    hasL = searchFilterHasLink,
+    pin = searchFilterPinned
+  ) => {
+    if (!token) return;
+    if (!query.trim() && !hasImg && !hasF && !hasL && !pin) {
+      setBackendSearchResults(null);
+      return;
+    }
+    setIsSearchingBackend(true);
+    try {
+      const params = new URLSearchParams();
+      if (query.trim()) params.set('q', query.trim());
+      if (currChOnly && activeChannelId) params.set('channelId', String(activeChannelId));
+      else if (selectedServerId && selectedServerId !== 'all') params.set('serverId', selectedServerId);
+      if (hasImg) params.set('hasImage', '1');
+      if (hasF) params.set('hasFile', '1');
+      if (hasL) params.set('hasLink', '1');
+      if (pin) params.set('pinned', '1');
+      params.set('limit', '60');
+
+      const res = await safeFetch(`/api/messages/search?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setBackendSearchResults(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error('Search error:', err);
+    } finally {
+      setIsSearchingBackend(false);
+    }
+  };
+
+  const jumpToSearchResult = (channelId: number, messageId: number) => {
+    setActiveChannelId(channelId);
+    setIsSearchOpen(false);
+    setChatSearchQuery('');
+    setBackendSearchResults(null);
+    jumpToMessage(messageId);
   };
 
   // 入力中であることを3秒おきに知らせる
@@ -3972,23 +4069,33 @@ export default function App() {
     ctx.restore();
   };
 
-  // Pointer Events: マウス・タッチ・ペン(Chromebook のスタイラス)を同じ処理で扱う
+  // Pointer Events: マウス・タッチ・ペン(iPad / Chromebook のスタイラス / 筆圧 / パームリジェクション対応)
+  const activePointerTypeRef = useRef<string | null>(null);
+
   const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (boardMode !== 'draw' && boardMode !== 'eraser') return;
-    if (activePointerRef.current !== null) return; // マルチタッチの2本目は無視 (線の暴走防止)
+    // パームリジェクション: ペン描画中にタッチが触れても無視する
+    if (activePointerRef.current !== null) {
+      if (activePointerTypeRef.current === 'pen' && e.pointerType === 'touch') return;
+      return;
+    }
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     activePointerRef.current = e.pointerId;
+    activePointerTypeRef.current = e.pointerType;
     const p = getCanvasCoords(e);
     strokePointsRef.current = [p];
     setIsDrawing(true);
-    drawSegment(p, { x: p.x + 0.01, y: p.y + 0.01 }, boardMode === 'eraser' ? eraserWidth : brushWidth);
+    const pressureWidth = (e.pointerType === 'pen' && e.pressure > 0)
+      ? brushWidth * (0.3 + e.pressure * 1.4)
+      : brushWidth;
+    drawSegment(p, { x: p.x + 0.01, y: p.y + 0.01 }, boardMode === 'eraser' ? eraserWidth : pressureWidth);
   };
 
   const handleCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (activePointerRef.current !== e.pointerId) return;
+    if (activePointerTypeRef.current === 'pen' && e.pointerType === 'touch') return;
     e.preventDefault();
-    // ペンの速い動きも取りこぼさないよう coalesced events を使う
     const events = typeof e.nativeEvent.getCoalescedEvents === 'function' ? e.nativeEvent.getCoalescedEvents() : [];
     const list = events.length > 0 ? events : [e.nativeEvent];
     for (const ev of list) {
@@ -3997,13 +4104,17 @@ export default function App() {
       const last = pts[pts.length - 1];
       if (last && Math.abs(last.x - p.x) < 0.8 && Math.abs(last.y - p.y) < 0.8) continue;
       pts.push(p);
-      if (last) drawSegment(last, p, boardMode === 'eraser' ? eraserWidth : brushWidth);
+      const pressureWidth = (e.pointerType === 'pen' && (ev.pressure || 0) > 0)
+        ? brushWidth * (0.3 + (ev.pressure || 0.5) * 1.4)
+        : brushWidth;
+      if (last) drawSegment(last, p, boardMode === 'eraser' ? eraserWidth : pressureWidth);
     }
   };
 
   const finishStroke = async (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (activePointerRef.current !== e.pointerId) return;
     activePointerRef.current = null;
+    activePointerTypeRef.current = null;
     setIsDrawing(false);
     const points = strokePointsRef.current;
     strokePointsRef.current = [];
@@ -4035,9 +4146,46 @@ export default function App() {
   };
 
   const handleAddBoardText = async (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (boardMode !== 'text' || !newBoardText.trim() || !token) return;
+    if (boardMode !== 'text' || !token) return;
     const { x, y } = getCanvasCoords(e);
 
+    // テキスト欄に既に文字がある場合は即時配置、ない場合はその位置にインライン入力ボックスを開く
+    if (newBoardText.trim()) {
+      try {
+        const res = await safeFetch(`${API_BASE_URL}/api/board/text`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({ x, y, text: newBoardText })
+        });
+        if (res.ok) {
+          const saved = await res.json();
+          setBoardUndoStack(prev => [...prev, { kind: 'text', item: saved }]);
+          setBoardRedoStack([]);
+        }
+        setNewBoardText('');
+      } catch (err) {
+        console.error(err);
+      }
+    } else {
+      const rect = e.currentTarget.getBoundingClientRect();
+      setBoardInlineText({
+        x,
+        y,
+        clientX: e.clientX - rect.left,
+        clientY: e.clientY - rect.top,
+        text: '',
+      });
+    }
+  };
+
+  const submitInlineBoardText = async (text: string) => {
+    if (!boardInlineText || !text.trim() || !token) {
+      setBoardInlineText(null);
+      return;
+    }
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/board/text`, {
         method: 'POST',
@@ -4045,16 +4193,17 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ x, y, text: newBoardText })
+        body: JSON.stringify({ x: boardInlineText.x, y: boardInlineText.y, text: text.trim() })
       });
       if (res.ok) {
         const saved = await res.json();
         setBoardUndoStack(prev => [...prev, { kind: 'text', item: saved }]);
         setBoardRedoStack([]);
       }
-      setNewBoardText('');
     } catch (err) {
       console.error(err);
+    } finally {
+      setBoardInlineText(null);
     }
   };
 
@@ -4280,6 +4429,75 @@ export default function App() {
   const getMainServerId = (): string => {
     const srv = discordServers.find(s => /2年|２年/.test(s.name || '')) || discordServers[0];
     return srv?.id || '1524703392927191100';
+  };
+
+  // ユーザーごとのサーバー並び順を反映したサーバーリスト
+  const sortedDiscordServers = useMemo(() => {
+    if (!serverOrder || serverOrder.length === 0) return discordServers;
+    const orderMap = new Map(serverOrder.map((id, idx) => [id, idx]));
+    return [...discordServers].sort((a, b) => {
+      const idxA = orderMap.has(a.id) ? orderMap.get(a.id)! : 999;
+      const idxB = orderMap.has(b.id) ? orderMap.get(b.id)! : 999;
+      return idxA - idxB;
+    });
+  }, [discordServers, serverOrder]);
+
+  const handleReorderServer = (sourceId: string, targetId: string) => {
+    if (sourceId === targetId) return;
+    const currentList = sortedDiscordServers.map(s => s.id);
+    const fromIdx = currentList.indexOf(sourceId);
+    const toIdx = currentList.indexOf(targetId);
+    if (fromIdx < 0 || toIdx < 0) return;
+    const next = [...currentList];
+    const [moved] = next.splice(fromIdx, 1);
+    next.splice(toIdx, 0, moved);
+    setServerOrder(next);
+    try { localStorage.setItem('asdf_server_order', JSON.stringify(next)); } catch (_) {}
+    syncPreferencesToServer({ serverOrder: next });
+  };
+
+  const handleOpenServerPermissions = async (guild: any) => {
+    if (!guild || !token) return;
+    setServerPermModalGuild(guild);
+    try {
+      const res = await safeFetch(`/api/server-permissions/${guild.id}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setServerPermAllowedRoles(Array.isArray(data.allowed_roles) ? data.allowed_roles : []);
+        setServerPermAllowedUsers(Array.isArray(data.allowed_users) ? data.allowed_users : []);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleSaveServerPermissions = async () => {
+    if (!serverPermModalGuild || !token) return;
+    setIsSavingServerPerm(true);
+    try {
+      const res = await safeFetch(`/api/server-permissions/${serverPermModalGuild.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          allowed_roles: serverPermAllowedRoles,
+          allowed_users: serverPermAllowedUsers,
+        })
+      });
+      if (res.ok) {
+        toast('サーバー権限設定を保存しました', { kind: 'success' });
+        setServerPermModalGuild(null);
+        fetchDiscordServers();
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        toast(errData.error || '保存に失敗しました', { kind: 'error' });
+      }
+    } catch (err: any) {
+      toast(err.message || '保存に失敗しました', { kind: 'error' });
+    } finally {
+      setIsSavingServerPerm(false);
+    }
   };
 
   // チャンネルを所属する Discord サーバーに振り分ける (バインディングを最優先)
@@ -4746,11 +4964,16 @@ export default function App() {
                   className={`relative px-2 lg:px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 whitespace-nowrap border ${
                     isActive 
                       ? 'bg-amber-500/10 text-amber-400 border-amber-500/30' 
+                      : tab.id === 'more' && hasUnreadPatchNotes
+                      ? 'text-amber-300 border-amber-500/50 bg-amber-500/10 shadow-[0_0_12px_rgba(245,158,11,0.3)]'
                       : 'text-stone-400 border-transparent hover:text-stone-100 hover:bg-stone-800/70 hover:border-stone-700/60'
                   }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
                   <span className="hidden lg:inline">{tab.label}</span>
+                  {tab.id === 'more' && hasUnreadPatchNotes && (
+                    <span className="w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.9)] animate-pulse" title="新しいパッチノートがあります" />
+                  )}
                   {tab.id === 'chat' && totalMentions > 0 && (
                     <span className="anim-badge min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold leading-[18px] text-center">
                       {totalMentions > 99 ? '99+' : totalMentions}
@@ -5062,6 +5285,7 @@ export default function App() {
             onClick={() => {
               setNotifyBannerDismissed(true);
               LS.set('asdf_notify_banner_dismissed', '1');
+              syncPreferencesToServer({ notifyBannerDismissed: true });
             }}
             className="shrink-0 p-1 rounded text-amber-300/70 hover:text-white"
             aria-label="閉じる"
@@ -5095,9 +5319,9 @@ export default function App() {
             {/* Channels Sidebar (左にサーバーレール + チャンネル一覧) */}
             {!isChannelsCollapsed && (
               <aside className="absolute md:static inset-y-0 left-0 z-40 w-80 md:w-72 lg:w-80 border-r border-stone-800 bg-[#0C0D10] flex flex-row shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
-                {/* 左端: Discord風 サーバーレール (プロキシ/ローカルキャッシュアイコン表示 & VC/メンションバッジ) */}
+                {/* 左端: Discord風 サーバーレール (ドラッグ並び替え・プロキシ/ローカルキャッシュアイコン表示 & VC/メンションバッジ) */}
                 <div className="w-12 border-r border-stone-800/80 bg-[#08090B] flex flex-col items-center py-2.5 gap-2 overflow-y-auto shrink-0 select-none">
-                  {discordServers.map((srv: any) => {
+                  {sortedDiscordServers.map((srv: any) => {
                     const isSelected = selectedServerId === srv.id;
                     const vcsList = Array.isArray(srv.voiceChannels) ? srv.voiceChannels : Array.isArray(srv.vcs) ? srv.vcs : [];
                     const vcCount = vcsList.reduce((s: number, v: any) => s + (v.members?.length || 0), 0);
@@ -5108,6 +5332,14 @@ export default function App() {
                       <button
                         key={srv.id}
                         type="button"
+                        draggable
+                        onDragStart={e => e.dataTransfer.setData('text/plain', srv.id)}
+                        onDragOver={e => e.preventDefault()}
+                        onDrop={e => {
+                          e.preventDefault();
+                          const src = e.dataTransfer.getData('text/plain');
+                          if (src) handleReorderServer(src, srv.id);
+                        }}
                         onClick={() => {
                           setSelectedServerId(srv.id);
                           if (srvChannels.length > 0 && !srvChannels.some(c => c.id === activeChannelId)) {
@@ -5116,8 +5348,8 @@ export default function App() {
                             setActiveChannelId(targetChannel.id);
                           }
                         }}
-                        title={`${srv.name}${vcCount > 0 ? ` (VC ${vcCount}人)` : ''}`}
-                        className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group ${
+                        title={`${srv.name} (ドラッグで並び替え)${vcCount > 0 ? ` (VC ${vcCount}人)` : ''}`}
+                        className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group cursor-grab active:cursor-grabbing ${
                           isSelected
                             ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
                             : 'bg-[#14161C] hover:bg-stone-800 hover:rounded-xl border border-stone-800/80'
@@ -5132,10 +5364,10 @@ export default function App() {
                           <img
                             src={toProxiedMediaUrl(srv.iconUrl, token)}
                             alt={srv.name}
-                            className="w-full h-full rounded-[inherit] object-cover"
+                            className="w-full h-full rounded-[inherit] object-cover pointer-events-none"
                           />
                         ) : (
-                          <span className="flex items-center justify-center text-indigo-400" title={srv.name}>
+                          <span className="flex items-center justify-center text-indigo-400 pointer-events-none" title={srv.name}>
                             <DiscordIcon className="w-5 h-5" />
                           </span>
                         )}
@@ -5173,6 +5405,18 @@ export default function App() {
                       </span>
                     )}
                   </button>
+
+                  {/* 全体ロール管理ボタン (管理者向け) */}
+                  {currentUser?.role === 'admin' && (
+                    <button
+                      type="button"
+                      onClick={() => setShowRoleManagerModal(true)}
+                      title="全体ロール & メンバー権限管理 (admin専用)"
+                      className="relative w-9 h-9 rounded-2xl bg-[#14161C] border border-stone-800 hover:border-amber-400 text-stone-400 hover:text-amber-400 flex items-center justify-center transition"
+                    >
+                      <Shield className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
 
                 {/* 右側: サーバー情報 & チャンネル一覧 */}
@@ -5216,12 +5460,12 @@ export default function App() {
                       >
                         <Link className="w-3.5 h-3.5" />
                       </button>
-                      {currentUser?.role === 'admin' && (
+                      {currentUser?.role === 'admin' && selectedServer && (
                         <button
                           type="button"
-                          onClick={() => setShowRoleManagerModal(true)}
+                          onClick={() => handleOpenServerPermissions(selectedServer)}
                           className="p-1 hover:text-amber-400 rounded text-stone-400 hover:bg-stone-800"
-                          title="ロール管理・メンバー権限設定 (admin専用)"
+                          title="このサーバーの権限設定 (閲覧できるロール/ユーザーの制限)"
                         >
                           <Shield className="w-3.5 h-3.5" />
                         </button>
@@ -5600,25 +5844,128 @@ export default function App() {
 
                 <div className="flex items-center gap-1.5 shrink-0">
                   {isSearchOpen ? (
-                    <div className="flex items-center gap-1.5 bg-[#16181D] border border-stone-800 px-2 py-1 rounded-lg anim-fade">
-                      <Search className="w-3.5 h-3.5 text-stone-500" />
-                      <input
-                        type="text"
-                        autoFocus
-                        placeholder="検索"
-                        value={chatSearchQuery}
-                        onChange={e => setChatSearchQuery(e.target.value)}
-                        className="bg-transparent text-white focus:outline-none w-24 sm:w-44 text-[11px]"
-                      />
-                      <button onClick={() => { setIsSearchOpen(false); setChatSearchQuery(''); }} className="text-stone-500 hover:text-white">
-                        <X className="w-3 h-3" />
-                      </button>
+                    <div className="flex flex-col gap-1.5 bg-[#16181D] border border-stone-800 p-2 rounded-xl anim-fade absolute right-2 top-2 z-30 shadow-2xl max-w-md w-[calc(100vw-2rem)] sm:w-96">
+                      <div className="flex items-center gap-1.5">
+                        <Search className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <input
+                          type="text"
+                          autoFocus
+                          placeholder="メッセージを検索 (Enterで実行)…"
+                          value={chatSearchQuery}
+                          onChange={e => {
+                            setChatSearchQuery(e.target.value);
+                            executeBackendSearch(e.target.value);
+                          }}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') executeBackendSearch();
+                            if (e.key === 'Escape') {
+                              setIsSearchOpen(false);
+                              setChatSearchQuery('');
+                              setBackendSearchResults(null);
+                            }
+                          }}
+                          className="bg-transparent text-white focus:outline-none flex-1 text-xs"
+                        />
+                        {isSearchingBackend && <RefreshCw className="w-3 h-3 animate-spin text-amber-400 shrink-0" />}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsSearchOpen(false);
+                            setChatSearchQuery('');
+                            setBackendSearchResults(null);
+                          }}
+                          className="text-stone-500 hover:text-white p-0.5"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      {/* フィルターチップ */}
+                      <div className="flex flex-wrap items-center gap-1 pt-1 border-t border-stone-800/80 text-[10px]">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next = !searchFilterCurrentChannelOnly;
+                            setSearchFilterCurrentChannelOnly(next);
+                            executeBackendSearch(chatSearchQuery, next);
+                          }}
+                          className={`px-2 py-0.5 rounded-full border transition ${
+                            searchFilterCurrentChannelOnly
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                              : 'bg-stone-800/60 text-stone-400 border-stone-700 hover:text-stone-200'
+                          }`}
+                        >
+                          {searchFilterCurrentChannelOnly ? `#${activeChannelName} のみ` : 'サーバー全体'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next = !searchFilterHasImage;
+                            setSearchFilterHasImage(next);
+                            executeBackendSearch(chatSearchQuery, searchFilterCurrentChannelOnly, next);
+                          }}
+                          className={`px-2 py-0.5 rounded-full border transition ${
+                            searchFilterHasImage
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                              : 'bg-stone-800/60 text-stone-400 border-stone-700 hover:text-stone-200'
+                          }`}
+                        >
+                          画像あり
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next = !searchFilterHasFile;
+                            setSearchFilterHasFile(next);
+                            executeBackendSearch(chatSearchQuery, searchFilterCurrentChannelOnly, searchFilterHasImage, next);
+                          }}
+                          className={`px-2 py-0.5 rounded-full border transition ${
+                            searchFilterHasFile
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                              : 'bg-stone-800/60 text-stone-400 border-stone-700 hover:text-stone-200'
+                          }`}
+                        >
+                          ファイルあり
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next = !searchFilterHasLink;
+                            setSearchFilterHasLink(next);
+                            executeBackendSearch(chatSearchQuery, searchFilterCurrentChannelOnly, searchFilterHasImage, searchFilterHasFile, next);
+                          }}
+                          className={`px-2 py-0.5 rounded-full border transition ${
+                            searchFilterHasLink
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                              : 'bg-stone-800/60 text-stone-400 border-stone-700 hover:text-stone-200'
+                          }`}
+                        >
+                          リンクあり
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next = !searchFilterPinned;
+                            setSearchFilterPinned(next);
+                            executeBackendSearch(chatSearchQuery, searchFilterCurrentChannelOnly, searchFilterHasImage, searchFilterHasFile, searchFilterHasLink, next);
+                          }}
+                          className={`px-2 py-0.5 rounded-full border transition ${
+                            searchFilterPinned
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                              : 'bg-stone-800/60 text-stone-400 border-stone-700 hover:text-stone-200'
+                          }`}
+                        >
+                          ピン留め
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <button
-                      onClick={() => setIsSearchOpen(true)}
+                      onClick={() => {
+                        setIsSearchOpen(true);
+                        executeBackendSearch(chatSearchQuery);
+                      }}
                       className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white hover:border-stone-600"
-                      title="検索"
+                      title="検索・フィルター"
                     >
                       <Search className="w-3.5 h-3.5" />
                     </button>
@@ -5665,7 +6012,56 @@ export default function App() {
                   </div>
                 )}
 
-                {messages.filter(m => !chatSearchQuery || (m.content || '').toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
+                {backendSearchResults !== null ? (
+                  <div className="space-y-2 py-2">
+                    <div className="flex items-center justify-between px-2 py-1 border-b border-stone-800 text-xs text-stone-400">
+                      <span>検索結果: <b className="text-amber-400">{backendSearchResults.length}</b> 件</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBackendSearchResults(null);
+                          setChatSearchQuery('');
+                          setIsSearchOpen(false);
+                        }}
+                        className="text-stone-500 hover:text-white"
+                      >
+                        検索を終了
+                      </button>
+                    </div>
+                    {backendSearchResults.length === 0 ? (
+                      <div className="py-12 text-center text-stone-500 text-xs">
+                        条件に一致するメッセージは見つかりませんでした
+                      </div>
+                    ) : (
+                      backendSearchResults.map(m => {
+                        const { name: displayName, fromDiscord } = splitSenderName(m.sender_username || m.username || 'unknown');
+                        const created = new Date(m.created_at);
+                        const timeStr = `${created.getMonth() + 1}/${created.getDate()} ${pad2(created.getHours())}:${pad2(created.getMinutes())}`;
+                        return (
+                          <div
+                            key={m.id}
+                            onClick={() => jumpToSearchResult(m.channel_id, m.id)}
+                            className="p-3 rounded-xl bg-[#12141A] border border-stone-800/80 hover:border-amber-500/50 hover:bg-[#161820] transition cursor-pointer space-y-1.5"
+                          >
+                            <div className="flex items-center justify-between text-[11px]">
+                              <div className="flex items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-mono text-[10px] font-bold">
+                                  #{m.channel_name || 'channel'}
+                                </span>
+                                <span className="font-bold text-stone-200">{displayName}</span>
+                                {fromDiscord && <DiscordIcon className="w-3 h-3 text-indigo-400" />}
+                              </div>
+                              <span className="text-stone-500 text-[10px]">{timeStr}</span>
+                            </div>
+                            <div className="text-xs text-stone-300 line-clamp-3">
+                              {m.content}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                ) : messages.filter(m => !chatSearchQuery || (m.content || '').toLowerCase().includes(chatSearchQuery.toLowerCase())).length === 0 ? (
                   channelLoadState !== 'ready' && !chatSearchQuery ? (
                     <div className="h-full flex flex-col items-center justify-center text-stone-500 text-xs space-y-3 anim-fade">
                       {channelLoadState === 'loading' ? (
@@ -6466,7 +6862,7 @@ export default function App() {
                                     </div>
                                     <div className="min-w-0 flex-1">
                                       <div className="flex items-center gap-1 truncate">
-                                        <span className="truncate">{name}</span>
+                                        <span className="truncate" style={{ color: m.topRoleColor || undefined }}>{name}</span>
                                         {m.isBot && <span className="text-[9px] px-1 rounded bg-indigo-500/20 text-indigo-300 font-mono shrink-0">BOT</span>}
                                         {m.inVoice && <Volume2 className="w-3 h-3 text-emerald-400 shrink-0" />}
                                       </div>
@@ -6515,7 +6911,7 @@ export default function App() {
                                     </div>
                                     <div className="min-w-0 flex-1">
                                       <div className="flex items-center gap-1 truncate">
-                                        <span className="truncate">{name}</span>
+                                        <span className="truncate" style={{ color: m.topRoleColor || undefined, opacity: m.topRoleColor ? 0.8 : undefined }}>{name}</span>
                                         {m.isBot && <span className="text-[9px] px-1 rounded bg-stone-800 text-stone-500 font-mono shrink-0">BOT</span>}
                                       </div>
                                     </div>
@@ -6587,7 +6983,15 @@ export default function App() {
                                   group === 'online' ? 'bg-emerald-400' : group === 'away' ? 'bg-amber-400' : 'bg-stone-600'
                                 }`} />
                               </div>
-                              <span className="truncate">{u.username}</span>
+                              <span
+                                className="truncate"
+                                style={{
+                                  color: u.role === 'admin' ? '#f43f5e' : (roleDefs.find(r => r.id === u.role)?.color || undefined),
+                                  opacity: group === 'offline' ? 0.7 : undefined,
+                                }}
+                              >
+                                {u.username}
+                              </span>
                               {u.id === currentUser.id && <span className="ml-auto text-[10px] text-stone-500">あなた</span>}
                             </button>
                           ))}
@@ -7659,6 +8063,47 @@ export default function App() {
                 className="w-full h-full block select-none"
               />
 
+              {/* テキストモード時のインライン入力ボックス */}
+              {boardInlineText && (
+                <div
+                  className="absolute z-20 anim-pop"
+                  style={{ left: `${boardInlineText.clientX}px`, top: `${boardInlineText.clientY}px` }}
+                >
+                  <form
+                    onSubmit={e => {
+                      e.preventDefault();
+                      submitInlineBoardText(boardInlineText.text);
+                    }}
+                    className="flex items-center gap-1 bg-[#111214] border border-amber-500 rounded-xl p-1 shadow-2xl"
+                  >
+                    <input
+                      autoFocus
+                      type="text"
+                      placeholder="文字を入力してEnter…"
+                      value={boardInlineText.text}
+                      onChange={e => setBoardInlineText(prev => prev ? { ...prev, text: e.target.value } : prev)}
+                      onKeyDown={e => {
+                        if (e.key === 'Escape') setBoardInlineText(null);
+                      }}
+                      className="bg-transparent text-white focus:outline-none px-2 py-1 text-sm font-bold min-w-[140px]"
+                    />
+                    <button
+                      type="submit"
+                      className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs"
+                    >
+                      配置
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBoardInlineText(null)}
+                      className="px-1.5 py-1 rounded-lg hover:bg-stone-800 text-stone-400 hover:text-white"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </form>
+                </div>
+              )}
+
               {/* 共有クリップボード (折りたたみ可) */}
               <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 w-[calc(100%-1rem)] sm:w-80 bg-[#111214]/90 backdrop-blur-md border border-stone-800/80 rounded-2xl shadow-2xl font-mono text-xs cursor-auto">
                 <button
@@ -7719,14 +8164,18 @@ export default function App() {
                   className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
                     moreSubTab === 'patch_notes'
                       ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                      : hasUnreadPatchNotes
+                      ? 'text-amber-300 border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 animate-pulse'
                       : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/60'
                   }`}
                 >
                   <FileText className="w-3.5 h-3.5" />
                   <span>パッチノート</span>
-                  <span className="px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-mono border border-emerald-500/30 font-bold">
-                    NEW
-                  </span>
+                  {hasUnreadPatchNotes && (
+                    <span className="px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-mono border border-amber-500/40 font-bold">
+                      NEW
+                    </span>
+                  )}
                 </button>
               </div>
             </div>
@@ -7740,143 +8189,48 @@ export default function App() {
                   <div className="max-w-3xl mx-auto space-y-6">
                     <div className="border-b border-stone-800/80 pb-4">
                       <div className="flex items-center gap-2 mb-1">
-                        <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-xs font-mono font-bold border border-amber-500/40">v2.6.0</span>
-                        <h2 className="text-xl sm:text-2xl font-bold font-['Space_Grotesk'] text-white">最新アップデート パッチノート</h2>
+                        <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-xs font-mono font-bold border border-amber-500/40">
+                          {LATEST_PATCH_VERSION}
+                        </span>
+                        <h2 className="text-xl sm:text-2xl font-bold font-['Space_Grotesk'] text-white">アップデート パッチノート</h2>
                       </div>
-                      <p className="text-xs text-stone-400">メンバープロフィール詳細・ボードの元に戻す/やり直し・特別時程対応・コードゾーンDLなど14項目の機能追加＆改善</p>
+                      <p className="text-xs text-stone-400">asdfbase の機能追加・修正・パフォーマンス改善の全履歴</p>
                     </div>
 
-                    {/* v2.6.0: 今回の最新アップデート */}
-                    <div className="p-4 rounded-2xl bg-amber-500/5 border border-amber-500/30 space-y-3">
-                      <div className="flex items-center gap-2 text-sm font-bold text-amber-400">
-                        <Sparkles className="w-4 h-4" />
-                        <span>v2.6.0 アップデート内容 (最新)</span>
+                    {PATCH_NOTES.map((pn, pIdx) => (
+                      <div
+                        key={pn.version}
+                        className={`p-4 sm:p-5 rounded-2xl space-y-3.5 border ${
+                          pIdx === 0
+                            ? 'bg-amber-500/5 border-amber-500/30 shadow-[0_0_20px_rgba(245,158,11,0.06)]'
+                            : 'bg-[#111214] border-stone-800'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-800/80 pb-2.5">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-xs font-mono font-bold border ${
+                                pIdx === 0
+                                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                                  : 'bg-stone-800 text-stone-300 border-stone-700'
+                              }`}
+                            >
+                              {pn.version}
+                            </span>
+                            <span className="font-bold text-sm sm:text-base text-white">{pn.title}</span>
+                          </div>
+                          <span className="text-[11px] font-mono text-stone-500">{pn.date}</span>
+                        </div>
+                        {pn.summary && <p className="text-xs text-stone-400 leading-relaxed">{pn.summary}</p>}
+                        <ul className="space-y-2 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
+                          {pn.items.map((item, itIdx) => (
+                            <li key={itIdx}>
+                              <b className="text-stone-100">{item.title}</b>: {item.description}
+                            </li>
+                          ))}
+                        </ul>
                       </div>
-                      <ul className="space-y-2 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
-                        <li>
-                          <b>メンバープロフィール・Bio・ロール確認モーダル</b>:
-                          メンバー一覧のユーザー（Discord / asdfbase）をクリックすると、Discord風のプロフィールモーダルが開き、バナー色、アバター、所有ロール一覧（各ロールカラー付き）、接続端末（PC/スマホ/Web）、カスタムステータス・アクティビティ、VC接続状況、アカウント作成日、サーバー参加日を確認し、ワンクリックでメンションできるようになりました。
-                        </li>
-                        <li>
-                          <b>ホワイトボードの元に戻す (Undo)・やり直し (Redo) & 1:1キャンバス</b>:
-                          描いた線やテキストをツールバーボタンまたは <kbd className="px-1.5 py-0.5 rounded bg-stone-800 border border-stone-700 text-[10px] font-mono">Ctrl + Z</kbd> / <kbd className="px-1.5 py-0.5 rounded bg-stone-800 border border-stone-700 text-[10px] font-mono">Ctrl + Y</kbd> で取り消し・再適用できるようになりました。キャンバスの余白計算を改善し、画面横幅いっぱいに描画可能で描画位置も正確に1:1で一致するようになりました。
-                        </li>
-                        <li>
-                          <b>特別時程のバリエーション対応（2時間授業等）& 通常時間割からのコピー</b>:
-                          2時間授業や行事・学活などに対応するため、各曜日の授業時間数（1〜6限）を自由に切り替えられる専用の特別時程（special）時間割を新設。「通常時間割からコピー」ボタンでワンクリックで基本の時間割を複製して手軽に編集できるようになりました。ヘッダーのバッジも特別時程時は「特別」と表示されます。
-                        </li>
-                        <li>
-                          <b>ヘルプ画面でその場でAIに質問・回答表示</b>:
-                          AIタブに画面遷移することなく、ヘルプタブ内の入力欄から直接アプリの使い方や機能について質問でき、画面内にインラインで回答が表示されるようになりました。
-                        </li>
-                        <li>
-                          <b>コードゾーンの無制限作成 & 言語別ファイルダウンロード</b>:
-                          1人あたりのコードゾーン作成数制限を撤廃し、用途や言語ごとに何個でも作成可能になりました。タイトルや言語の事前指定にも対応し、エディタツールバーの「DL」ボタンから選択言語に応じた拡張子（<code>.html</code>, <code>.ts</code>, <code>.py</code> など）でファイルとして直接ダウンロードできるようになりました。
-                        </li>
-                        <li>
-                          <b>リアクションの名前解決（「ほか N 人」の解消）</b>:
-                          リアクションチップのホバー・クリック時に、Discord側のメンバーやサーバー参加者の表示名が正しく一覧表示されるようになりました。
-                        </li>
-                        <li>
-                          <b>絵文字の拡大表示（ジャンボ絵文字）</b>:
-                          絵文字のみのメッセージや <code>:melting_face:</code>・<code>:swim:</code> 等のショートコード、Unicode絵文字が特大サイズで大きく表示されるようになりました。
-                        </li>
-                        <li>
-                          <b>AIストリーミングの滑らかなアニメーション & 完了時の表示クリア</b>:
-                          AI回答中の文字出力がガタつかず滑らかに流れるタイピングアニメーションを導入し、「思考中・ツールを実行中…」が完了後に残ってしまう問題を解消しました。
-                        </li>
-                        <li>
-                          <b>Botメッセージへの「BOT」バッジ表示</b>:
-                          Discord Botからのメッセージに、Discordアイコンの横に紫色の「BOT」バッジが表示されるようになりました。
-                        </li>
-                        <li>
-                          <b>AIチャットの履歴削除 ＝ セッション完全削除</b>:
-                          履歴削除操作で現在の会話セッションを完全にリセット・削除するように統一しました。
-                        </li>
-                        <li>
-                          <b>Markdown目次内アンカーリンクのジャンプ後の巻き戻り防止</b>:
-                          目次から見出しへ飛んだ際にエディタ側のスクロール同期で元の位置に引き戻されてしまう挙動を修正しました。
-                        </li>
-                        <li>
-                          <b>Webhookメッセージ編集時の再送信</b>:
-                          編集時に古いメッセージを削除した上で新しい内容を送信し、Discord側にも確実に編集が反映されるようになりました。
-                        </li>
-                        <li>
-                          <b>asdfbaseメンバー一覧の正確化</b>:
-                          Discord疑似ユーザーが asdfbase メンバー一覧に混ざって表示されないようフィルタリングを分離しました。
-                        </li>
-                      </ul>
-                    </div>
-
-                    {/* 過去バージョン (v2.5.0) */}
-                    <div className="border-t border-stone-800/80 pt-4">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="px-2 py-0.5 rounded-full bg-stone-800 text-stone-300 text-xs font-mono font-bold border border-stone-700">v2.5.0</span>
-                        <h3 className="text-base font-bold text-stone-300">前回アップデート</h3>
-                      </div>
-                    </div>
-
-                    {/* 1. Discord連携・メッセージ送受信 */}
-                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
-                      <div className="flex items-center gap-2 text-sm font-bold text-indigo-400">
-                        <DiscordIcon className="w-4 h-4" />
-                        <span>1. Discord連携・メッセージ送受信の強化</span>
-                      </div>
-                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
-                        <li><b>Webhook送信の導入</b>: 「rds9:」表記を廃止し、送信者のアイコンとユーザー名がDiscord側にそのまま反映されるようになりました。</li>
-                        <li><b>送信中チャンネル移動の混入防止</b>: メッセージや画像送信中に別チャンネルへ移動しても、元のチャンネルへ正確に投稿されます。</li>
-                        <li><b>サーバー切替時のチャンネル記憶</b>: サーバーを切り替えた際、常に一番上ではなく前回見ていたチャンネルへ復帰するようになりました。</li>
-                        <li><b>外部Bot・他Webhookの取得</b>: 他のBotや外部Webhookのメッセージもasdfbase側で漏れなく受信できるようになりました。</li>
-                        <li><b>メッセージ削除のDiscord同期</b>: asdfbase側でメッセージを削除した際、Discord側にも即座に「(メッセージが削除されました)」として反映されます。</li>
-                        <li><b>画像ペースト時のHTMLタグ混入防止</b>: 画像をクリップボードから貼り付けた際に不要なタグが入力欄に入らないよう修正しました。</li>
-                        <li><b>Discord公式ロゴ</b>: サーバーアイコンやチャンネルタグの「DC」表記を公式ロゴSVGに統一しました。</li>
-                      </ul>
-                    </div>
-
-                    {/* 2. リアクション周りの改善 */}
-                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
-                      <div className="flex items-center gap-2 text-sm font-bold text-amber-400">
-                        <Smile className="w-4 h-4" />
-                        <span>2. リアクション周りの改善</span>
-                      </div>
-                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
-                        <li><b>楽観的UI (Optimistic UI)</b>: リアクションを押した瞬間にローカルで即座に反映され、体感レスポンスが劇的に高速化しました。</li>
-                        <li><b>リアクション送信者ポップアップ</b>: リアクションチップをクリックまたはホバーすると、誰がリアクションしたか全員の名前が一覧で表示されます。</li>
-                        <li><b>Discordリアクション者名の解決</b>: Discord側でリアクションしたユーザーの表示名が正しく表示されるようになりました。</li>
-                        <li><b>全チャンネル一括既読機能</b>: チャンネルヘッダーの「すべて既読」ボタンまたは <kbd className="px-1.5 py-0.5 rounded bg-stone-800 border border-stone-700 text-[10px] font-mono">Shift + Esc</kbd> で全未読を一度に既読にできます。</li>
-                      </ul>
-                    </div>
-
-                    {/* 3. AIタブ & ヘルプ */}
-                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
-                      <div className="flex items-center gap-2 text-sm font-bold text-purple-400">
-                        <Sparkles className="w-4 h-4" />
-                        <span>3. AIタブ & ヘルプの改善</span>
-                      </div>
-                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
-                        <li><b>AI出力の停止ボタン</b>: 長文生成中いつでも「停止」ボタンで出力を中断できるようになりました。</li>
-                        <li><b>ガタつき解消 & 出力アニメーション</b>: 過去ログ閲覧中のスクロール干渉を解消し、スムーズなタイピングアニメーションを実装しました。</li>
-                        <li><b>スレッドごとの処理分離</b>: AIの出力中に別の会話スレッドを開いてもメッセージが混ざらないよう分離しました。</li>
-                        <li><b>コードブロックのワンクリックコピー</b>: AIが出力したコードブロックにコピーボタンを追加しました。</li>
-                        <li><b>文面の自然化</b>: 「変更差分 (Diff)」→「変更差分」、「元に戻す (Undo)」→「元に戻す」に日本語を整理しました。</li>
-                        <li><b>ヘルプタブのAI質問枠</b>: ヘルプタブの上部から直接AIに使い方や疑問を質問できるようになりました。</li>
-                      </ul>
-                    </div>
-
-                    {/* 4. メモ・時間割・その他 */}
-                    <div className="p-4 rounded-2xl bg-[#111214] border border-stone-800 space-y-3">
-                      <div className="flex items-center gap-2 text-sm font-bold text-emerald-400">
-                        <Book className="w-4 h-4" />
-                        <span>4. メモ・時間割・絵文字・その他の改修</span>
-                      </div>
-                      <ul className="space-y-1.5 text-xs text-stone-300 list-disc list-inside leading-relaxed pl-1">
-                        <li><b>メモの3モード対応</b>: Markdownメモで「編集のみ」「両方」「表示」を自由に切り替えられるようになりました。プレーンテキストにも「編集」「表示」モードを追加しました。</li>
-                        <li><b>同時スクロールの軽量化</b>: スクロール同期処理を最適化し、長文メモでも滑らかに動くようになりました。</li>
-                        <li><b>専用コードゾーンの言語指定 & 上限緩和</b>: Monaco Editor で TypeScript, Python, HTML, Rust などの言語を選択できるようになりました。コードゾーンは最大30個まで作成可能です。</li>
-                        <li><b>特別時程・学校スケジュール拡充</b>: 「特別時程」に対応し、給食（4限後）・昼休み・清掃（6限後）のスケジュール管理が可能になりました。</li>
-                        <li><b>ジャンボ絵文字 & ショートコード</b>: 絵文字単体投稿時のスタンプサイズ拡大表示、および <code>:melting_face:</code> や <code>:salute:</code> 等のDiscord標準ショートコードに対応しました。</li>
-                      </ul>
-                    </div>
+                    ))}
                   </div>
                 </div>
               )}
@@ -8738,6 +9092,9 @@ export default function App() {
                 {tab.id === 'ai' && !isAiJobRunning && hasUnreadAiResult && (
                   <span className="absolute top-0.5 left-1/2 ml-1.5 w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.8)]" />
                 )}
+                {tab.id === 'menu' && hasUnreadPatchNotes && (
+                  <span className="absolute top-0.5 left-1/2 ml-1.5 w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.9)] animate-pulse" />
+                )}
               </button>
             );
           })}
@@ -8760,12 +9117,19 @@ export default function App() {
                     setActiveTab(tab.id);
                     setIsMobileMenuOpen(false);
                   }}
-                  className={`flex flex-col items-center gap-1 py-3 rounded-xl text-[11px] ${
-                    activeTab === tab.id ? 'bg-amber-500/15 text-amber-300' : 'text-stone-300 active:bg-stone-800'
+                  className={`relative flex flex-col items-center gap-1 py-3 rounded-xl text-[11px] ${
+                    activeTab === tab.id
+                      ? 'bg-amber-500/15 text-amber-300'
+                      : tab.id === 'more' && hasUnreadPatchNotes
+                      ? 'bg-amber-500/15 text-amber-300 border border-amber-500/40 shadow-[0_0_8px_rgba(245,158,11,0.25)]'
+                      : 'text-stone-300 active:bg-stone-800'
                   }`}
                 >
                   <Icon className="w-5 h-5" />
-                  {tab.id === 'more' ? 'テスト点数' : tab.label}
+                  <span>{tab.id === 'more' ? 'その他' : tab.label}</span>
+                  {tab.id === 'more' && hasUnreadPatchNotes && (
+                    <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.9)] animate-pulse" />
+                  )}
                 </button>
               );
             })}
@@ -9365,20 +9729,20 @@ export default function App() {
                               className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-300 font-bold text-[11px] flex items-center gap-1.5 disabled:opacity-40"
                             >
                               <RefreshCw className={`w-3 h-3 ${isSyncingAllChannels ? 'animate-spin' : ''}`} />
-                              全チャンネルを一括同期
+                              このサーバーの全チャンネルを一括同期
                             </button>
                           </div>
                         )}
                       </div>
 
-                      {/* 展開時: チャンネル同期一覧 */}
+                      {/* 展開時: チャンネル同期一覧 & 未連携チャンネル一覧 */}
                       {isExpanded && (
-                        <div className="p-3 border-t border-stone-800/80 space-y-2">
+                        <div className="p-3 border-t border-stone-800/80 space-y-3">
                           {filteredBindings.length === 0 ? (
                             <div className="text-stone-500 text-[11px] py-1 text-center">
                               {serverBindingSearch.trim()
                                 ? '検索に一致するチャンネルはありません'
-                                : '同期中のチャンネルはありません。「全チャンネルを一括同期」または上の簡単紐付けから追加できます。'}
+                                : '同期中のチャンネルはありません。「このサーバーの全チャンネルを一括同期」または下の未連携チャンネルから追加できます。'}
                             </div>
                           ) : (
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-80 overflow-y-auto pr-1">
@@ -9410,12 +9774,137 @@ export default function App() {
                               ))}
                             </div>
                           )}
+
+                          {/* 未連携の Discord チャンネル一覧 */}
+                          {(() => {
+                            const unboundChannels = (srv.textChannels || []).filter(
+                              (tc: any) => !allSrvBindings.some((b: any) => b.discordChannelId === tc.id)
+                            );
+                            if (unboundChannels.length === 0) return null;
+                            return (
+                              <div className="pt-2.5 border-t border-stone-800/80 space-y-1.5">
+                                <div className="text-[10px] font-bold text-stone-400 flex items-center justify-between">
+                                  <span>未連携の Discord チャンネル ({unboundChannels.length})</span>
+                                  <span className="text-[9px] text-stone-500 font-normal">ワンクリックで新規作成して連携できます</span>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 max-h-48 overflow-y-auto pr-1">
+                                  {unboundChannels.map((tc: any) => (
+                                    <div key={tc.id} className="flex items-center justify-between gap-2 p-1.5 px-2 rounded-lg bg-[#0E1014] border border-stone-800/70">
+                                      <span className="text-stone-300 font-mono text-xs truncate">#{tc.name}</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRequestOrCreateDiscordBinding({
+                                          guildId: srv.id,
+                                          guildName: srv.name,
+                                          discordChannelId: tc.id,
+                                          discordChannelName: tc.name,
+                                          asdfChannelId: null,
+                                          asdfChannelName: tc.name,
+                                        })}
+                                        className="px-2 py-0.5 rounded bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-[10px] font-bold shrink-0 transition"
+                                      >
+                                        ＋ 連携
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()}
                         </div>
                       )}
                     </div>
                   );
                 })
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* サーバーごとの権限設定モーダル (admin限定) */}
+      {serverPermModalGuild && currentUser?.role === 'admin' && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setServerPermModalGuild(null)}>
+          <div onClick={e => e.stopPropagation()} className="w-full max-w-lg bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop">
+            <div className="flex items-center justify-between border-b border-stone-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Shield className="w-4 h-4 text-amber-400" />
+                <span className="font-bold text-white text-sm">サーバー閲覧権限設定: {serverPermModalGuild.name}</span>
+              </div>
+              <button type="button" onClick={() => setServerPermModalGuild(null)} className="text-stone-500 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-stone-400 text-xs leading-relaxed">
+              このサーバーと所属チャンネルを閲覧できるロール・ユーザーを制限できます。
+              指定がない場合は全員に表示されます。権限のないユーザーにはサーバー一覧からも完全に非表示になります。
+            </p>
+
+            {/* ロール指定 */}
+            <div className="space-y-2">
+              <label className="block text-stone-300 font-bold">閲覧を許可するロール</label>
+              <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto p-2 bg-[#16181D] rounded-xl border border-stone-800">
+                {roleDefs.map(r => {
+                  const isChecked = serverPermAllowedRoles.includes(r.id);
+                  return (
+                    <label key={r.id} className="flex items-center gap-2 text-stone-200 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={e => {
+                          if (e.target.checked) setServerPermAllowedRoles(prev => [...prev, r.id]);
+                          else setServerPermAllowedRoles(prev => prev.filter(x => x !== r.id));
+                        }}
+                        className="rounded border-stone-700 bg-stone-900 text-amber-500 focus:ring-0"
+                      />
+                      <span className="truncate" style={{ color: r.color }}>{r.name}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* ユーザー個別指定 */}
+            <div className="space-y-2">
+              <label className="block text-stone-300 font-bold">追加で閲覧を許可するユーザー (任意)</label>
+              <div className="grid grid-cols-2 gap-2 max-h-36 overflow-y-auto p-2 bg-[#16181D] rounded-xl border border-stone-800">
+                {onlineUsers.map(u => {
+                  const isChecked = serverPermAllowedUsers.includes(u.id);
+                  return (
+                    <label key={u.id} className="flex items-center gap-2 text-stone-200 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={e => {
+                          if (e.target.checked) setServerPermAllowedUsers(prev => [...prev, u.id]);
+                          else setServerPermAllowedUsers(prev => prev.filter(x => x !== u.id));
+                        }}
+                        className="rounded border-stone-700 bg-stone-900 text-amber-500 focus:ring-0"
+                      />
+                      <span className="truncate">{u.username}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-stone-800">
+              <button
+                type="button"
+                onClick={() => setServerPermModalGuild(null)}
+                className="px-4 py-2 rounded-xl border border-stone-700 hover:bg-stone-800 text-stone-300 font-bold transition"
+              >
+                キャンセル
+              </button>
+              <button
+                type="button"
+                disabled={isSavingServerPerm}
+                onClick={handleSaveServerPermissions}
+                className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold transition disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {isSavingServerPerm ? '保存中…' : '権限を保存'}
+              </button>
             </div>
           </div>
         </div>
@@ -10181,7 +10670,12 @@ export default function App() {
         const joinedAtStr = isDiscord ? dm.joinedAt : null;
         const premiumSinceStr = isDiscord ? dm.premiumSince : null;
         const clientPlatforms: string[] = isDiscord && Array.isArray(dm.clientStatus) ? dm.clientStatus : [];
-        const platformLabels: Record<string, string> = { desktop: 'PC (デスクトップ)', mobile: 'スマホ (モバイル)', web: 'ブラウザ (Web)' };
+        const platformLabels: Record<string, string> = {
+          desktop: 'PC (デスクトップ)',
+          mobile: 'スマホ (モバイル)',
+          web: 'ブラウザ (Web)',
+          embedded: 'アクティビティ / ゲーム機',
+        };
         const activities: { name: string; type: number; details?: string | null; state?: string | null }[] =
           isDiscord && Array.isArray(dm.activities) ? dm.activities : [];
 
@@ -10550,67 +11044,158 @@ export default function App() {
         </div>
       )}
 
-      {/* Ctrl+K コマンドパレット (Spotlight風モーダル) */}
-      {isPaletteOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-start justify-center pt-16 sm:pt-24 p-4 anim-fade" onClick={() => setIsPaletteOpen(false)}>
-          <div 
-            onClick={e => e.stopPropagation()} 
-            className="w-full max-w-xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden anim-pop font-mono text-xs"
-          >
-            <div className="p-3 border-b border-stone-800 flex items-center gap-2">
-              <Command className="w-4 h-4 text-amber-400" />
-              <input
-                autoFocus
-                type="text"
-                placeholder="タブ名や計算式 (例: 12 * 85)"
-                value={paletteQuery}
-                onChange={e => handlePaletteInput(e.target.value)}
-                className="w-full bg-transparent text-white focus:outline-none placeholder-stone-600 text-sm"
-              />
-              <span className="text-[10px] text-stone-500 border border-stone-800 px-1.5 py-0.5 rounded">ESC</span>
-            </div>
+      {/* Ctrl+K コマンドパレット (キーボード操作 ↑/↓/Tab/Enter & 機能拡充) */}
+      {isPaletteOpen && (() => {
+        const q = paletteQuery.toLowerCase().trim();
+        const tabItems = [
+          { id: 'tab-chat', label: 'チャットへ移動', desc: '/chat', category: 'タブ', run: () => { setActiveTab('chat'); } },
+          { id: 'tab-memo', label: 'リアルタイムメモへ移動', desc: '/memo', category: 'タブ', run: () => { setActiveTab('memo'); } },
+          { id: 'tab-assignments', label: '提出物・時間割へ移動', desc: '/assignments', category: 'タブ', run: () => { setActiveTab('assignments'); } },
+          { id: 'tab-board', label: 'ホワイトボードへ移動', desc: '/board', category: 'タブ', run: () => { setActiveTab('board'); } },
+          { id: 'tab-ai', label: 'AIへ移動', desc: '/ai', category: 'タブ', run: () => { setActiveTab('ai'); } },
+          { id: 'tab-patch', label: 'パッチノートを表示', desc: '/patch', category: 'タブ', run: () => { setActiveTab('more'); setMoreSubTab('patch_notes'); } },
+          { id: 'tab-more', label: 'テスト点数へ移動', desc: '/scores', category: 'タブ', run: () => { setActiveTab('more'); setMoreSubTab('scores'); } },
+          { id: 'tab-settings', label: '設定へ移動', desc: '/settings', category: 'タブ', run: () => { setActiveTab('settings'); } },
+          { id: 'tab-help', label: 'ヘルプへ移動', desc: '/help', category: 'タブ', run: () => { setActiveTab('help'); } },
+        ];
 
-            {/* 計算機結果 */}
-            {calcResult !== null && (
-              <div className="p-3 bg-amber-500/10 border-b border-amber-500/20 text-amber-300 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Calculator className="w-4 h-4 text-amber-400" />
-                  <span>計算結果:</span>
-                </div>
-                <span className="text-base font-bold font-['Space_Grotesk'] text-white">{calcResult}</span>
-              </div>
-            )}
+        const channelItems = channels.filter(c => c.type !== 'voice').map(c => {
+          const srvId = resolveChannelServerId(c);
+          const srv = discordServers.find(s => s.id === srvId);
+          return {
+            id: `ch-${c.id}`,
+            label: `#${c.name}`,
+            desc: srv ? srv.name : 'チャンネル',
+            category: 'チャンネル',
+            run: () => {
+              if (srvId) setSelectedServerId(srvId);
+              setActiveChannelId(c.id);
+              setActiveTab('chat');
+            }
+          };
+        });
 
-            {/* ナビゲーションショートカット候補 */}
-            <div className="p-2 space-y-1">
-              <div className="text-[10px] uppercase text-stone-500 px-2 py-1 font-bold">移動</div>
-              {[
-                { id: 'chat', label: 'チャットへ移動', desc: '/chat' },
-                { id: 'memo', label: 'リアルタイムメモへ移動', desc: '/memo' },
-                { id: 'assignments', label: '提出物・時間割へ移動', desc: '/assignments' },
-                { id: 'board', label: 'ホワイトボードへ移動', desc: '/board' },
-                { id: 'ai', label: 'AIへ移動', desc: '/ai' },
-                { id: 'more', label: 'テスト点数へ移動', desc: '/more' },
-                { id: 'settings', label: '設定へ移動', desc: '/settings' },
-                { id: 'help', label: 'ヘルプへ移動', desc: '/help' },
-              ].filter(c => c.label.includes(paletteQuery) || c.desc.includes(paletteQuery) || !paletteQuery).map(cmd => (
-                <button
-                  key={cmd.id}
-                  onClick={() => {
-                    setActiveTab(cmd.id as any);
-                    setIsPaletteOpen(false);
-                    setPaletteQuery('');
+        const serverItems = sortedDiscordServers.map(s => ({
+          id: `srv-${s.id}`,
+          label: `サーバー: ${s.name}`,
+          desc: `オンライン ${s.onlineCount || 0}人`,
+          category: 'サーバー',
+          run: () => {
+            setSelectedServerId(s.id);
+            setActiveTab('chat');
+          }
+        }));
+
+        const actionItems = [
+          { id: 'act-tt', label: '時間割モーダルを開く', desc: '今日の授業コマ・週予定確認', category: 'クイック操作', run: () => { setIsTimetableModalOpen(true); } },
+          { id: 'act-cam', label: 'カメラ小窓を切り替え', desc: 'ノートや黒板の確認', category: 'クイック操作', run: () => { setShowCamera(v => !v); } },
+          { id: 'act-read', label: '全チャンネルを既読にする', desc: 'Shift + Esc', category: 'クイック操作', run: () => { handleMarkAllRead(); } },
+          { id: 'act-sync', label: 'Discord未取得履歴を同期', desc: 'Botダウンタイム補完', category: 'クイック操作', run: () => { handleSyncDiscordHistory(selectedServer ? { guildId: selectedServer.id } : undefined); } },
+        ];
+
+        const allItems = [...tabItems, ...actionItems, ...channelItems, ...serverItems];
+        const filteredItems = q
+          ? allItems.filter(item =>
+              item.label.toLowerCase().includes(q) ||
+              item.desc.toLowerCase().includes(q) ||
+              item.category.toLowerCase().includes(q)
+            )
+          : allItems.slice(0, 16);
+
+        const activeIndex = filteredItems.length > 0 ? ((paletteSelectedIndex % filteredItems.length) + filteredItems.length) % filteredItems.length : 0;
+
+        return (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-start justify-center pt-16 sm:pt-24 p-4 anim-fade" onClick={() => setIsPaletteOpen(false)}>
+            <div 
+              onClick={e => e.stopPropagation()} 
+              className="w-full max-w-xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden anim-pop font-mono text-xs max-h-[80vh] flex flex-col"
+            >
+              <div className="p-3 border-b border-stone-800 flex items-center gap-2 shrink-0">
+                <Command className="w-4 h-4 text-amber-400" />
+                <input
+                  autoFocus
+                  type="text"
+                  placeholder="チャンネル名・タブ・操作・計算式 (例: #雑談, /memo, 12 * 85)"
+                  value={paletteQuery}
+                  onChange={e => {
+                    handlePaletteInput(e.target.value);
+                    setPaletteSelectedIndex(0);
                   }}
-                  className="w-full px-3 py-2 rounded-xl flex items-center justify-between hover:bg-stone-900/80 text-stone-300 hover:text-white transition text-left"
-                >
-                  <span>{cmd.label}</span>
-                  <span className="text-stone-500 text-[10px]">{cmd.desc}</span>
-                </button>
-              ))}
+                  onKeyDown={e => {
+                    if (e.key === 'Escape') {
+                      setIsPaletteOpen(false);
+                      setPaletteQuery('');
+                    } else if (e.key === 'ArrowDown' || (e.key === 'Tab' && !e.shiftKey)) {
+                      e.preventDefault();
+                      setPaletteSelectedIndex(prev => prev + 1);
+                    } else if (e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey)) {
+                      e.preventDefault();
+                      setPaletteSelectedIndex(prev => prev - 1);
+                    } else if (e.key === 'Enter') {
+                      e.preventDefault();
+                      if (filteredItems[activeIndex]) {
+                        filteredItems[activeIndex].run();
+                        setIsPaletteOpen(false);
+                        setPaletteQuery('');
+                      }
+                    }
+                  }}
+                  className="w-full bg-transparent text-white focus:outline-none placeholder-stone-600 text-sm"
+                />
+                <span className="text-[10px] text-stone-500 border border-stone-800 px-1.5 py-0.5 rounded">↑↓ / Tab / Enter</span>
+              </div>
+
+              {/* 計算機結果 */}
+              {calcResult !== null && (
+                <div className="p-3 bg-amber-500/10 border-b border-amber-500/20 text-amber-300 flex items-center justify-between shrink-0">
+                  <div className="flex items-center gap-2">
+                    <Calculator className="w-4 h-4 text-amber-400" />
+                    <span>計算結果:</span>
+                  </div>
+                  <span className="text-base font-bold font-['Space_Grotesk'] text-white">{calcResult}</span>
+                </div>
+              )}
+
+              {/* 候補一覧 */}
+              <div className="p-2 space-y-1 overflow-y-auto flex-1">
+                {filteredItems.length === 0 ? (
+                  <div className="p-6 text-center text-stone-500 text-xs">
+                    該当するコマンドやチャンネルが見つかりませんでした
+                  </div>
+                ) : (
+                  filteredItems.map((item, idx) => {
+                    const isSelected = idx === activeIndex;
+                    return (
+                      <button
+                        key={item.id}
+                        onMouseEnter={() => setPaletteSelectedIndex(idx)}
+                        onClick={() => {
+                          item.run();
+                          setIsPaletteOpen(false);
+                          setPaletteQuery('');
+                        }}
+                        className={`w-full px-3 py-2 rounded-xl flex items-center justify-between transition text-left ${
+                          isSelected
+                            ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                            : 'hover:bg-stone-900/80 text-stone-300 hover:text-white border border-transparent'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-stone-800 text-stone-400 font-mono shrink-0">
+                            {item.category}
+                          </span>
+                          <span className="truncate font-medium">{item.label}</span>
+                        </div>
+                        <span className="text-stone-500 text-[10px] shrink-0 ml-2">{item.desc}</span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* 時間割モーダル: 週間グリッド (朝の会〜帰りの会) と各コマの編集 */}
       {isTimetableModalOpen && (() => {

@@ -1,6 +1,6 @@
 // メッセージのリアクション: クリックで付け外し、ホバー (PC) / 長押し (スマホ) で誰が押したかを表示
 import { useEffect, useRef, useState } from 'react';
-import { renderEmojiToken } from './chatText';
+import { renderEmojiToken, toProxiedMediaUrl } from './chatText';
 
 const LONG_PRESS_MS = 450;
 
@@ -10,6 +10,22 @@ export function renderReactionEmoji(emoji: string, customEmojis?: Map<string, st
   if (emoji.startsWith(':') && emoji.endsWith(':')) {
     const node = renderEmojiToken(emoji, customEmojis, undefined, sizeClass);
     if (node) return node;
+  }
+  if (emoji.startsWith('<') && emoji.endsWith('>')) {
+    const matchDc = emoji.match(/^<(a)?:([a-zA-Z0-9_]+):([0-9]+)>$/);
+    if (matchDc) {
+      const ext = matchDc[1] ? 'gif' : 'webp';
+      const url = `https://cdn.discordapp.com/emojis/${matchDc[3]}.${ext}?size=48&quality=lossless`;
+      return (
+        <img
+          src={toProxiedMediaUrl(url)}
+          alt={`:${matchDc[2]}:`}
+          title={`:${matchDc[2]}:`}
+          className={`${sizeClass} inline-block object-contain align-middle`}
+          loading="lazy"
+        />
+      );
+    }
   }
   return <span>{emoji}</span>;
 }

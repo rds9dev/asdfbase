@@ -16,6 +16,9 @@ exports.relayMessage = relayMessage;
 exports.logAudit = logAudit;
 exports.authMiddleware = authMiddleware;
 exports.adminOnly = adminOnly;
+exports.decryptMessageRow = decryptMessageRow;
+exports.decryptMessageRows = decryptMessageRows;
+exports.checkServerPermission = checkServerPermission;
 exports.checkDiscordChannelPermission = checkDiscordChannelPermission;
 const express_1 = __importDefault(require("express"));
 const http_1 = __importDefault(require("http"));
@@ -29,7 +32,9 @@ const sharp_1 = __importDefault(require("sharp"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
 const dns_1 = __importDefault(require("dns"));
+const zlib_1 = __importDefault(require("zlib"));
 const db_js_1 = require("./db.js");
+const crypto_js_1 = require("./crypto.js");
 const gemini_js_1 = require("./gemini.js");
 const aiTools_js_1 = require("./aiTools.js");
 const discord_js_1 = require("./discord.js");
@@ -290,8 +295,43 @@ if (!fs_1.default.existsSync(UPLOAD_DIR)) {
     fs_1.default.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 app.use((0, cors_1.default)({ origin: '*' }));
+// レスポンス gzip 圧縮ミドルウェア (Node.js 標準 zlib による通信量削減)
+app.use((req, res, next) => {
+    const acceptEncoding = req.headers['accept-encoding'] || '';
+    if (!acceptEncoding.includes('gzip'))
+        return next();
+    const originalSend = res.send.bind(res);
+    res.send = function (body) {
+        if (!body || req.method === 'HEAD')
+            return originalSend(body);
+        const contentType = String(res.getHeader('content-type') || '');
+        if (typeof body === 'string' || Buffer.isBuffer(body) || contentType.includes('json') || contentType.includes('text')) {
+            const buf = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'object' ? JSON.stringify(body) : String(body));
+            if (buf.length > 512) {
+                zlib_1.default.gzip(buf, (err, compressed) => {
+                    if (err)
+                        return originalSend(body);
+                    res.setHeader('Content-Encoding', 'gzip');
+                    res.removeHeader('Content-Length');
+                    originalSend(compressed);
+                });
+                return res;
+            }
+        }
+        return originalSend(body);
+    };
+    const originalJson = res.json.bind(res);
+    res.json = function (obj) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.send(obj);
+    };
+    next();
+});
 app.use(express_1.default.json({ limit: '10mb' }));
-app.use('/uploads', express_1.default.static(UPLOAD_DIR));
+app.use('/uploads', express_1.default.static(UPLOAD_DIR, {
+    maxAge: '30d',
+    immutable: true,
+}));
 const upload = (0, multer_1.default)({
     storage: multer_1.default.memoryStorage(),
     limits: { fileSize: 15 * 1024 * 1024 },
@@ -620,6 +660,18 @@ app.post('/api/upload', authMiddleware, upload.single('image'), async (req, res)
         res.status(500).json({ error: '画像の圧縮保存に失敗しました' });
     }
 });
+// メッセージ暗号化・復号ヘルパー
+function decryptMessageRow(msg) {
+    if (!msg)
+        return msg;
+    return {
+        ...msg,
+        content: (0, crypto_js_1.decryptMessageContent)(msg.content, msg.channel_id),
+    };
+}
+function decryptMessageRows(rows) {
+    return rows.map(decryptMessageRow);
+}
 // ロール権限判定ヘルパー
 async function getUserAllRoles(userId, fallbackRole = 'member') {
     try {
@@ -636,6 +688,33 @@ async function getUserAllRoles(userId, fallbackRole = 'member') {
     }
     catch {
         return { isAdmin: fallbackRole === 'admin', roles: [fallbackRole] };
+    }
+}
+// サーバー (Discord Guild) 単位の閲覧権限チェック
+async function checkServerPermission(userId, userRole, guildId) {
+    if (!guildId)
+        return true; // 全体チャンネルは常に閲覧可
+    if (userRole === 'admin')
+        return true;
+    try {
+        const res = await db_js_1.pool.query(`SELECT * FROM server_permissions WHERE guild_id = $1`, [guildId]);
+        if (res.rows.length === 0)
+            return true;
+        const perm = res.rows[0];
+        const { roles } = await getUserAllRoles(userId, userRole);
+        const viewRoles = Array.isArray(perm.view_roles) ? perm.view_roles : [];
+        const denyRoles = Array.isArray(perm.deny_roles) ? perm.deny_roles : [];
+        if (roles.some(r => denyRoles.includes(r)))
+            return false;
+        if (perm.allow_everyone !== false && viewRoles.length === 0)
+            return true;
+        if (roles.some(r => viewRoles.includes(r)))
+            return true;
+        return Boolean(perm.allow_everyone && viewRoles.length === 0);
+    }
+    catch (err) {
+        console.error('[permission] checkServerPermission error:', err.message);
+        return true;
     }
 }
 function checkDiscordChannelPermission(isAdmin, userRoles, channel, action = 'send') {
@@ -690,7 +769,9 @@ app.get('/api/channels', authMiddleware, async (req, res) => {
     try {
         const { isAdmin, roles } = await getUserAllRoles(req.user.id, req.user.role);
         const result = await db_js_1.pool.query(`SELECT * FROM channels ORDER BY position ASC, id ASC`);
-        const visible = result.rows.filter(ch => checkChannelViewPermission(isAdmin, roles, ch));
+        const serverAllowedPromises = result.rows.map(ch => checkServerPermission(req.user.id, req.user.role, ch.server_id));
+        const serverAllowed = await Promise.all(serverAllowedPromises);
+        const visible = result.rows.filter((ch, i) => serverAllowed[i] && checkChannelViewPermission(isAdmin, roles, ch));
         res.json(visible);
     }
     catch (err) {
@@ -817,9 +898,12 @@ async function attachReplies(rows) {
     const ids = Array.from(new Set(rows.map(r => r.reply_to_id).filter((v) => typeof v === 'number')));
     if (ids.length === 0)
         return rows;
-    const res = await db_js_1.pool.query(`SELECT m.id, m.content, m.user_id, COALESCE(u.username, m.username) AS username
+    const res = await db_js_1.pool.query(`SELECT m.id, m.content, m.channel_id, m.user_id, COALESCE(u.username, m.username) AS username
      FROM messages m LEFT JOIN users u ON u.id = m.user_id WHERE m.id = ANY($1::int[])`, [ids]);
-    const map = new Map(res.rows.map(r => [r.id, { id: r.id, username: r.username, user_id: r.user_id, content: String(r.content || '').slice(0, 200) }]));
+    const map = new Map(res.rows.map(r => {
+        const dec = (0, crypto_js_1.decryptMessageContent)(r.content, r.channel_id);
+        return [r.id, { id: r.id, username: r.username, user_id: r.user_id, content: String(dec || '').slice(0, 200) }];
+    }));
     return rows.map(r => (r.reply_to_id ? { ...r, reply_to: map.get(r.reply_to_id) || { id: r.reply_to_id, deleted: true } } : r));
 }
 // Messages API (supports pagination: limit & beforeId)
@@ -828,6 +912,18 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
         const channelId = parseInt(req.params.channelId, 10);
         const limit = parseInt(req.query.limit, 10) || 50;
         const beforeId = req.query.beforeId ? parseInt(req.query.beforeId, 10) : null;
+        // チャンネルとサーバーのアクセス権限チェック
+        const chRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [channelId]);
+        if (chRes.rows.length === 0)
+            return res.status(404).json({ error: 'チャンネルが見つかりません' });
+        const ch = chRes.rows[0];
+        if (!await checkServerPermission(req.user.id, req.user.role, ch.server_id)) {
+            return res.status(403).json({ error: 'このサーバーの閲覧権限がありません' });
+        }
+        const { isAdmin, roles } = await getUserAllRoles(req.user.id, req.user.role);
+        if (!checkChannelViewPermission(isAdmin, roles, ch)) {
+            return res.status(403).json({ error: 'このチャンネルの閲覧権限がありません' });
+        }
         let query = `
       SELECT m.*, u.username as sender_username 
       FROM messages m 
@@ -841,7 +937,8 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
             query += ` AND m.id > $2 ORDER BY m.id ASC LIMIT $3`;
             params.push(afterId, Math.min(limit, 200));
             const result = await db_js_1.pool.query(query, params);
-            return res.json(await attachReplies(result.rows));
+            const decrypted = decryptMessageRows(result.rows);
+            return res.json(await attachReplies(decrypted));
         }
         else if (beforeId) {
             query += ` AND m.id < $2 ORDER BY m.id DESC LIMIT $3`;
@@ -852,7 +949,12 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
             params.push(Math.min(limit, 200));
         }
         const result = await db_js_1.pool.query(query, params);
-        res.json(await attachReplies(result.rows.reverse()));
+        // 低頻度チャンネル救済: 初回取得時 (afterId / beforeId なし) かつメッセージ数が30件未満の場合、Discord同期をバックグラウンド実行
+        if (!afterId && !beforeId && result.rows.length < 30) {
+            (0, discord_js_1.syncDiscordHistory)({ asdfChannelId: channelId, limit: 30 }).catch(() => { });
+        }
+        const decrypted = decryptMessageRows(result.rows.reverse());
+        res.json(await attachReplies(decrypted));
     }
     catch (err) {
         res.status(500).json({ error: 'メッセージ取得エラー' });
@@ -862,13 +964,26 @@ app.get('/api/channels/:channelId/messages', authMiddleware, async (req, res) =>
 app.get('/api/messages/since', authMiddleware, async (req, res) => {
     try {
         const afterId = parseInt(req.query.afterId, 10) || 0;
+        const { isAdmin, roles } = await getUserAllRoles(req.user.id, req.user.role);
+        const channels = (await db_js_1.pool.query(`SELECT * FROM channels`)).rows;
+        const allowedChannelIds = [];
+        for (const ch of channels) {
+            if (await checkServerPermission(req.user.id, req.user.role, ch.server_id)) {
+                if (checkChannelViewPermission(isAdmin, roles, ch)) {
+                    allowedChannelIds.push(ch.id);
+                }
+            }
+        }
+        if (allowedChannelIds.length === 0)
+            return res.json([]);
         const result = await db_js_1.pool.query(`SELECT m.*, u.username as sender_username
        FROM messages m
        LEFT JOIN users u ON m.user_id = u.id
-       WHERE m.id > $1
+       WHERE m.id > $1 AND m.channel_id = ANY($2::int[])
        ORDER BY m.id ASC
-       LIMIT 200`, [afterId]);
-        res.json(await attachReplies(result.rows));
+       LIMIT 200`, [afterId, allowedChannelIds]);
+        const decrypted = decryptMessageRows(result.rows);
+        res.json(await attachReplies(decrypted));
     }
     catch (err) {
         res.status(500).json({ error: 'メッセージ同期エラー' });
@@ -963,6 +1078,82 @@ app.post('/api/channels/read-all', authMiddleware, async (req, res) => {
         res.status(500).json({ error: '一括既読エラー' });
     }
 });
+// 全文検索 API (権限のあるチャンネルから復号検索 & 各種フィルター)
+app.get('/api/messages/search', authMiddleware, async (req, res) => {
+    try {
+        const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+        const channelId = req.query.channelId ? parseInt(req.query.channelId, 10) : null;
+        const serverId = typeof req.query.serverId === 'string' ? req.query.serverId.trim() : null;
+        const fromUser = typeof req.query.from === 'string' ? req.query.from.trim() : null;
+        const hasType = typeof req.query.has === 'string' ? req.query.has.trim().toLowerCase() : null;
+        const pinned = req.query.pinned === 'true';
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 40, 1), 100);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+        const { isAdmin, roles } = await getUserAllRoles(req.user.id, req.user.role);
+        const chRows = (await db_js_1.pool.query(`SELECT * FROM channels`)).rows;
+        const allowedChannels = [];
+        for (const ch of chRows) {
+            if (channelId && ch.id !== channelId)
+                continue;
+            if (serverId && ch.server_id !== serverId)
+                continue;
+            if (await checkServerPermission(req.user.id, req.user.role, ch.server_id)) {
+                if (checkChannelViewPermission(isAdmin, roles, ch)) {
+                    allowedChannels.push(ch);
+                }
+            }
+        }
+        if (allowedChannels.length === 0) {
+            return res.json({ messages: [], total: 0, hasMore: false });
+        }
+        const allowedChannelIds = allowedChannels.map(c => c.id);
+        let sql = `
+      SELECT m.*, u.username as sender_username, c.name as channel_name, c.server_id
+      FROM messages m
+      LEFT JOIN users u ON m.user_id = u.id
+      JOIN channels c ON m.channel_id = c.id
+      WHERE m.channel_id = ANY($1::int[])
+    `;
+        const params = [allowedChannelIds];
+        let paramIdx = 2;
+        if (pinned) {
+            sql += ` AND m.is_pinned = TRUE`;
+        }
+        if (fromUser) {
+            sql += ` AND (u.username ILIKE $${paramIdx} OR m.username ILIKE $${paramIdx})`;
+            params.push(`%${fromUser}%`);
+            paramIdx++;
+        }
+        sql += ` ORDER BY m.id DESC LIMIT 400`;
+        const result = await db_js_1.pool.query(sql, params);
+        let matched = decryptMessageRows(result.rows);
+        if (q) {
+            const lowerQ = q.toLowerCase();
+            matched = matched.filter(m => String(m.content || '').toLowerCase().includes(lowerQ));
+        }
+        if (hasType === 'image') {
+            matched = matched.filter(m => /!\[[^\]]*\]\([^)]+\)/.test(m.content || '') || (Array.isArray(m.attachments) && m.attachments.some((a) => (a.contentType || '').startsWith('image/'))));
+        }
+        else if (hasType === 'file') {
+            matched = matched.filter(m => /\[📎[^\]]*\]\([^)]+\)/.test(m.content || '') || (Array.isArray(m.attachments) && m.attachments.length > 0));
+        }
+        else if (hasType === 'link') {
+            matched = matched.filter(m => /https?:\/\/[^\s]+/.test(m.content || ''));
+        }
+        const total = matched.length;
+        const paginated = matched.slice(offset, offset + limit);
+        const withReplies = await attachReplies(paginated);
+        res.json({
+            messages: withReplies,
+            total,
+            hasMore: offset + limit < total,
+        });
+    }
+    catch (err) {
+        console.error('Search error:', err);
+        res.status(500).json({ error: '検索処理に失敗しました' });
+    }
+});
 // メッセージリンク用: 指定メッセージの前後をまとめて返す
 app.get('/api/messages/:messageId/context', authMiddleware, async (req, res) => {
     try {
@@ -971,13 +1162,26 @@ app.get('/api/messages/:messageId/context', authMiddleware, async (req, res) => 
         const target = (await db_js_1.pool.query(`SELECT id, channel_id FROM messages WHERE id = $1`, [messageId])).rows[0];
         if (!target)
             return res.status(404).json({ error: 'メッセージが見つかりません (削除された可能性があります)' });
+        // チャンネルとサーバーの権限チェック
+        const chRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [target.channel_id]);
+        if (chRes.rows.length === 0)
+            return res.status(404).json({ error: 'チャンネルが見つかりません' });
+        const ch = chRes.rows[0];
+        if (!await checkServerPermission(req.user.id, req.user.role, ch.server_id)) {
+            return res.status(403).json({ error: 'このサーバーの閲覧権限がありません' });
+        }
+        const { isAdmin, roles } = await getUserAllRoles(req.user.id, req.user.role);
+        if (!checkChannelViewPermission(isAdmin, roles, ch)) {
+            return res.status(403).json({ error: 'このチャンネルの閲覧権限がありません' });
+        }
         const base = `SELECT m.*, u.username as sender_username FROM messages m LEFT JOIN users u ON m.user_id = u.id WHERE m.channel_id = $1`;
         const before = (await db_js_1.pool.query(`${base} AND m.id < $2 ORDER BY m.id DESC LIMIT $3`, [target.channel_id, messageId, half + 1])).rows;
         const after = (await db_js_1.pool.query(`${base} AND m.id >= $2 ORDER BY m.id ASC LIMIT $3`, [target.channel_id, messageId, half + 2])).rows;
         const hasOlder = before.length > half;
         const hasNewer = after.length > half + 1;
         const rows = [...before.slice(0, half).reverse(), ...after.slice(0, half + 1)];
-        res.json({ channelId: target.channel_id, messageId, hasOlder, hasNewer, messages: await attachReplies(rows) });
+        const decrypted = decryptMessageRows(rows);
+        res.json({ channelId: target.channel_id, messageId, hasOlder, hasNewer, messages: await attachReplies(decrypted) });
     }
     catch (err) {
         res.status(500).json({ error: 'メッセージ取得エラー' });
@@ -1004,7 +1208,7 @@ app.delete('/api/messages/:messageId', authMiddleware, async (req, res) => {
             channel_id: msg.channel_id,
             author: msg.username,
             author_id: msg.user_id,
-            content: msg.content,
+            content: (0, crypto_js_1.decryptMessageContent)(msg.content, msg.channel_id),
             created_at: msg.created_at,
         }, true);
         res.json({ success: true, messageId });
@@ -1030,18 +1234,20 @@ app.put('/api/messages/:messageId', authMiddleware, async (req, res) => {
         if (typeof content !== 'string' || !content.trim()) {
             return res.status(400).json({ error: '本文が空です' });
         }
-        if (content === msg.content) {
-            const [same] = await attachReplies([{ ...msg, sender_username: req.user.username }]);
+        const existingDecrypted = (0, crypto_js_1.decryptMessageContent)(msg.content, msg.channel_id);
+        if (content === existingDecrypted) {
+            const [same] = await attachReplies([{ ...msg, content, sender_username: req.user.username }]);
             return res.json(same);
         }
-        const updated = await db_js_1.pool.query(`UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`, [content, messageId]);
-        const [updatedMessage] = await attachReplies([{ ...updated.rows[0], sender_username: req.user.username }]);
+        const encrypted = (0, crypto_js_1.encryptMessageContent)(content, msg.channel_id);
+        const updated = await db_js_1.pool.query(`UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`, [encrypted, messageId]);
+        const [updatedMessage] = await attachReplies([{ ...updated.rows[0], content, sender_username: req.user.username }]);
         broadcast({ type: 'MESSAGE_UPDATED', payload: updatedMessage });
         relayEdit(updatedMessage, req.user.username);
         logAudit(req.user, 'message_edit', 'message', messageId, {
             message: 'メッセージ編集',
             channel_id: msg.channel_id,
-            before: msg.content,
+            before: existingDecrypted,
             after: content,
         });
         res.json(updatedMessage);
@@ -1060,7 +1266,10 @@ async function replyAsGemini(channelId, trigger) {
         const hist = await db_js_1.pool.query(`SELECT m.id, m.content, m.user_id, COALESCE(u.username, m.username) AS username, m.created_at
        FROM messages m LEFT JOIN users u ON u.id = m.user_id
        WHERE m.channel_id = $1 AND m.id <= $2 ORDER BY m.id DESC LIMIT 30`, [channelId, trigger.id]);
-        const rows = hist.rows.reverse();
+        const rows = hist.rows.reverse().map(r => ({
+            ...r,
+            content: (0, crypto_js_1.decryptMessageContent)(r.content, channelId),
+        }));
         // 直近の画像 (最大3枚) は中身も見せる
         const recentImageIds = new Set(rows.slice(-8).filter(r => /^!\[[^\]]*\]\(\/uploads\/[^)\s]+\)$/.test(String(r.content).trim())).slice(-3).map(r => r.id));
         const history = [];
@@ -1107,9 +1316,10 @@ async function replyAsGemini(channelId, trigger) {
                 '前置きは省き、チャットらしく簡潔に日本語で答えてください。',
             ].join('\n'),
         });
+        const encryptedReply = (0, crypto_js_1.encryptMessageContent)(reply, channelId);
         const botResult = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, reply_to_id)
-       VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, reply, trigger.id]);
-        const [aiMessage] = await attachReplies([{ ...botResult.rows[0], sender_username: 'Gemini' }]);
+       VALUES ($1, NULL, 'Gemini', $2, $3) RETURNING *`, [channelId, encryptedReply, trigger.id]);
+        const [aiMessage] = await attachReplies([{ ...botResult.rows[0], content: reply, sender_username: 'Gemini' }]);
         broadcast({ type: 'NEW_MESSAGE', payload: aiMessage });
         relayMessage(aiMessage);
     }
@@ -1125,16 +1335,22 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
         const userId = req.user.id;
         const username = req.user.username;
         const chRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [channelId]);
-        if (chRes.rows.length > 0) {
-            const { isAdmin, roles } = await getUserAllRoles(userId, req.user.role);
-            if (!checkChannelWritePermission(isAdmin, roles, chRes.rows[0])) {
-                return res.status(403).json({ error: 'このチャンネルへの発言権限がありません' });
-            }
+        if (chRes.rows.length === 0)
+            return res.status(404).json({ error: 'チャンネルが見つかりません' });
+        const ch = chRes.rows[0];
+        // サーバー権限チェック
+        if (!await checkServerPermission(userId, req.user.role, ch.server_id)) {
+            return res.status(403).json({ error: 'このサーバーの閲覧・発言権限がありません' });
         }
+        const { isAdmin, roles } = await getUserAllRoles(userId, req.user.role);
+        if (!checkChannelWritePermission(isAdmin, roles, ch)) {
+            return res.status(403).json({ error: 'このチャンネルへの発言権限がありません' });
+        }
+        const encryptedContent = (0, crypto_js_1.encryptMessageContent)(content, channelId);
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments, reply_to_id) 
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, userId, username, content, JSON.stringify(attachments || []), replyToId || null]);
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [channelId, userId, username, encryptedContent, JSON.stringify(attachments || []), replyToId || null]);
         const userAvatar = await getUserAvatar(userId);
-        const [savedMessage] = await attachReplies([{ ...result.rows[0], sender_username: username, author_avatar: userAvatar, client_nonce: clientNonce || null }]);
+        const [savedMessage] = await attachReplies([{ ...result.rows[0], content, sender_username: username, author_avatar: userAvatar, client_nonce: clientNonce || null }]);
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
         const relayed = await relayMessage(savedMessage);
         if (String(content).includes('@everyone') && !relayed) {
@@ -1157,9 +1373,10 @@ app.post('/api/discord/webhook', async (req, res) => {
         }
         const targetChannelId = parseInt(channelId, 10) || 1;
         const senderName = username ? `[Discord] ${username}` : '[Discord]';
+        const encryptedContent = (0, crypto_js_1.encryptMessageContent)(content || '', targetChannelId);
         const result = await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, attachments) 
-       VALUES ($1, NULL, $2, $3, $4) RETURNING *`, [targetChannelId, senderName, content || '', JSON.stringify(attachments || [])]);
-        const savedMessage = { ...result.rows[0], sender_username: senderName };
+       VALUES ($1, NULL, $2, $3, $4) RETURNING *`, [targetChannelId, senderName, encryptedContent, JSON.stringify(attachments || [])]);
+        const savedMessage = { ...result.rows[0], content: content || '', sender_username: senderName };
         broadcast({ type: 'NEW_MESSAGE', payload: savedMessage });
         res.json({ success: true, message: savedMessage });
     }
@@ -2025,16 +2242,72 @@ app.get('/api/discord/guild-status', authMiddleware, async (_req, res) => {
         res.status(500).json({ error: 'Discord状態取得エラー' });
     }
 });
-// 複数サーバー一覧・オンラインメンバー・VC・連携リクエスト取得
-app.get('/api/discord/servers', authMiddleware, async (_req, res) => {
+// 複数サーバー一覧・オンラインメンバー・VC・連携リクエスト取得 (権限のあるサーバーのみ返却)
+app.get('/api/discord/servers', authMiddleware, async (req, res) => {
     try {
         const servers = await (0, discord_js_1.getDiscordServers)(true);
         const status = await (0, discord_js_1.getDiscordStatus)();
         const reqRes = await db_js_1.pool.query(`SELECT * FROM discord_link_requests ORDER BY id DESC LIMIT 50`);
-        res.json({ servers, status, linkRequests: reqRes.rows });
+        const allowedServers = [];
+        for (const s of servers) {
+            if (await checkServerPermission(req.user.id, req.user.role, s.id)) {
+                allowedServers.push(s);
+            }
+        }
+        res.json({ servers: allowedServers, status, linkRequests: reqRes.rows });
     }
     catch (err) {
         res.status(500).json({ error: 'Discordサーバー一覧取得エラー' });
+    }
+});
+// サーバー権限の取得
+app.get('/api/server-permissions/:guildId', authMiddleware, async (req, res) => {
+    try {
+        const guildId = String(req.params.guildId || '');
+        const r = await db_js_1.pool.query(`SELECT * FROM server_permissions WHERE guild_id = $1`, [guildId]);
+        if (r.rows.length === 0) {
+            return res.json({
+                guild_id: guildId,
+                view_roles: [],
+                deny_roles: [],
+                allow_everyone: true,
+            });
+        }
+        res.json(r.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'サーバー権限取得エラー' });
+    }
+});
+// サーバー権限の更新 (admin限定)
+app.put('/api/server-permissions/:guildId', authMiddleware, adminOnly, async (req, res) => {
+    try {
+        const guildId = String(req.params.guildId || '').trim();
+        if (!guildId)
+            return res.status(400).json({ error: 'guildIdが必要です' });
+        const { view_roles, deny_roles, allow_everyone } = req.body || {};
+        const cleanView = Array.isArray(view_roles) ? view_roles.map(String) : [];
+        const cleanDeny = Array.isArray(deny_roles) ? deny_roles.map(String) : [];
+        const cleanEveryone = allow_everyone !== false;
+        const r = await db_js_1.pool.query(`INSERT INTO server_permissions (guild_id, view_roles, deny_roles, allow_everyone, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (guild_id) DO UPDATE SET
+         view_roles = EXCLUDED.view_roles,
+         deny_roles = EXCLUDED.deny_roles,
+         allow_everyone = EXCLUDED.allow_everyone,
+         updated_at = NOW()
+       RETURNING *`, [guildId, JSON.stringify(cleanView), JSON.stringify(cleanDeny), cleanEveryone]);
+        logAudit(req.user, 'server_permission_update', 'discord_guild', null, {
+            message: `Discordサーバー (${guildId}) の権限設定を更新`,
+            view_roles: cleanView,
+            deny_roles: cleanDeny,
+            allow_everyone: cleanEveryone,
+        });
+        broadcast({ type: 'SERVER_PERMISSIONS_UPDATED', payload: r.rows[0] });
+        res.json(r.rows[0]);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'サーバー権限更新エラー' });
     }
 });
 // サーバー承認 (admin / rds9 専用)
@@ -3141,23 +3414,7 @@ app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
 app.get('/api/users', authMiddleware, async (req, res) => {
     try {
         const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, avatar_url, class_no, custom_roles, last_active_at, created_at FROM users ORDER BY username ASC`);
-        // Discord サーバーメンバー全員の pseudoUserId -> 表示名 を補完してリアクションの「ほか N 人」を解消する
-        try {
-            const servers = await (0, discord_js_1.getDiscordServers)();
-            for (const srv of servers) {
-                for (const m of srv.members || []) {
-                    const uname = m.displayName || m.username;
-                    if (m.id && uname) {
-                        const pid = discordUserIdToPseudoId(m.id);
-                        const displayUname = uname.startsWith('[Discord]') ? uname : `[Discord] ${uname}`;
-                        if (!exports.discordReactionUsernames.has(pid)) {
-                            saveDiscordReactionUsername(pid, displayUname);
-                        }
-                    }
-                }
-            }
-        }
-        catch { }
+        // すでに解決済みの Discord メンバー名マップから pseudoUsers を生成 (重い Discord API fetch はブロックしない)
         const pseudoUsers = Array.from(exports.discordReactionUsernames.entries()).map(([id, uname]) => ({
             id,
             username: uname,
@@ -3652,6 +3909,9 @@ function broadcast(message, excludeConnId) {
 }
 // after 以降で自分宛てのイベント。バッファ切れ/サーバー再起動なら reset=true
 function eventsSince(after, boot, userId, connId) {
+    // 初回接続時 (after === 0) はクライアントが REST API で現在状態を完全ロードするため過去イベント全件再送は不要
+    if (after === 0)
+        return { reset: false, events: [] };
     const oldest = eventLog.length > 0 ? eventLog[0].seq : eventSeq + 1;
     const reset = (boot !== undefined && boot !== '' && boot !== BOOT_ID) || after > eventSeq || (after > 0 && after < oldest - 1);
     if (reset)
@@ -4037,12 +4297,20 @@ async function runRetention() {
         if (days > 0) {
             const channelIds = await discordMirroredChannelIds();
             if (channelIds.length > 0) {
-                // 一度に消しすぎて DB を止めないよう 500 件ずつ
+                // 一度に消しすぎて DB を止めないよう 500 件ずつ (各チャンネルの最新30件は低頻度チャンネル保護のため削除除外)
                 for (;;) {
                     const del = await db_js_1.pool.query(`DELETE FROM messages WHERE id IN (
-               SELECT id FROM messages
-               WHERE channel_id = ANY($1::int[]) AND is_pinned = FALSE AND created_at < NOW() - make_interval(days => $2)
-               ORDER BY id LIMIT 500
+               SELECT m.id FROM messages m
+               WHERE m.channel_id = ANY($1::int[])
+                 AND m.is_pinned = FALSE
+                 AND m.created_at < NOW() - make_interval(days => $2)
+                 AND m.id NOT IN (
+                   SELECT t.id FROM (
+                     SELECT id, ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY id DESC) AS rn
+                     FROM messages
+                   ) t WHERE t.rn <= 30
+                 )
+               ORDER BY m.id LIMIT 500
              ) RETURNING content`, [channelIds, days]);
                     if (del.rows.length === 0)
                         break;
@@ -4101,6 +4369,10 @@ server.listen(PORT, async () => {
                 if (upd.rows[0])
                     broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
             },
+            getMessageCount: async (asdfChannelId) => {
+                const r = await db_js_1.pool.query(`SELECT COUNT(*) FROM messages WHERE channel_id = $1`, [asdfChannelId]);
+                return parseInt(r.rows[0].count, 10) || 0;
+            },
             isDiscordMessageSynced: async (discordMessageId) => {
                 const res = await db_js_1.pool.query(`SELECT 1 FROM discord_message_links WHERE discord_message_id = $1 LIMIT 1`, [discordMessageId]);
                 return res.rows.length > 0;
@@ -4118,15 +4390,16 @@ server.listen(PORT, async () => {
                         replyToId = link.rows[0].asdf_message_id;
                     }
                 }
+                const encrypted = (0, crypto_js_1.encryptMessageContent)(content, asdfChannelId);
                 const result = meta.createdAt
-                    ? await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, created_at, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId, meta.createdAt, Boolean(meta.isBot)])
-                    : await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6) RETURNING *`, [asdfChannelId, username, content, meta.avatarUrl, replyToId, Boolean(meta.isBot)]);
+                    ? await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, created_at, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7) RETURNING *`, [asdfChannelId, username, encrypted, meta.avatarUrl, replyToId, meta.createdAt, Boolean(meta.isBot)])
+                    : await db_js_1.pool.query(`INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6) RETURNING *`, [asdfChannelId, username, encrypted, meta.avatarUrl, replyToId, Boolean(meta.isBot)]);
                 const saved = result.rows[0];
                 if (meta.discordMessageId) {
                     await db_js_1.pool.query(`INSERT INTO discord_message_links (asdf_message_id, discord_channel_id, discord_message_id, direction)
              VALUES ($1, $2, $3, 'in') ON CONFLICT DO NOTHING`, [saved.id, meta.discordChannelId, meta.discordMessageId]);
                 }
-                const [attached] = await attachReplies([{ ...saved, sender_username: username }]);
+                const [attached] = await attachReplies([{ ...saved, content, sender_username: username }]);
                 broadcast({ type: 'NEW_MESSAGE', payload: attached });
                 // Discord から届いたメッセージで @gemini または Bot メンションがあれば AI 返信を起動
                 if (/@gemini\b/i.test(String(content || '')) || /<@!?\d+>/.test(String(content || ''))) {
@@ -4134,28 +4407,33 @@ server.listen(PORT, async () => {
                 }
             },
             ingestEdit: async (discordMessageId, content) => {
-                const rows = (await db_js_1.pool.query(`UPDATE messages m SET content = $1, updated_at = NOW(), edited_at = NOW()
-           FROM discord_message_links l
-           WHERE l.discord_message_id = $2 AND l.direction = 'in' AND l.asdf_message_id = m.id AND m.content IS DISTINCT FROM $1
-           RETURNING m.*`, [content, discordMessageId])).rows;
-                for (const r of rows) {
-                    const [updated] = await attachReplies([{ ...r, sender_username: r.username }]);
-                    broadcast({ type: 'MESSAGE_UPDATED', payload: updated });
+                const links = (await db_js_1.pool.query(`SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1 AND direction = 'in'`, [discordMessageId])).rows;
+                for (const l of links) {
+                    const curMsg = (await db_js_1.pool.query(`SELECT id, channel_id FROM messages WHERE id = $1`, [l.asdf_message_id])).rows[0];
+                    if (!curMsg)
+                        continue;
+                    const encrypted = (0, crypto_js_1.encryptMessageContent)(content, curMsg.channel_id);
+                    const rows = (await db_js_1.pool.query(`UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`, [encrypted, curMsg.id])).rows;
+                    for (const r of rows) {
+                        const [updated] = await attachReplies([{ ...r, content, sender_username: r.username }]);
+                        broadcast({ type: 'MESSAGE_UPDATED', payload: updated });
+                    }
                 }
             },
             ingestDelete: async (discordMessageId) => {
                 const links = (await db_js_1.pool.query(`SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1`, [discordMessageId])).rows;
                 for (const l of links) {
-                    const cur = await db_js_1.pool.query(`SELECT id, content FROM messages WHERE id = $1`, [l.asdf_message_id]);
+                    const cur = await db_js_1.pool.query(`SELECT id, channel_id, content FROM messages WHERE id = $1`, [l.asdf_message_id]);
                     if (cur.rows.length === 0)
                         continue;
-                    const originalContent = cur.rows[0].content;
+                    const originalContent = (0, crypto_js_1.decryptMessageContent)(cur.rows[0].content, cur.rows[0].channel_id);
                     if (originalContent.includes('*(Discordで削除されました)*'))
                         continue;
                     const newContent = `~~${originalContent}~~ *(Discordで削除されました)*`;
-                    const updated = (await db_js_1.pool.query(`UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`, [newContent, l.asdf_message_id])).rows;
+                    const encrypted = (0, crypto_js_1.encryptMessageContent)(newContent, cur.rows[0].channel_id);
+                    const updated = (await db_js_1.pool.query(`UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`, [encrypted, l.asdf_message_id])).rows;
                     for (const r of updated) {
-                        const [attached] = await attachReplies([{ ...r, sender_username: r.username }]);
+                        const [attached] = await attachReplies([{ ...r, content: newContent, sender_username: r.username }]);
                         broadcast({ type: 'MESSAGE_UPDATED', payload: attached });
                     }
                 }

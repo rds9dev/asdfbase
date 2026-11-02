@@ -3,7 +3,7 @@ import React from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-const TOKEN_RE = /(@[^\s@#]+|#[^\s@#]+|:[a-zA-Z0-9_-]{2,32}:|https?:\/\/[^\s<>"]+)/g;
+const TOKEN_RE = /(@[^\s@#]+|#[^\s@#]+|<a?:[a-zA-Z0-9_]{2,32}:[0-9]+>|:[a-zA-Z0-9_-]{2,32}:|https?:\/\/[^\s<>"]+)/g;
 export const SPECIAL_MENTIONS = ['everyone', 'gemini'];
 
 export interface CustomEmojiItem {
@@ -105,22 +105,27 @@ export const BUILTIN_SHORTCODES: Record<string, string> = {
 export function isOnlyEmojis(text: string, customEmojis?: Map<string, string>): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
+  // Discord カスタム絵文字 (<:name:id> / <a:name:id>)
+  const dcCustomEmojis = trimmed.match(/<a?:[a-zA-Z0-9_]{2,32}:[0-9]+>/g) || [];
+  const withoutCustom = trimmed.replace(/<a?:[a-zA-Z0-9_]{2,32}:[0-9]+>/g, '').trim();
+
   // ショートコード (:melting_face:, :swim: 等) を抽出して一旦除去
-  const shortcodes = trimmed.match(/:[a-zA-Z0-9_+-]{1,32}:/g) || [];
+  const shortcodes = withoutCustom.match(/:[a-zA-Z0-9_+-]{1,32}:/g) || [];
   for (const sc of shortcodes) {
     const clean = sc.slice(1, -1).toLowerCase();
     const isKnown = Boolean(BUILTIN_SHORTCODES[clean] || clean === 'swim' || customEmojis?.has(clean));
     if (!isKnown) return false;
   }
-  const withoutShortcodes = trimmed.replace(/:[a-zA-Z0-9_+-]{1,32}:/g, '').trim();
+  const withoutShortcodes = withoutCustom.replace(/:[a-zA-Z0-9_+-]{1,32}:/g, '').trim();
   if (!withoutShortcodes) {
-    return shortcodes.length >= 1 && shortcodes.length <= 5;
+    const total = dcCustomEmojis.length + shortcodes.length;
+    return total >= 1 && total <= 5;
   }
   const emojiRegex = /^(\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Emoji_Modifier}|\uFE0F|\u200D|\s)+$/u;
   if (!emojiRegex.test(withoutShortcodes)) return false;
   const PictographicRe = /\p{Extended_Pictographic}|\p{Emoji_Presentation}/gu;
   const unicodeMatches = withoutShortcodes.match(PictographicRe) || [];
-  const totalCount = shortcodes.length + unicodeMatches.length;
+  const totalCount = dcCustomEmojis.length + shortcodes.length + unicodeMatches.length;
   return totalCount >= 1 && totalCount <= 5;
 }
 
@@ -309,6 +314,26 @@ export function renderMessageText(content: string, opts: RenderOptions, emojiSiz
       const rendered = renderEmojiToken(token, opts.customEmojis, i++, emojiSizeClass, opts.token);
       if (rendered) {
         out.push(rendered);
+        continue;
+      }
+    } else if (token.startsWith('<') && token.endsWith('>')) {
+      const matchDc = token.match(/^<(a)?:([a-zA-Z0-9_]+):([0-9]+)>$/);
+      if (matchDc) {
+        const animated = Boolean(matchDc[1]);
+        const emojiName = matchDc[2];
+        const emojiId = matchDc[3];
+        const ext = animated ? 'gif' : 'webp';
+        const url = `https://cdn.discordapp.com/emojis/${emojiId}.${ext}?size=48&quality=lossless`;
+        out.push(
+          <img
+            key={i++}
+            src={toProxiedMediaUrl(url, opts.token)}
+            alt={`:${emojiName}:`}
+            title={`:${emojiName}:`}
+            className={`inline-block align-middle object-contain ${emojiSizeClass} mx-0.5 select-none`}
+            loading="lazy"
+          />
+        );
         continue;
       }
     } else {
@@ -545,11 +570,11 @@ export function renderComposerHighlight(
       ? channels.has(body)
       : token.startsWith(':') && token.endsWith(':')
       ? Boolean(resolveEmojiUrl(token, customEmojis) || BUILTIN_SHORTCODES[token.slice(1, -1).toLowerCase()])
-      : false;
+      : token.startsWith('<') && /^<a?:[a-zA-Z0-9_]{2,32}:[0-9]+>$/.test(token);
     if (!valid) continue;
     if (idx > last) out.push(text.slice(last, idx));
     out.push(
-      <mark key={i++} className={token.startsWith('@') ? 'composer-mention' : 'composer-channel'}>
+      <mark key={i++} className={token.startsWith('@') ? 'composer-mention' : token.startsWith('#') ? 'composer-channel' : 'composer-emoji'}>
         {token}
       </mark>
     );

@@ -7,6 +7,7 @@ exports.pool = void 0;
 exports.initDb = initDb;
 const pg_1 = require("pg");
 const dotenv_1 = __importDefault(require("dotenv"));
+const crypto_1 = require("./crypto");
 dotenv_1.default.config();
 exports.pool = new pg_1.Pool({
     connectionString: process.env.DATABASE_URL || 'postgresql://asdfbase:asdfbase_secure_password_2026@127.0.0.1:5432/asdfbase',
@@ -259,7 +260,32 @@ async function initDb() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS server_permissions (
+        guild_id VARCHAR(64) PRIMARY KEY,
+        view_roles JSONB DEFAULT '[]',
+        deny_roles JSONB DEFAULT '[]',
+        allow_everyone BOOLEAN DEFAULT TRUE,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
     `).catch(err => console.warn('Migration class/edit/discord/homework warning:', err.message));
+        // メッセージの AES-256-GCM 暗号化マイグレーション (初回のみ)
+        const encMigrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_encrypt_messages_v1'`).catch(() => ({ rows: [] }));
+        if (encMigrated.rows.length === 0) {
+            try {
+                const msgs = await client.query(`SELECT id, channel_id, content FROM messages WHERE content IS NOT NULL AND content NOT LIKE 'enc:v1:%' LIMIT 10000`);
+                for (const m of msgs.rows) {
+                    if (m.content) {
+                        const enc = (0, crypto_1.encryptMessageContent)(m.content, m.channel_id);
+                        await client.query(`UPDATE messages SET content = $1 WHERE id = $2`, [enc, m.id]);
+                    }
+                }
+                await client.query(`INSERT INTO system_settings (key, value) VALUES ('migr_encrypt_messages_v1', 'done') ON CONFLICT DO NOTHING`);
+                console.log(`[migration] Encrypted ${msgs.rows.length} existing messages.`);
+            }
+            catch (err) {
+                console.warn('[migration] encrypt messages warning:', err.message);
+            }
+        }
         // 以前の編集 (updated_at だけ更新されていたもの) にも「編集済み」を付ける (初回のみ)
         const editMigrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_message_edited_at'`);
         if (editMigrated.rows.length === 0) {
