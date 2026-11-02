@@ -452,10 +452,18 @@ async function resolveGuildIcon(guild: any): Promise<string | null> {
   if (!guild?.icon) return null;
   const rawUrl = guild.iconURL({ extension: 'png', size: 128 });
   if (!rawUrl) return null;
+  const key = `guild-${guild.id}-${guild.icon}`;
+  if (deps?.uploadDir) {
+    const localWebpPath = path.join(deps.uploadDir, `discord-avatar-${key}.webp`);
+    if (fs.existsSync(localWebpPath)) {
+      return `/uploads/discord-avatar-${key}.webp`;
+    }
+  }
   if (deps?.saveAvatar) {
-    const key = `guild-${guild.id}-${guild.icon}`;
-    // 非同期でバックグラウンド保存を走らせつつ、即座にプロキシURLを返す
-    deps.saveAvatar(key, rawUrl).catch(() => {});
+    try {
+      const saved = await deps.saveAvatar(key, rawUrl);
+      if (saved) return saved;
+    } catch {}
   }
   return `/api/proxy/media?url=${encodeURIComponent(rawUrl)}`;
 }

@@ -235,6 +235,17 @@ export function memoSlotId(url: string): number | null {
 // Discord CDN や GIF の URL をプロキシ経由に変換 (i-FILTER 対策)
 export function toProxiedMediaUrl(url: string, token = ''): string {
   if (!url) return '';
+  // 既にプロキシURLの場合、未認証トークンパラメータを補完
+  if (url.startsWith('/api/proxy/media')) {
+    if (token && !url.includes('token=')) {
+      return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
+    }
+    return url;
+  }
+  // /uploads/... などのローカル静的パスはそのまま返す
+  if (url.startsWith('/')) {
+    return url;
+  }
   try {
     const u = new URL(url);
     const host = u.hostname.toLowerCase();

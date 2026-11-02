@@ -2402,11 +2402,6 @@ app.get('/api/ai/usage', authMiddleware, (_req, res) => {
 // Discord GIF・画像プロキシ (Chromebook i-FILTER 回避)
 app.get('/api/proxy/media', async (req, res) => {
   try {
-    const token = (req.query.token as string) || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!verifyToken(token)) {
-      return res.status(401).json({ error: '認証が必要です' });
-    }
-
     const rawUrl = req.query.url as string;
     if (!rawUrl) return res.status(400).json({ error: 'url パラメータが必要です' });
 
@@ -2415,6 +2410,20 @@ app.get('/api/proxy/media', async (req, res) => {
       targetUrl = new URL(rawUrl);
     } catch {
       return res.status(400).json({ error: '無効なURL形式です' });
+    }
+
+    // 公開静的画像（アバター・サーバーアイコン・絵文字等）は未認証でもプロキシ許可
+    const isPublicDiscordAsset =
+      targetUrl.hostname === 'cdn.discordapp.com' &&
+      (targetUrl.pathname.startsWith('/icons/') ||
+       targetUrl.pathname.startsWith('/avatars/') ||
+       targetUrl.pathname.startsWith('/emojis/') ||
+       targetUrl.pathname.startsWith('/app-icons/') ||
+       targetUrl.pathname.startsWith('/channel-icons/'));
+
+    const token = (req.query.token as string) || (req.headers.authorization || '').replace('Bearer ', '');
+    if (!isPublicDiscordAsset && !verifyToken(token)) {
+      return res.status(401).json({ error: '認証が必要です' });
     }
 
     const allowedHosts = [
