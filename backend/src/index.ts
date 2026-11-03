@@ -1238,13 +1238,32 @@ app.post('/api/channels/:channelId/read', authMiddleware, async (req: AuthReques
   }
 });
 
-// 全チャンネルを一括既読にする
+// チャンネルを一括既読にする (サーバーID指定がある場合は該当サーバーに属するチャンネルのみ)
 app.post('/api/channels/read-all', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const userId = req.user!.id;
-    const latestPerChannel = await pool.query(
-      `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages GROUP BY channel_id`
-    );
+    const { serverId, channelIds: targetChannelIds } = req.body || {};
+
+    let query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages GROUP BY channel_id`;
+    let queryParams: any[] = [];
+
+    if (Array.isArray(targetChannelIds) && targetChannelIds.length > 0) {
+      const validIds = targetChannelIds.map(Number).filter(Number.isFinite);
+      if (validIds.length > 0) {
+        query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages WHERE channel_id = ANY($1) GROUP BY channel_id`;
+        queryParams = [validIds];
+      }
+    } else if (serverId && serverId !== 'all') {
+      // serverId に紐付くチャンネルIDを channels テーブルから抽出
+      const chRows = await pool.query(`SELECT id FROM channels WHERE server_id = $1`, [String(serverId).trim()]);
+      const validIds = chRows.rows.map(r => Number(r.id));
+      if (validIds.length > 0) {
+        query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages WHERE channel_id = ANY($1) GROUP BY channel_id`;
+        queryParams = [validIds];
+      }
+    }
+
+    const latestPerChannel = await pool.query(query, queryParams);
     const readUpdates: Record<number, number> = {};
     for (const row of latestPerChannel.rows) {
       const channelId = Number(row.channel_id);
@@ -1258,7 +1277,7 @@ app.post('/api/channels/read-all', authMiddleware, async (req: AuthRequest, res)
         readUpdates[channelId] = maxId;
       }
     }
-    publish({ type: 'ALL_CHANNELS_READ', payload: { userId, readUpdates } }, { targetUserId: userId });
+    publish({ type: 'ALL_CHANNELS_READ', payload: { userId, readUpdates, serverId: serverId || null } }, { targetUserId: userId });
     res.json({ success: true, readUpdates });
   } catch (err: any) {
     console.error('Read all channels error:', err);

@@ -1557,6 +1557,24 @@ export default function App() {
           }
           scheduleUnreadRefresh();
         }
+      } else if (msg.type === 'ALL_CHANNELS_READ') {
+        const { readUpdates, serverId } = msg.payload || {};
+        if (readUpdates && typeof readUpdates === 'object') {
+          const chIds = Object.keys(readUpdates).map(Number);
+          setUnreadCounts(prev => {
+            const next = { ...prev };
+            for (const id of chIds) delete next[id];
+            return next;
+          });
+          setMentionCounts(prev => {
+            const next = { ...prev };
+            for (const id of chIds) delete next[id];
+            return next;
+          });
+          lastReadMessageIdsRef.current = { ...lastReadMessageIdsRef.current, ...readUpdates };
+          setLastReadMessageIds(prev => ({ ...prev, ...readUpdates }));
+        }
+        scheduleUnreadRefresh();
       } else if (msg.type === 'HOMEWORK_CREATED') {
         setHomework(prev => (prev.some(h => h.id === msg.payload.id) ? prev : [...prev, { ...msg.payload, my_done: false }]));
       } else if (msg.type === 'HOMEWORK_UPDATED') {
@@ -2573,16 +2591,55 @@ export default function App() {
     }
   };
 
-  const handleMarkAllReadRef = useRef<() => void>(() => {});
-  const handleMarkAllRead = async () => {
-    setUnreadCounts({});
-    setMentionCounts({});
+  const handleMarkAllReadRef = useRef<(targetServerId?: string) => void>(() => {});
+  const handleMarkAllRead = async (targetServerId?: string) => {
+    const srvId = targetServerId !== undefined ? targetServerId : selectedServerId;
+    const isTargeted = Boolean(srvId && srvId !== 'all');
+
+    // 該当サーバーのチャンネルIDリストを取得
+    const targetChannels = isTargeted
+      ? channels.filter(c => c.type !== 'voice' && resolveChannelServerId(c) === srvId)
+      : channels.filter(c => c.type !== 'voice');
+    const targetChannelIds = targetChannels.map(c => c.id);
+    const targetIdSet = new Set(targetChannelIds);
+
+    // 楽観的UI更新: 該当サーバーのチャンネルの未読・メンション数を即時クリア
+    setUnreadCounts(prev => {
+      if (!isTargeted) return {};
+      const next = { ...prev };
+      for (const id of targetChannelIds) delete next[id];
+      return next;
+    });
+    setMentionCounts(prev => {
+      if (!isTargeted) return {};
+      const next = { ...prev };
+      for (const id of targetChannelIds) delete next[id];
+      return next;
+    });
+
     try {
-      await safeFetch(`${API_BASE_URL}/api/channels/read-all`, {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels/read-all`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          serverId: isTargeted ? srvId : undefined,
+          channelIds: isTargeted ? targetChannelIds : undefined,
+        }),
       });
-      toast('すべてのチャンネルを既読にしました', { kind: 'success' });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.readUpdates) {
+          const reads = data.readUpdates;
+          lastReadMessageIdsRef.current = { ...lastReadMessageIdsRef.current, ...reads };
+          setLastReadMessageIds(prev => ({ ...prev, ...reads }));
+        }
+      }
+
+      const srvName = isTargeted
+        ? (discordServers.find(s => s.id === srvId)?.name || 'このサーバー')
+        : 'すべて';
+      toast(isTargeted ? `「${srvName}」のチャンネルを既読にしました` : 'すべてのチャンネルを既読にしました', { kind: 'success' });
     } catch (err) {
       console.error(err);
     }
@@ -5450,24 +5507,34 @@ export default function App() {
                 </div>
 
                 {/* 右側: サーバー情報 & チャンネル一覧 */}
-                <div className="flex-1 min-w-0 min-h-0 flex flex-col p-2 sm:p-2.5">
-                  <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-stone-400 px-1.5 mb-1.5 font-bold shrink-0 gap-1">
-                    <span className="truncate text-stone-200">
-                      {selectedServer ? selectedServer.name : 'asdfbase'}
-                    </span>
-                    <div className="flex items-center gap-0.5 shrink-0">
-                      <button
-                        type="button"
-                        onClick={handleMarkAllRead}
-                        className={`p-1 rounded transition ${
-                          totalUnread > 0
-                            ? 'text-amber-400 hover:text-amber-300 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30'
-                            : 'text-stone-500 hover:text-stone-300 hover:bg-stone-800'
-                        }`}
-                        title="すべてのチャンネルを既読にする (Shift + Esc)"
-                      >
-                        <CheckCheck className="w-3.5 h-3.5" />
-                      </button>
+                {(() => {
+                  const currentServerChannels = channels.filter(
+                    c => c.type !== 'voice' && resolveChannelServerId(c) === selectedServerId
+                  );
+                  const totalServerUnread = currentServerChannels.reduce(
+                    (s, c) => s + (c.id === activeChannelId ? 0 : (unreadCounts[c.id] || 0)),
+                    0
+                  );
+
+                  return (
+                    <div className="flex-1 min-w-0 min-h-0 flex flex-col p-2 sm:p-2.5">
+                      <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-stone-400 px-1.5 mb-1.5 font-bold shrink-0 gap-1">
+                        <span className="truncate text-stone-200">
+                          {selectedServer ? selectedServer.name : 'asdfbase'}
+                        </span>
+                        <div className="flex items-center gap-0.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleMarkAllRead(selectedServerId)}
+                            className={`p-1 rounded transition ${
+                              totalServerUnread > 0
+                                ? 'text-amber-400 hover:text-amber-300 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30'
+                                : 'text-stone-500 hover:text-stone-300 hover:bg-stone-800'
+                            }`}
+                            title={`${selectedServer ? selectedServer.name : 'このサーバー'}の全チャンネルを既読にする (Shift + Esc)`}
+                          >
+                            <CheckCheck className="w-3.5 h-3.5" />
+                          </button>
                       <button
                         type="button"
                         onClick={() => handleSyncDiscordHistory(selectedServer ? { guildId: selectedServer.id } : undefined)}
@@ -5809,8 +5876,10 @@ export default function App() {
                     })()}
                   </div>
                 </div>
-              </aside>
-            )}
+              );
+            })()}
+          </aside>
+        )}
 
             {/* Center: メインチャット */}
             <section className="flex-1 min-w-0 min-h-0 flex flex-col bg-[#090A0C] overflow-hidden">
