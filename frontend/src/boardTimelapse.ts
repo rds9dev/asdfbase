@@ -2,11 +2,17 @@
 // 普通の速さ (1点あたり NATURAL_MS_PER_POINT) で30秒を超える量なら、全体が30秒になるよう倍速にする。
 // 少ししか描いていない時は引き伸ばさず普通の速さ (ただし最短 MIN_DURATION_MS)。
 
+export interface BoardStrokePoint {
+  x: number;
+  y: number;
+  p?: number; // 筆圧 (0.0 ~ 1.0)
+}
+
 export interface BoardStroke {
   id: number;
   color: string;
   width: number;
-  points: { x: number; y: number }[];
+  points: BoardStrokePoint[];
   created_at?: string;
 }
 
@@ -28,20 +34,41 @@ type Item = { kind: 'stroke'; s: BoardStroke; weight: number } | { kind: 'text';
 
 export function drawStroke(ctx: CanvasRenderingContext2D, s: BoardStroke, from = 1, to = s.points.length) {
   if (!s.points || s.points.length < 2 || to <= from) return;
+  const isEraser = s.color === 'eraser';
+  const baseWidth = s.width || (isEraser ? 16 : 3);
+  const pts = s.points;
+
+  // 筆圧情報 (p) が含まれる場合はセグメントごとに太さを滑らかに変化させて描画
+  const hasPressure = pts.some(pt => typeof pt.p === 'number');
+
   ctx.save();
-  if (s.color === 'eraser') {
+  if (isEraser) {
     ctx.globalCompositeOperation = 'destination-out';
-    ctx.lineWidth = s.width || 9;
   } else {
     ctx.strokeStyle = s.color || '#f59e0b';
-    ctx.lineWidth = s.width || 3;
   }
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.beginPath();
-  ctx.moveTo(s.points[from - 1].x, s.points[from - 1].y);
-  for (let i = from; i < to; i++) ctx.lineTo(s.points[i].x, s.points[i].y);
-  ctx.stroke();
+
+  if (hasPressure) {
+    for (let i = from; i < to; i++) {
+      const p1 = pts[i - 1];
+      const p2 = pts[i];
+      const press = typeof p2.p === 'number' ? p2.p : (typeof p1.p === 'number' ? p1.p : 0.5);
+      const segmentWidth = isEraser ? baseWidth : Math.max(1, baseWidth * (0.3 + press * 1.4));
+      ctx.lineWidth = segmentWidth;
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+    }
+  } else {
+    ctx.lineWidth = baseWidth;
+    ctx.beginPath();
+    ctx.moveTo(pts[from - 1].x, pts[from - 1].y);
+    for (let i = from; i < to; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -62,12 +89,14 @@ function buildTimeline(strokes: BoardStroke[], texts: BoardText[]): Item[] {
   return items.sort((a, b) => a.at - b.at || a.id - b.id);
 }
 
-export function timelapsePlan(strokes: BoardStroke[], texts: BoardText[]) {
+export function timelapsePlan(strokes: BoardStroke[], texts: BoardText[], speedMultiplier = 1) {
   const items = buildTimeline(strokes, texts);
   const total = items.reduce((a, b) => a + b.weight, 0);
   const natural = total * NATURAL_MS_PER_POINT;
-  const duration = natural > TARGET_DURATION_MS ? TARGET_DURATION_MS : Math.max(natural, MIN_DURATION_MS);
-  return { items, total, duration, speed: natural / duration };
+  const baseDuration = natural > TARGET_DURATION_MS ? TARGET_DURATION_MS : Math.max(natural, MIN_DURATION_MS);
+  const mult = Math.max(0.2, speedMultiplier);
+  const duration = Math.max(500, baseDuration / mult);
+  return { items, total, duration, speed: (natural / duration) };
 }
 
 // 再生を始め、止める関数を返す
@@ -75,10 +104,11 @@ export function playTimelapse(
   canvas: HTMLCanvasElement,
   strokes: BoardStroke[],
   texts: BoardText[],
-  cb: { onProgress: (ratio: number) => void; onDone: () => void }
+  cb: { onProgress: (ratio: number) => void; onDone: () => void },
+  speedMultiplier = 1
 ): () => void {
   const ctx = canvas.getContext('2d');
-  const { items, total, duration } = timelapsePlan(strokes, texts);
+  const { items, total, duration } = timelapsePlan(strokes, texts, speedMultiplier);
   if (!ctx || total === 0) {
     cb.onDone();
     return () => {};

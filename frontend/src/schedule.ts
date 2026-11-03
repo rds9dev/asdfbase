@@ -183,6 +183,8 @@ export function computeSchoolStatus(now: Date, config: TimetableConfig, today: T
   sub: string;
   currentKey?: string;
 } {
+  const holiday = getJapaneseHoliday(now);
+  if (holiday) return { kind: 'holiday', label: '祝日', sub: holiday };
   const dow = now.getDay();
   if (dow === 0 || dow === 6) return { kind: 'holiday', label: '休み', sub: dow === 6 ? '土曜日' : '日曜日' };
   const slots = daySlots(config, dow, today);

@@ -737,6 +737,7 @@ export default function App() {
   const [currentStrokePoints, setCurrentStrokePoints] = useState<{ x: number; y: number }[]>([]);
   const [boardMode, setBoardMode] = useState<'draw' | 'eraser' | 'text'>('draw');
   const [newBoardText, setNewBoardText] = useState('');
+  const [timelapseSpeed, setTimelapseSpeed] = useState<number>(1);
   const [isTimelapsePlaying, setIsTimelapsePlaying] = useState(false);
   const [timelapseProgress, setTimelapseProgress] = useState(0);
   const stopTimelapseRef = useRef<(() => void) | null>(null);
@@ -4046,16 +4047,17 @@ export default function App() {
     };
   };
 
-  const strokePointsRef = useRef<{ x: number; y: number }[]>([]);
+  const strokePointsRef = useRef<{ x: number; y: number; p?: number }[]>([]);
   const activePointerRef = useRef<number | null>(null);
+  const activePointerIsEraserRef = useRef<boolean>(false);
 
-  const drawSegment = (from: { x: number; y: number }, to: { x: number; y: number }, width: number) => {
+  const drawSegment = (from: { x: number; y: number }, to: { x: number; y: number }, width: number, isEraser = false) => {
     const ctx = canvasRef.current?.getContext('2d');
     if (!ctx) return;
     ctx.save();
-    if (boardMode === 'eraser') {
+    if (isEraser || boardMode === 'eraser') {
       ctx.globalCompositeOperation = 'destination-out';
-      ctx.lineWidth = eraserWidth;
+      ctx.lineWidth = isEraser ? eraserWidth : eraserWidth;
     } else {
       ctx.strokeStyle = drawColor;
       ctx.lineWidth = width;
@@ -4069,8 +4071,16 @@ export default function App() {
     ctx.restore();
   };
 
-  // Pointer Events: マウス・タッチ・ペン(iPad / Chromebook のスタイラス / 筆圧 / パームリジェクション対応)
+  // Pointer Events: マウス・タッチ・ペン(iPad / Chromebook のスタイラス / 筆圧 / ペン裏消しゴム / パームリジェクション対応)
   const activePointerTypeRef = useRef<string | null>(null);
+
+  const isEraserPointer = (e: React.PointerEvent<HTMLCanvasElement> | PointerEvent) => {
+    return (
+      (e as any).pointerType === 'eraser' ||
+      (e.buttons !== undefined && (e.buttons & 32) === 32) || // ペン裏側消しゴムボタン
+      (e.button !== undefined && e.button === 5)
+    );
+  };
 
   const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (boardMode !== 'draw' && boardMode !== 'eraser') return;
@@ -4083,43 +4093,57 @@ export default function App() {
     e.currentTarget.setPointerCapture(e.pointerId);
     activePointerRef.current = e.pointerId;
     activePointerTypeRef.current = e.pointerType;
-    const p = getCanvasCoords(e);
+    const isPenEraser = isEraserPointer(e) || boardMode === 'eraser';
+    activePointerIsEraserRef.current = isPenEraser;
+
+    const coords = getCanvasCoords(e);
+    const pressure = (e.pointerType === 'pen' && typeof e.pressure === 'number' && e.pressure > 0) ? Math.round(e.pressure * 100) / 100 : undefined;
+    const p = { ...coords, p: pressure };
     strokePointsRef.current = [p];
     setIsDrawing(true);
-    const pressureWidth = (e.pointerType === 'pen' && e.pressure > 0)
-      ? brushWidth * (0.3 + e.pressure * 1.4)
+    const pressureWidth = (e.pointerType === 'pen' && pressure !== undefined)
+      ? Math.max(1, brushWidth * (0.3 + pressure * 1.4))
       : brushWidth;
-    drawSegment(p, { x: p.x + 0.01, y: p.y + 0.01 }, boardMode === 'eraser' ? eraserWidth : pressureWidth);
+    drawSegment(p, { x: p.x + 0.01, y: p.y + 0.01 }, isPenEraser ? eraserWidth : pressureWidth, isPenEraser);
   };
 
   const handleCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (activePointerRef.current !== e.pointerId) return;
     if (activePointerTypeRef.current === 'pen' && e.pointerType === 'touch') return;
     e.preventDefault();
+
+    // 途中でペンの裏ボタンが押された/離された場合も追従
+    const isPenEraser = activePointerIsEraserRef.current || isEraserPointer(e) || boardMode === 'eraser';
+    activePointerIsEraserRef.current = isPenEraser;
+
     const events = typeof e.nativeEvent.getCoalescedEvents === 'function' ? e.nativeEvent.getCoalescedEvents() : [];
     const list = events.length > 0 ? events : [e.nativeEvent];
     for (const ev of list) {
-      const p = getCanvasCoords(ev);
+      const coords = getCanvasCoords(ev);
       const pts = strokePointsRef.current;
       const last = pts[pts.length - 1];
-      if (last && Math.abs(last.x - p.x) < 0.8 && Math.abs(last.y - p.y) < 0.8) continue;
+      if (last && Math.abs(last.x - coords.x) < 0.8 && Math.abs(last.y - coords.y) < 0.8) continue;
+      const pressure = (e.pointerType === 'pen' && typeof ev.pressure === 'number' && ev.pressure > 0) ? Math.round(ev.pressure * 100) / 100 : undefined;
+      const p = { ...coords, p: pressure };
       pts.push(p);
-      const pressureWidth = (e.pointerType === 'pen' && (ev.pressure || 0) > 0)
-        ? brushWidth * (0.3 + (ev.pressure || 0.5) * 1.4)
+      const pressureWidth = (e.pointerType === 'pen' && pressure !== undefined)
+        ? Math.max(1, brushWidth * (0.3 + pressure * 1.4))
         : brushWidth;
-      if (last) drawSegment(last, p, boardMode === 'eraser' ? eraserWidth : pressureWidth);
+      if (last) drawSegment(last, p, isPenEraser ? eraserWidth : pressureWidth, isPenEraser);
     }
   };
 
   const finishStroke = async (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (activePointerRef.current !== e.pointerId) return;
+    const isPenEraser = activePointerIsEraserRef.current || isEraserPointer(e) || boardMode === 'eraser';
     activePointerRef.current = null;
     activePointerTypeRef.current = null;
+    activePointerIsEraserRef.current = false;
     setIsDrawing(false);
     const points = strokePointsRef.current;
     strokePointsRef.current = [];
     if (points.length < 2 || !token) {
-      if (points.length === 1 && token) points.push({ x: points[0].x + 0.5, y: points[0].y + 0.5 });
+      if (points.length === 1 && token) points.push({ x: points[0].x + 0.5, y: points[0].y + 0.5, p: points[0].p });
       else return;
     }
     try {
@@ -4130,8 +4154,8 @@ export default function App() {
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
-          color: boardMode === 'eraser' ? 'eraser' : drawColor,
-          width: boardMode === 'eraser' ? eraserWidth : brushWidth,
+          color: isPenEraser ? 'eraser' : drawColor,
+          width: isPenEraser ? eraserWidth : brushWidth,
           points
         })
       });
@@ -4293,19 +4317,25 @@ export default function App() {
     }
   };
 
-  // タイムラプス再生: 描いた順に少しずつ描き直す。長い時は全体が約30秒になるよう倍速
+  // タイムラプス再生: 描いた順に少しずつ描き直す。長い時は全体が約30秒になるよう倍速 (速度倍率対応)
   const handlePlayTimelapse = () => {
     const canvas = canvasRef.current;
     if (!canvas || (boardStrokes.length === 0 && boardTexts.length === 0) || isTimelapsePlaying) return;
     setIsTimelapsePlaying(true);
     setTimelapseProgress(0);
-    stopTimelapseRef.current = playTimelapse(canvas, boardStrokes, boardTexts, {
-      onProgress: setTimelapseProgress,
-      onDone: () => {
-        stopTimelapseRef.current = null;
-        setIsTimelapsePlaying(false);
+    stopTimelapseRef.current = playTimelapse(
+      canvas,
+      boardStrokes,
+      boardTexts,
+      {
+        onProgress: setTimelapseProgress,
+        onDone: () => {
+          stopTimelapseRef.current = null;
+          setIsTimelapsePlaying(false);
+        },
       },
-    });
+      timelapseSpeed
+    );
   };
 
   const stopTimelapse = () => {
@@ -7929,24 +7959,41 @@ export default function App() {
                 {(boardMode === 'draw' || boardMode === 'eraser') && (
                   <div className="flex items-center gap-2 pl-2 border-l border-stone-800">
                     {boardMode === 'draw' && (
-                      <>
-
-                        {['#f59e0b', '#ef4444', '#10b981', '#3b82f6', '#ffffff'].map(c => (
+                      <div className="flex items-center gap-1.5">
+                        {['#f59e0b', '#ef4444', '#10b981', '#3b82f6', '#a855f7', '#ffffff'].map(c => (
                           <button
                             key={c}
                             onClick={() => setDrawColor(c)}
                             style={{ backgroundColor: c }}
                             className={`w-5 h-5 rounded-full border-2 transition ${
-                              drawColor === c ? 'border-white scale-110' : 'border-transparent'
+                              drawColor.toLowerCase() === c.toLowerCase() ? 'border-white scale-110 shadow-sm shadow-white/30' : 'border-transparent hover:scale-105'
                             }`}
+                            title={`色: ${c}`}
                           />
                         ))}
-                      </>
+                        {/* 自由カラーピッカー */}
+                        <label
+                          className="relative w-6 h-6 rounded-full border border-stone-700 cursor-pointer overflow-hidden flex items-center justify-center hover:scale-105 transition shrink-0"
+                          title="自由な色を選択"
+                          style={{
+                            background: !['#f59e0b', '#ef4444', '#10b981', '#3b82f6', '#a855f7', '#ffffff'].includes(drawColor.toLowerCase())
+                              ? drawColor
+                              : 'conic-gradient(from 180deg at 50% 50%, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00)',
+                          }}
+                        >
+                          <input
+                            type="color"
+                            value={drawColor}
+                            onChange={e => setDrawColor(e.target.value)}
+                            className="absolute inset-0 opacity-0 cursor-pointer w-full h-full"
+                          />
+                        </label>
+                      </div>
                     )}
 
                     <span className="w-px h-4 bg-stone-800 mx-1" />
                     {boardMode === 'eraser' ? (
-                      [16, 32, 64, 120].map(w => (
+                      [16, 32, 64, 120, 180, 240].map(w => (
                         <button
                           key={w}
                           onClick={() => setEraserWidth(w)}
@@ -7959,13 +8006,13 @@ export default function App() {
                         </button>
                       ))
                     ) : (
-                      [2, 4, 8, 16].map(w => (
+                      [2, 4, 8, 16, 32].map(w => (
                         <button
                           key={w}
                           onClick={() => setBrushWidth(w)}
                           title={`ペンの太さ: ${w}px`}
                           className={`px-2 py-0.5 rounded border transition ${
-                            brushWidth === w ? 'border-amber-400 text-amber-400' : 'border-stone-800 text-stone-500'
+                            brushWidth === w ? 'border-amber-400 text-amber-400 font-bold bg-amber-500/10' : 'border-stone-800 text-stone-500 hover:text-stone-300'
                           }`}
                         >
                           {w}px
@@ -8022,18 +8069,30 @@ export default function App() {
                   </button>
                 ) : (
                   (() => {
-                    const plan = timelapsePlan(boardStrokes, boardTexts);
+                    const plan = timelapsePlan(boardStrokes, boardTexts, timelapseSpeed);
                     return (
-                      <button
-                        onClick={handlePlayTimelapse}
-                        disabled={plan.total === 0}
-                        title={plan.total === 0 ? 'まだ何も描かれていません' : `約${Math.max(1, Math.round(plan.duration / 1000))}秒で再生${plan.speed > 1.05 ? ` (×${plan.speed.toFixed(1)}倍速)` : ''}`}
-                        className="px-3 py-1.5 bg-stone-900 border border-stone-800 hover:border-amber-500/40 text-stone-300 hover:text-amber-400 rounded-xl flex items-center gap-1.5 transition disabled:opacity-40"
-                      >
-                        <Play className="w-3.5 h-3.5 text-amber-400" />
-                        <span className="hidden sm:inline">タイムラプス</span>
-                        {plan.speed > 1.05 && <span className="hidden sm:inline text-[10px] text-stone-500">×{plan.speed.toFixed(1)}</span>}
-                      </button>
+                      <div className="flex items-center gap-1 bg-stone-900 border border-stone-800 rounded-xl p-0.5">
+                        <button
+                          onClick={handlePlayTimelapse}
+                          disabled={plan.total === 0}
+                          title={plan.total === 0 ? 'まだ何も描かれていません' : `約${Math.max(1, Math.round(plan.duration / 1000))}秒で再生 (${timelapseSpeed}倍速)`}
+                          className="px-2.5 py-1 text-stone-300 hover:text-amber-400 rounded-lg flex items-center gap-1.5 transition disabled:opacity-40"
+                        >
+                          <Play className="w-3.5 h-3.5 text-amber-400" />
+                          <span className="hidden sm:inline text-xs">タイムラプス</span>
+                        </button>
+                        <select
+                          value={timelapseSpeed}
+                          onChange={e => setTimelapseSpeed(Number(e.target.value))}
+                          title="タイムラプス再生速度"
+                          className="bg-transparent text-amber-400 font-mono text-xs px-1.5 py-1 border-l border-stone-800 focus:outline-none cursor-pointer"
+                        >
+                          <option value={1} className="bg-[#111214] text-white">1x</option>
+                          <option value={2} className="bg-[#111214] text-white">2x</option>
+                          <option value={5} className="bg-[#111214] text-white">5x</option>
+                          <option value={10} className="bg-[#111214] text-white">10x</option>
+                        </select>
+                      </div>
                     );
                   })()
                 )}
@@ -8103,39 +8162,6 @@ export default function App() {
                   </form>
                 </div>
               )}
-
-              {/* 共有クリップボード (折りたたみ可) */}
-              <div className="absolute bottom-2 left-2 sm:bottom-4 sm:left-4 w-[calc(100%-1rem)] sm:w-80 bg-[#111214]/90 backdrop-blur-md border border-stone-800/80 rounded-2xl shadow-2xl font-mono text-xs cursor-auto">
-                <button
-                  onClick={() => setIsClipboardOpen(v => !v)}
-                  className="w-full flex items-center justify-between px-3 py-2 text-stone-400 hover:text-white"
-                >
-                  <span className="flex items-center gap-1.5 font-bold text-white">
-                    <Clipboard className="w-3.5 h-3.5 text-amber-400" /> 共有クリップボード
-                  </span>
-                  <span className="flex items-center gap-2 text-[10px] text-stone-500">
-                    {clipboardUpdatedBy && `by ${clipboardUpdatedBy}`}
-                    <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isClipboardOpen ? '' : 'rotate-180'}`} />
-                  </span>
-                </button>
-                {isClipboardOpen && (
-                  <div className="px-3 pb-3 space-y-2 anim-fade">
-                    <textarea
-                      value={clipboardText}
-                      onChange={e => handleUpdateClipboard(e.target.value)}
-                      placeholder="ここに書いた内容は全員と共有されます"
-                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl p-2 text-stone-200 focus:outline-none focus:border-amber-500/60 resize-none h-20 text-xs leading-relaxed"
-                    />
-                    <button
-                      onClick={handleCopyClipboardToOS}
-                      className="w-full py-1.5 btn-ghost rounded-lg flex items-center justify-center gap-1.5 text-[11px]"
-                    >
-                      {isCopiedToOS ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                      <span>{isCopiedToOS ? 'コピーしました' : '端末にコピー'}</span>
-                    </button>
-                  </div>
-                )}
-              </div>
             </div>
           </div>
         )}
