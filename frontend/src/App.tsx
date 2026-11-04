@@ -90,6 +90,7 @@ import {
   Upload,
   CheckCheck,
   Radio,
+  Paperclip,
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
@@ -159,6 +160,37 @@ interface ChannelItem {
   view_roles?: string[];
   write_roles?: string[];
   permissions_overwrites?: PermissionOverwrite[];
+}
+
+interface DmSession {
+  id: number;
+  asdf_user_id: number;
+  discord_user_id: string;
+  discord_username: string;
+  discord_display_name?: string | null;
+  discord_avatar_url?: string | null;
+  created_at: string;
+  last_message_at: string;
+  unread_count?: number;
+  last_message?: {
+    id: number;
+    sender_type: 'asdf' | 'discord';
+    sender_name: string;
+    content: string;
+    created_at: string;
+  } | null;
+}
+
+interface DmMessage {
+  id: number;
+  session_id: number;
+  sender_type: 'asdf' | 'discord';
+  sender_name: string;
+  content: string;
+  attachments?: { url: string; name: string }[];
+  discord_message_id?: string | null;
+  is_read?: boolean;
+  created_at: string;
 }
 
 interface Message {
@@ -418,6 +450,27 @@ export default function App() {
   const [discordBindings, setDiscordBindings] = useState<any[]>([]);
   const [discordLinkRequests, setDiscordLinkRequests] = useState<any[]>([]);
   const [selectedServerId, setSelectedServerId] = useState<string>('1524703392927191100');
+  // DM (ダイレクトメッセージ) state
+  const [dmSessions, setDmSessions] = useState<DmSession[]>([]);
+  const [selectedDmSessionId, setSelectedDmSessionId] = useState<number | null>(null);
+  const selectedDmSessionIdRef = useRef<number | null>(null);
+  selectedDmSessionIdRef.current = selectedDmSessionId;
+  const [dmMessages, setDmMessages] = useState<DmMessage[]>([]);
+  const [isLoadingDmMessages, setIsLoadingDmMessages] = useState<boolean>(false);
+  const [dmInputText, setDmInputText] = useState<string>('');
+  const [dmAttachments, setDmAttachments] = useState<{ url: string; name: string }[]>([]);
+  const [isSendingDm, setIsSendingDm] = useState<boolean>(false);
+  const [showNewDmModal, setShowNewDmModal] = useState<boolean>(false);
+  const [dmMemberSearch, setDmMemberSearch] = useState<string>('');
+  const [customDiscordIdInput, setCustomDiscordIdInput] = useState<string>('');
+  const [dmTypingUsers, setDmTypingUsers] = useState<Record<number, { discordUserId: string; t: number }>>({});
+  const lastDmTypingSentRef = useRef<number>(0);
+  const dmChatBottomRef = useRef<HTMLDivElement | null>(null);
+
+  const totalDmUnread = useMemo(() => {
+    return dmSessions.reduce((sum, s) => sum + (s.unread_count || 0), 0);
+  }, [dmSessions]);
+
   const [showDiscordServerModal, setShowDiscordServerModal] = useState<boolean>(false);
   const [isSyncingDiscordHistory, setIsSyncingDiscordHistory] = useState<boolean>(false);
   const [linkGuildId, setLinkGuildId] = useState<string>('');
@@ -1174,6 +1227,180 @@ export default function App() {
     }
   }, [isPinsOpen, activeChannelId, fetchPins]);
 
+  // ===== DM (ダイレクトメッセージ) ハンドラ =====
+  const fetchDmSessions = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await safeFetch('/api/dm/sessions', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDmSessions(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.warn('fetchDmSessions error:', err);
+    }
+  }, [token]);
+
+  const fetchDmMessages = useCallback(async (sessionId: number) => {
+    if (!token) return;
+    setIsLoadingDmMessages(true);
+    try {
+      const res = await safeFetch(`/api/dm/sessions/${sessionId}/messages`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDmMessages(Array.isArray(data) ? data : []);
+        // 既読化
+        safeFetch(`/api/dm/sessions/${sessionId}/read`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }).catch(() => {});
+        setDmSessions(prev => prev.map(s => s.id === sessionId ? { ...s, unread_count: 0 } : s));
+        setTimeout(() => {
+          dmChatBottomRef.current?.scrollIntoView({ behavior: 'auto' });
+        }, 50);
+      }
+    } catch (err) {
+      console.warn('fetchDmMessages error:', err);
+    } finally {
+      setIsLoadingDmMessages(false);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (token) {
+      fetchDmSessions();
+    }
+  }, [token, fetchDmSessions]);
+
+  useEffect(() => {
+    if (selectedServerId === 'dm' && selectedDmSessionId) {
+      fetchDmMessages(selectedDmSessionId);
+    }
+  }, [selectedServerId, selectedDmSessionId, fetchDmMessages]);
+
+  const handleSendDmMessage = async () => {
+    if (!selectedDmSessionId || (!dmInputText.trim() && dmAttachments.length === 0) || isSendingDm) return;
+    const textToSend = dmInputText.trim();
+    const attsToSend = [...dmAttachments];
+    setDmInputText('');
+    setDmAttachments([]);
+    setIsSendingDm(true);
+
+    try {
+      const res = await safeFetch(`/api/dm/sessions/${selectedDmSessionId}/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          content: textToSend,
+          attachments: attsToSend,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'DM送信に失敗しました');
+      }
+      setTimeout(() => {
+        dmChatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 50);
+    } catch (err: any) {
+      toast(err.message || 'DM送信に失敗しました', { kind: 'error' });
+      setDmInputText(textToSend);
+      setDmAttachments(attsToSend);
+    } finally {
+      setIsSendingDm(false);
+    }
+  };
+
+  const handleDeleteDmMessage = async (msgId: number) => {
+    if (!selectedDmSessionId) return;
+    try {
+      const res = await safeFetch(`/api/dm/sessions/${selectedDmSessionId}/messages/${msgId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const d = await res.json();
+        throw new Error(d.error || '削除失敗');
+      }
+      setDmMessages(prev => prev.filter(m => m.id !== msgId));
+    } catch (err: any) {
+      toast(err.message || 'メッセージ削除に失敗しました', { kind: 'error' });
+    }
+  };
+
+  const handleDeleteDmSession = async (sessionId: number, name: string) => {
+    const ok = await confirmDialog({
+      title: `${name} とのDMを削除しますか？`,
+      message: '会話履歴は完全に消去されます。元に戻せません。',
+      confirmLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
+
+    try {
+      const res = await safeFetch(`/api/dm/sessions/${sessionId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error('削除失敗');
+      setDmSessions(prev => prev.filter(s => s.id !== sessionId));
+      if (selectedDmSessionId === sessionId) {
+        setSelectedDmSessionId(null);
+        setDmMessages([]);
+      }
+      toast('DMセッションを削除しました', { kind: 'success' });
+    } catch (err: any) {
+      toast(err.message || '削除に失敗しました', { kind: 'error' });
+    }
+  };
+
+  const handleStartDmSession = async (target: { id: string; username: string; displayName?: string; avatarUrl?: string | null }) => {
+    try {
+      const res = await safeFetch('/api/dm/sessions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          discord_user_id: target.id,
+          discord_username: target.username,
+          discord_display_name: target.displayName || target.username,
+          discord_avatar_url: target.avatarUrl || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'DMセッション作成失敗');
+
+      await fetchDmSessions();
+      setSelectedServerId('dm');
+      setSelectedDmSessionId(data.id);
+      setShowNewDmModal(false);
+      setSelectedProfileMember(null);
+    } catch (err: any) {
+      toast(err.message || 'DM開始に失敗しました', { kind: 'error' });
+    }
+  };
+
+  const handleDmTyping = () => {
+    if (!selectedDmSessionId) return;
+    const now = Date.now();
+    if (now - lastDmTypingSentRef.current > 4000) {
+      lastDmTypingSentRef.current = now;
+      safeFetch(`/api/dm/sessions/${selectedDmSessionId}/typing`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => {});
+    }
+  };
+
   // Fetch Current User
   useEffect(() => {
     if (!token) {
@@ -1459,7 +1686,88 @@ export default function App() {
 
   // リアルタイムイベント処理 (WS / SSE / ロングポーリング / ポーリング共通)
   const handleRealtimeEvent = (msg: any) => {
-      if (msg.type === 'NEW_MESSAGE') {
+      if (msg.type === 'DM_MESSAGE_CREATED') {
+        const { sessionId, message, session } = msg.payload || {};
+        if (!sessionId || !message) return;
+        setDmSessions(prev => {
+          const idx = prev.findIndex(s => s.id === sessionId);
+          if (idx >= 0) {
+            const copy = [...prev];
+            const isCur = selectedDmSessionIdRef.current === sessionId;
+            copy[idx] = {
+              ...copy[idx],
+              ...(session || {}),
+              last_message: {
+                id: message.id,
+                sender_type: message.sender_type,
+                sender_name: message.sender_name,
+                content: message.content,
+                created_at: message.created_at,
+              },
+              last_message_at: message.created_at,
+              unread_count: isCur ? 0 : (copy[idx].unread_count || 0) + (message.sender_type === 'discord' ? 1 : 0),
+            };
+            copy.sort((a, b) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime());
+            return copy;
+          } else if (session) {
+            const isCur = selectedDmSessionIdRef.current === sessionId;
+            const newS = {
+              ...session,
+              last_message: {
+                id: message.id,
+                sender_type: message.sender_type,
+                sender_name: message.sender_name,
+                content: message.content,
+                created_at: message.created_at,
+              },
+              unread_count: isCur ? 0 : 1,
+            };
+            return [newS, ...prev];
+          }
+          return prev;
+        });
+
+        if (selectedDmSessionIdRef.current === sessionId) {
+          setDmMessages(prev => {
+            if (prev.some(m => m.id === message.id)) return prev;
+            return [...prev, message];
+          });
+          if (message.sender_type === 'discord' && token) {
+            fetch(`/api/dm/sessions/${sessionId}/read`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}` },
+            }).catch(() => {});
+          }
+          setTimeout(() => {
+            dmChatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+          }, 50);
+        }
+      } else if (msg.type === 'DM_MESSAGE_DELETED') {
+        const { sessionId, messageId } = msg.payload || {};
+        if (selectedDmSessionIdRef.current === sessionId) {
+          setDmMessages(prev => prev.filter(m => m.id !== messageId));
+        }
+      } else if (msg.type === 'DM_TYPING') {
+        const { sessionId, discordUserId, t } = msg.payload || {};
+        if (sessionId) {
+          setDmTypingUsers(prev => ({
+            ...prev,
+            [sessionId]: { discordUserId, t: t || Date.now() },
+          }));
+        }
+      } else if (msg.type === 'DM_SESSION_DELETED') {
+        const { sessionId } = msg.payload || {};
+        setDmSessions(prev => prev.filter(s => s.id !== sessionId));
+        if (selectedDmSessionIdRef.current === sessionId) {
+          setSelectedDmSessionId(null);
+          setDmMessages([]);
+        }
+      } else if (msg.type === 'DM_READ') {
+        const { sessionId } = msg.payload || {};
+        if (sessionId) {
+          setDmSessions(prev => prev.map(s => s.id === sessionId ? { ...s, unread_count: 0 } : s));
+        }
+      } else if (msg.type === 'NEW_MESSAGE') {
         ingestNewMessageRef.current(msg.payload);
       } else if (msg.type === 'MESSAGE_REACTION_UPDATED') {
         const targetId = msg.payload?.messageId ?? msg.payload?.id;
@@ -5567,6 +5875,37 @@ export default function App() {
               <aside className="absolute md:static inset-y-0 left-0 z-40 w-80 md:w-72 lg:w-80 border-r border-stone-800 bg-[#0C0D10] flex flex-row shrink-0 min-h-0 overflow-hidden anim-slide-left md:animate-none shadow-2xl md:shadow-none">
                 {/* 左端: Discord風 サーバーレール (ドラッグ並び替え・プロキシ/ローカルキャッシュアイコン表示 & VC/メンションバッジ) */}
                 <div className="w-12 border-r border-stone-800/80 bg-[#08090B] flex flex-col items-center py-2.5 gap-2 overflow-y-auto shrink-0 select-none">
+                  {/* ダイレクトメッセージ (DM) ボタン */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedServerId('dm');
+                      if (!selectedDmSessionId && dmSessions.length > 0) {
+                        setSelectedDmSessionId(dmSessions[0].id);
+                      }
+                    }}
+                    title="ダイレクトメッセージ (DM)"
+                    className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group ${
+                      selectedServerId === 'dm'
+                        ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-600 text-white'
+                        : 'bg-[#14161C] hover:bg-indigo-600 hover:text-white hover:rounded-xl text-stone-400 border border-stone-800/80'
+                    }`}
+                  >
+                    {selectedServerId === 'dm' ? (
+                      <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-indigo-400" />
+                    ) : totalDmUnread > 0 ? (
+                      <span className="absolute -left-1.5 w-1 h-2.5 rounded-r bg-white" />
+                    ) : null}
+                    <MessageSquare className="w-4 h-4" />
+                    {totalDmUnread > 0 && (
+                      <span className="absolute -top-1 -right-1 px-1 min-w-[16px] h-4 rounded-full bg-rose-500 text-white text-[9px] font-bold flex items-center justify-center ring-2 ring-[#08090B]">
+                        {totalDmUnread > 99 ? '99+' : totalDmUnread}
+                      </span>
+                    )}
+                  </button>
+
+                  <div className="w-6 h-[1px] bg-stone-800 my-0.5 shrink-0" />
+
                   {sortedDiscordServers.map((srv: any) => {
                     const isSelected = selectedServerId === srv.id;
                     const vcsList = Array.isArray(srv.voiceChannels) ? srv.voiceChannels : Array.isArray(srv.vcs) ? srv.vcs : [];
@@ -5669,8 +6008,106 @@ export default function App() {
                   )}
                 </div>
 
-                {/* 右側: サーバー情報 & チャンネル一覧 */}
+                {/* 右側: サーバー情報 & チャンネル一覧 または DM一覧 */}
                 {(() => {
+                  if (selectedServerId === 'dm') {
+                    return (
+                      <div className="flex-1 min-w-0 min-h-0 flex flex-col p-2 sm:p-2.5">
+                        <div className="flex items-center justify-between px-2 mb-2 shrink-0">
+                          <span className="text-xs font-bold text-stone-200 flex items-center gap-1.5">
+                            <MessageSquare className="w-4 h-4 text-indigo-400" />
+                            ダイレクトメッセージ
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setShowNewDmModal(true)}
+                            className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white hover:border-indigo-400 transition"
+                            title="新しいDMを開始"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {/* DM 会話一覧 */}
+                        <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1">
+                          {dmSessions.length === 0 ? (
+                            <div className="p-4 text-center text-xs text-stone-500">
+                              DMの会話履歴がありません。<br />
+                              右上の「＋」やメンバー一覧からDMを開始できます。
+                            </div>
+                          ) : (
+                            dmSessions.map(session => {
+                              const isSelected = selectedDmSessionId === session.id;
+                              const isTyping = dmTypingUsers[session.id] && (Date.now() - dmTypingUsers[session.id].t < 4000);
+                              return (
+                                <div
+                                  key={session.id}
+                                  onClick={() => setSelectedDmSessionId(session.id)}
+                                  className={`group flex items-center justify-between p-2 rounded-xl cursor-pointer transition select-none ${
+                                    isSelected
+                                      ? 'bg-indigo-600/20 text-white border border-indigo-500/40'
+                                      : 'hover:bg-stone-800/70 text-stone-300'
+                                  }`}
+                                >
+                                  <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                                    <div className="relative shrink-0">
+                                      {session.discord_avatar_url ? (
+                                        <img
+                                          src={toProxiedMediaUrl(session.discord_avatar_url, token)}
+                                          alt=""
+                                          className="w-8 h-8 rounded-full object-cover"
+                                        />
+                                      ) : (
+                                        <div className="w-8 h-8 rounded-full bg-stone-800 flex items-center justify-center text-xs font-bold text-stone-300">
+                                          {session.discord_display_name?.slice(0, 1) || session.discord_username?.slice(0, 1) || '?'}
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center justify-between gap-1">
+                                        <span className="text-xs font-bold truncate">
+                                          {session.discord_display_name || session.discord_username}
+                                        </span>
+                                      </div>
+                                      <p className="text-[11px] text-stone-400 truncate">
+                                        {isTyping ? (
+                                          <span className="text-indigo-400 animate-pulse">入力中...</span>
+                                        ) : session.last_message ? (
+                                          `${session.last_message.sender_type === 'asdf' ? 'あなた: ' : ''}${session.last_message.content || '(添付ファイル)'}`
+                                        ) : (
+                                          <span className="text-stone-600">まだメッセージはありません</span>
+                                        )}
+                                      </p>
+                                    </div>
+                                  </div>
+
+                                  <div className="flex items-center gap-1 shrink-0 ml-1.5">
+                                    {session.unread_count && session.unread_count > 0 ? (
+                                      <span className="px-1.5 py-0.5 rounded-full bg-rose-500 text-white text-[10px] font-bold">
+                                        {session.unread_count}
+                                      </span>
+                                    ) : null}
+                                    <button
+                                      type="button"
+                                      onClick={e => {
+                                        e.stopPropagation();
+                                        handleDeleteDmSession(session.id, session.discord_display_name || session.discord_username);
+                                      }}
+                                      className="opacity-0 group-hover:opacity-100 p-1 text-stone-500 hover:text-rose-400 rounded hover:bg-stone-700/50 transition"
+                                      title="DMを削除"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }
+
                   const currentServerChannels = channels.filter(
                     c => c.type !== 'voice' && resolveChannelServerId(c) === selectedServerId
                   );
@@ -6069,7 +6506,275 @@ export default function App() {
           </aside>
         )}
 
-            {/* Center: メインチャット */}
+            {/* Center: メインチャット または DMチャット */}
+            {selectedServerId === 'dm' ? (
+              <section className="flex-1 min-w-0 min-h-0 flex flex-col bg-[#090A0C] overflow-hidden">
+                {(() => {
+                  const currentDmSession = dmSessions.find(s => s.id === selectedDmSessionId);
+                  if (!currentDmSession) {
+                    return (
+                      <div className="flex-1 flex flex-col items-center justify-center p-6 text-stone-500 text-center select-none">
+                        <div className="w-16 h-16 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-4 shadow-lg shadow-indigo-500/5">
+                          <MessageSquare className="w-8 h-8" />
+                        </div>
+                        <h3 className="text-base font-bold text-stone-200 mb-1.5">ダイレクトメッセージ</h3>
+                        <p className="text-xs text-stone-400 max-w-sm mb-5 leading-relaxed">
+                          asdfbasebot 経由で Discord の人と完全暗号化プライベート DM ができます。<br />
+                          他のユーザーやサーバーには一切公開されません。
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => setShowNewDmModal(true)}
+                          className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-2 transition shadow-lg shadow-indigo-600/20 cursor-pointer"
+                        >
+                          <Plus className="w-4 h-4" />
+                          新しいDMを開始
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  const isTyping = dmTypingUsers[currentDmSession.id] && (Date.now() - dmTypingUsers[currentDmSession.id].t < 4000);
+
+                  return (
+                    <div className="flex-1 min-h-0 flex flex-col">
+                      {/* DM ヘッダー */}
+                      <div className="h-12 shrink-0 border-b border-stone-800/80 px-4 flex items-center justify-between gap-3 bg-[#0C0D10]/50 font-mono text-xs">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <button
+                            onClick={() => setIsChannelsCollapsed(!isChannelsCollapsed)}
+                            className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white shrink-0 md:hidden"
+                          >
+                            {isChannelsCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
+                          </button>
+                          <div className="relative shrink-0">
+                            {currentDmSession.discord_avatar_url ? (
+                              <img
+                                src={toProxiedMediaUrl(currentDmSession.discord_avatar_url, token)}
+                                alt=""
+                                className="w-7 h-7 rounded-full object-cover"
+                              />
+                            ) : (
+                              <div className="w-7 h-7 rounded-full bg-stone-800 flex items-center justify-center text-xs font-bold text-stone-300">
+                                {currentDmSession.discord_display_name?.slice(0, 1) || currentDmSession.discord_username?.slice(0, 1) || '?'}
+                              </div>
+                            )}
+                          </div>
+                          <div className="min-w-0">
+                            <span className="font-bold text-white text-sm truncate flex items-center gap-1.5">
+                              {currentDmSession.discord_display_name || currentDmSession.discord_username}
+                              <span className="text-[10px] text-stone-500 font-mono">@{currentDmSession.discord_username}</span>
+                            </span>
+                          </div>
+                          <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[10px] shrink-0 font-sans">
+                            <Lock className="w-3 h-3" />
+                            プライベートDM (暗号化)
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteDmSession(currentDmSession.id, currentDmSession.discord_display_name || currentDmSession.discord_username)}
+                            className="p-1.5 rounded-lg text-stone-500 hover:text-rose-400 hover:bg-stone-800 transition"
+                            title="このDMセッションを削除 (履歴完全消去)"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* DM メッセージリスト */}
+                      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+                        {isLoadingDmMessages ? (
+                          <div className="text-center py-8 text-xs text-stone-500 font-mono">
+                            メッセージを読み込み中…
+                          </div>
+                        ) : dmMessages.length === 0 ? (
+                          <div className="text-center py-12 text-stone-500 text-xs">
+                            <p className="font-bold text-stone-400 mb-1">まだメッセージがありません</p>
+                            <p>メッセージを送信すると、asdfbasebot 経由で相手の Discord DM に届きます。</p>
+                          </div>
+                        ) : (
+                          dmMessages.map(msg => {
+                            const isMe = msg.sender_type === 'asdf';
+                            return (
+                              <div
+                                key={msg.id}
+                                className={`flex gap-3 group/dm-msg ${isMe ? 'flex-row-reverse' : 'flex-row'}`}
+                              >
+                                {!isMe && (
+                                  <div className="w-8 h-8 rounded-full overflow-hidden shrink-0 bg-stone-800">
+                                    {currentDmSession.discord_avatar_url ? (
+                                      <img
+                                        src={toProxiedMediaUrl(currentDmSession.discord_avatar_url, token)}
+                                        alt=""
+                                        className="w-full h-full object-cover"
+                                      />
+                                    ) : (
+                                      <div className="w-full h-full flex items-center justify-center text-xs font-bold text-stone-300">
+                                        {msg.sender_name.slice(0, 1)}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+
+                                <div className={`max-w-[80%] sm:max-w-[70%] space-y-1 flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
+                                  <div className={`flex items-center gap-2 text-[10px] text-stone-500 font-mono ${isMe ? 'justify-end' : 'justify-start'}`}>
+                                    <span className="font-bold text-stone-400">{msg.sender_name}</span>
+                                    <span>{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                    {isMe && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeleteDmMessage(msg.id)}
+                                        className="opacity-0 group-hover/dm-msg:opacity-100 p-0.5 text-stone-500 hover:text-rose-400 transition"
+                                        title="メッセージを削除"
+                                      >
+                                        <Trash2 className="w-3 h-3" />
+                                      </button>
+                                    )}
+                                  </div>
+
+                                  {msg.content && (
+                                    <div
+                                      className={`p-2.5 rounded-2xl text-xs sm:text-sm break-words leading-relaxed whitespace-pre-wrap ${
+                                        isMe
+                                          ? 'bg-indigo-600 text-white rounded-tr-none shadow-md'
+                                          : 'bg-stone-800/90 text-stone-100 rounded-tl-none border border-stone-700/60 shadow-md'
+                                      }`}
+                                    >
+                                      {msg.content}
+                                    </div>
+                                  )}
+
+                                  {msg.attachments && msg.attachments.length > 0 && (
+                                    <div className="space-y-1.5 pt-1">
+                                      {msg.attachments.map((att, i) => {
+                                        const isImg = /\.(png|jpe?g|gif|webp)$/i.test(att.url) || /\.(png|jpe?g|gif|webp)$/i.test(att.name);
+                                        return isImg ? (
+                                          <img
+                                            key={i}
+                                            src={toProxiedMediaUrl(att.url, token)}
+                                            alt={att.name}
+                                            className="max-h-60 rounded-xl object-contain border border-stone-700/60 cursor-pointer shadow-md"
+                                            onClick={() => setLightbox({ src: toProxiedMediaUrl(att.url, token), zoom: 1 })}
+                                          />
+                                        ) : (
+                                          <a
+                                            key={i}
+                                            href={toProxiedMediaUrl(att.url, token)}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-stone-800 hover:bg-stone-700 text-xs text-indigo-300 border border-stone-700"
+                                          >
+                                            <Paperclip className="w-3.5 h-3.5" />
+                                            {att.name || '添付ファイル'}
+                                          </a>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                        <div ref={dmChatBottomRef} />
+                      </div>
+
+                      {/* 入力中インジケーター */}
+                      {isTyping && (
+                        <div className="px-4 py-1 text-[11px] text-indigo-400 font-mono animate-pulse flex items-center gap-1.5">
+                          <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
+                          {currentDmSession.discord_display_name || currentDmSession.discord_username} が入力中…
+                        </div>
+                      )}
+
+                      {/* DM 入力エリア */}
+                      <div className="p-3 border-t border-stone-800/80 bg-[#0C0D10]/80">
+                        {dmAttachments.length > 0 && (
+                          <div className="flex gap-2 mb-2 p-2 rounded-xl bg-stone-900 border border-stone-800 overflow-x-auto">
+                            {dmAttachments.map((att, i) => (
+                              <div key={i} className="relative group shrink-0">
+                                <img
+                                  src={toProxiedMediaUrl(att.url, token)}
+                                  alt=""
+                                  className="w-14 h-14 rounded-lg object-cover"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => setDmAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                                  className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-rose-500 text-white"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        <form
+                          onSubmit={e => {
+                            e.preventDefault();
+                            handleSendDmMessage();
+                          }}
+                          className="flex items-center gap-2"
+                        >
+                          <label className="p-2 text-stone-400 hover:text-white rounded-xl hover:bg-stone-800 cursor-pointer transition shrink-0" title="画像添付">
+                            <Image className="w-5 h-5" />
+                            <input
+                              type="file"
+                              accept="image/*"
+                              className="hidden"
+                              onChange={async e => {
+                                const file = e.target.files?.[0];
+                                if (!file) return;
+                                const formData = new FormData();
+                                formData.append('image', file);
+                                try {
+                                  const res = await safeFetch('/api/upload', {
+                                    method: 'POST',
+                                    headers: { Authorization: `Bearer ${token}` },
+                                    body: formData,
+                                  });
+                                  const data = await res.json();
+                                  if (data.url) {
+                                    setDmAttachments(prev => [...prev, { url: data.url, name: file.name }]);
+                                  }
+                                } catch {
+                                  toast('画像アップロードに失敗しました', { kind: 'error' });
+                                }
+                                e.target.value = '';
+                              }}
+                            />
+                          </label>
+
+                          <input
+                            type="text"
+                            value={dmInputText}
+                            onChange={e => {
+                              setDmInputText(e.target.value);
+                              handleDmTyping();
+                            }}
+                            placeholder={`${currentDmSession.discord_display_name || currentDmSession.discord_username} にメッセージを送信 (Enterで送信)`}
+                            className="flex-1 min-w-0 bg-stone-900 border border-stone-800 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-3.5 py-2.5 text-xs sm:text-sm text-stone-100 placeholder-stone-500 outline-none transition"
+                          />
+
+                          <button
+                            type="submit"
+                            disabled={(!dmInputText.trim() && dmAttachments.length === 0) || isSendingDm}
+                            className="p-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 text-white transition shrink-0 cursor-pointer"
+                            title="送信"
+                          >
+                            <Send className="w-4 h-4" />
+                          </button>
+                        </form>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </section>
+            ) : (
             <section className="flex-1 min-w-0 min-h-0 flex flex-col bg-[#090A0C] overflow-hidden">
               <div className="h-12 shrink-0 border-b border-stone-800/80 px-2 sm:px-4 flex items-center justify-between gap-2 bg-[#0C0D10]/50 font-mono text-xs">
                 <div className="flex items-center gap-2 font-bold text-white min-w-0">
@@ -7206,6 +7911,7 @@ export default function App() {
               )}
               </div>
             </section>
+            )}
 
             {/* Right: Members Sidebar */}
             {!isMembersCollapsed && (
@@ -11249,8 +11955,18 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* アクション: @メンションする */}
+                  {/* アクション: DMを送る / @メンションする */}
                   <div className="pt-2 border-t border-stone-800/80 flex justify-end gap-2">
+                    {isDiscord && !dm.isBot && (
+                      <button
+                        type="button"
+                        onClick={() => handleStartDmSession({ id: dm.id, username: dm.username, displayName: dm.displayName, avatarUrl: dm.avatarUrl })}
+                        className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 transition shadow-md shadow-indigo-600/20 cursor-pointer"
+                      >
+                        <MessageSquare className="w-3.5 h-3.5" />
+                        DMを送る
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
@@ -11388,6 +12104,143 @@ export default function App() {
                   className="px-4 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold transition disabled:opacity-40"
                 >
                   コードゾーンを作成
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 新規DM作成モーダル */}
+      {showNewDmModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade">
+          <div className="w-full max-w-md bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl text-xs space-y-4 anim-pop max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between shrink-0">
+              <span className="font-bold text-white text-sm flex items-center gap-2">
+                <MessageSquare className="w-4 h-4 text-indigo-400" /> 新しいダイレクトメッセージ
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowNewDmModal(false);
+                  setDmMemberSearch('');
+                  setCustomDiscordIdInput('');
+                }}
+                className="text-stone-500 hover:text-white text-base"
+              >
+                &times;
+              </button>
+            </div>
+
+            <p className="text-[11px] text-stone-400 leading-relaxed shrink-0">
+              asdfbasebot と共通の Discord サーバーに参加しているメンバーを選択するか、Discord ユーザーID を入力してプライベートDMを開始します。
+            </p>
+
+            {/* 検索入力 */}
+            <div className="relative shrink-0">
+              <Search className="w-4 h-4 text-stone-500 absolute left-3 top-2.5" />
+              <input
+                type="text"
+                value={dmMemberSearch}
+                onChange={e => setDmMemberSearch(e.target.value)}
+                placeholder="メンバーを名前やIDで検索..."
+                className="w-full bg-stone-900 border border-stone-800 focus:border-indigo-500 rounded-xl pl-9 pr-3 py-2 text-stone-100 placeholder-stone-500 outline-none text-xs"
+              />
+            </div>
+
+            {/* Discord メンバー一覧 */}
+            <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1 border border-stone-800/80 rounded-xl p-2 bg-stone-900/30">
+              {(() => {
+                const allMembersMap = new Map<string, any>();
+                for (const srv of discordServers) {
+                  if (Array.isArray(srv.members)) {
+                    for (const m of srv.members) {
+                      if (!m.isBot && !allMembersMap.has(m.id)) {
+                        allMembersMap.set(m.id, m);
+                      }
+                    }
+                  }
+                }
+                let list = Array.from(allMembersMap.values());
+                if (dmMemberSearch.trim()) {
+                  const q = dmMemberSearch.toLowerCase();
+                  list = list.filter(m =>
+                    (m.displayName && m.displayName.toLowerCase().includes(q)) ||
+                    (m.username && m.username.toLowerCase().includes(q)) ||
+                    (m.globalName && m.globalName.toLowerCase().includes(q)) ||
+                    m.id.includes(q)
+                  );
+                }
+
+                if (list.length === 0) {
+                  return (
+                    <div className="text-center py-6 text-stone-500 text-xs">
+                      一致するメンバーが見つかりません
+                    </div>
+                  );
+                }
+
+                return list.map(m => (
+                  <div
+                    key={m.id}
+                    onClick={() => handleStartDmSession({ id: m.id, username: m.username, displayName: m.displayName || m.globalName || m.username, avatarUrl: m.avatarUrl })}
+                    className="flex items-center justify-between p-2 rounded-lg hover:bg-stone-800/80 cursor-pointer transition group"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="relative shrink-0">
+                        {m.avatarUrl ? (
+                          <img
+                            src={toProxiedMediaUrl(m.avatarUrl, token)}
+                            alt=""
+                            className="w-7 h-7 rounded-full object-cover"
+                          />
+                        ) : (
+                          <div className="w-7 h-7 rounded-full bg-stone-800 flex items-center justify-center text-xs font-bold text-stone-300">
+                            {m.displayName?.slice(0, 1) || m.username?.slice(0, 1) || '?'}
+                          </div>
+                        )}
+                        <span
+                          className={`absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full border border-[#111214] ${
+                            m.status === 'online' ? 'bg-emerald-400' :
+                            m.status === 'idle' ? 'bg-amber-400' :
+                            m.status === 'dnd' ? 'bg-rose-400' : 'bg-stone-500'
+                          }`}
+                        />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-bold text-stone-200 truncate text-xs">{m.displayName || m.username}</div>
+                        <div className="text-[10px] text-stone-500 font-mono truncate">@{m.username}</div>
+                      </div>
+                    </div>
+                    <span className="text-[11px] text-indigo-400 opacity-0 group-hover:opacity-100 font-bold transition">
+                      DMを開始 &rarr;
+                    </span>
+                  </div>
+                ));
+              })()}
+            </div>
+
+            {/* または Discord ID を直接入力 */}
+            <div className="pt-2 border-t border-stone-800 shrink-0 space-y-2">
+              <div className="text-[10px] font-bold text-stone-400 uppercase tracking-wider">Discord ユーザーID で直接開始</div>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={customDiscordIdInput}
+                  onChange={e => setCustomDiscordIdInput(e.target.value)}
+                  placeholder="例: 123456789012345678"
+                  className="flex-1 bg-stone-900 border border-stone-800 focus:border-indigo-500 rounded-xl px-3 py-2 text-stone-100 placeholder-stone-600 outline-none font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  disabled={!customDiscordIdInput.trim()}
+                  onClick={() => {
+                    if (!customDiscordIdInput.trim()) return;
+                    handleStartDmSession({ id: customDiscordIdInput.trim(), username: `User-${customDiscordIdInput.trim().slice(-4)}` });
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold text-xs transition shrink-0 cursor-pointer"
+                >
+                  開始
                 </button>
               </div>
             </div>

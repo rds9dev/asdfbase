@@ -1686,6 +1686,220 @@ app.get('/api/channels/:channelId/pins', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'ピン留め取得エラー' });
     }
 });
+// ============================================================================
+// Direct Messages (DM) API - asdfbasebot 経由の完全プライベート 1対1 DM
+// ============================================================================
+// 自分の DM セッション一覧取得
+app.get('/api/dm/sessions', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const result = await db_js_1.pool.query(`SELECT s.*,
+              (SELECT COUNT(*)::int FROM discord_dm_messages m WHERE m.session_id = s.id AND m.is_read = FALSE AND m.sender_type = 'discord') AS unread_count,
+              (SELECT json_build_object('id', lm.id, 'sender_type', lm.sender_type, 'sender_name', lm.sender_name, 'content', lm.content, 'created_at', lm.created_at)
+               FROM discord_dm_messages lm WHERE lm.session_id = s.id ORDER BY lm.id DESC LIMIT 1) AS last_message
+       FROM discord_dm_sessions s
+       WHERE s.asdf_user_id = $1
+       ORDER BY s.last_message_at DESC, s.id DESC`, [userId]);
+        const sessions = result.rows.map(s => {
+            let lastMsg = s.last_message;
+            if (lastMsg && lastMsg.content) {
+                lastMsg = {
+                    ...lastMsg,
+                    content: (0, crypto_js_1.decryptMessageContent)(lastMsg.content, `dm-${s.id}`),
+                };
+            }
+            return {
+                ...s,
+                last_message: lastMsg,
+            };
+        });
+        res.json(sessions);
+    }
+    catch (err) {
+        console.error('GET /api/dm/sessions error:', err);
+        res.status(500).json({ error: 'DMセッション取得エラー' });
+    }
+});
+// DM セッション作成・取得 (Discord ユーザー指定)
+app.post('/api/dm/sessions', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { discord_user_id, discord_username, discord_display_name, discord_avatar_url } = req.body;
+        if (!discord_user_id) {
+            return res.status(400).json({ error: 'Discord ユーザーIDが必要です' });
+        }
+        const ins = await db_js_1.pool.query(`INSERT INTO discord_dm_sessions (asdf_user_id, discord_user_id, discord_username, discord_display_name, discord_avatar_url, last_message_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (asdf_user_id, discord_user_id) DO UPDATE SET
+         discord_username = COALESCE(NULLIF(EXCLUDED.discord_username, ''), discord_dm_sessions.discord_username),
+         discord_display_name = COALESCE(NULLIF(EXCLUDED.discord_display_name, ''), discord_dm_sessions.discord_display_name),
+         discord_avatar_url = COALESCE(NULLIF(EXCLUDED.discord_avatar_url, ''), discord_dm_sessions.discord_avatar_url)
+       RETURNING *`, [userId, String(discord_user_id).trim(), discord_username || 'Discord User', discord_display_name || discord_username || 'Discord User', discord_avatar_url || null]);
+        res.json(ins.rows[0]);
+    }
+    catch (err) {
+        console.error('POST /api/dm/sessions error:', err);
+        res.status(500).json({ error: 'DMセッション作成エラー' });
+    }
+});
+// DM セッション削除 (会話履歴を完全消去)
+app.delete('/api/dm/sessions/:id', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const sessionId = parseInt(req.params.id, 10);
+        const delRes = await db_js_1.pool.query(`DELETE FROM discord_dm_sessions WHERE id = $1 AND asdf_user_id = $2 RETURNING *`, [sessionId, userId]);
+        if (delRes.rows.length === 0) {
+            return res.status(404).json({ error: 'セッションが見つかりません' });
+        }
+        publish({ type: 'DM_SESSION_DELETED', payload: { sessionId } }, { targetUserId: userId });
+        res.json({ success: true });
+    }
+    catch (err) {
+        console.error('DELETE /api/dm/sessions/:id error:', err);
+        res.status(500).json({ error: 'DMセッション削除エラー' });
+    }
+});
+// DM メッセージ履歴取得
+app.get('/api/dm/sessions/:id/messages', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const sessionId = parseInt(req.params.id, 10);
+        // 自分のセッションか厳格に検証 (他人のDMは絶対に閲覧不可)
+        const sRes = await db_js_1.pool.query(`SELECT * FROM discord_dm_sessions WHERE id = $1 AND asdf_user_id = $2`, [sessionId, userId]);
+        if (sRes.rows.length === 0) {
+            return res.status(403).json({ error: 'このDMセッションを閲覧する権限がありません' });
+        }
+        const messages = await db_js_1.pool.query(`SELECT * FROM discord_dm_messages WHERE session_id = $1 ORDER BY id ASC LIMIT 200`, [sessionId]);
+        const decrypted = messages.rows.map(m => ({
+            ...m,
+            content: (0, crypto_js_1.decryptMessageContent)(m.content, `dm-${sessionId}`),
+        }));
+        res.json(decrypted);
+    }
+    catch (err) {
+        console.error('GET /api/dm/sessions/:id/messages error:', err);
+        res.status(500).json({ error: 'DMメッセージ取得エラー' });
+    }
+});
+// DM メッセージ送信
+app.post('/api/dm/sessions/:id/messages', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const sessionId = parseInt(req.params.id, 10);
+        const { content, attachments } = req.body;
+        const sRes = await db_js_1.pool.query(`SELECT * FROM discord_dm_sessions WHERE id = $1 AND asdf_user_id = $2`, [sessionId, userId]);
+        if (sRes.rows.length === 0) {
+            return res.status(403).json({ error: 'このDMセッションに送信する権限がありません' });
+        }
+        const session = sRes.rows[0];
+        const cleanContent = content ? String(content).trim() : '';
+        const cleanAttachments = Array.isArray(attachments) ? attachments : [];
+        if (!cleanContent && cleanAttachments.length === 0) {
+            return res.status(400).json({ error: 'メッセージまたは添付ファイルを入力してください' });
+        }
+        // ユーザー名だけを付与して送信 (ユーザー指示: "ユーザー名だけ出して後は普通にやればいい")
+        const discordText = `${req.user.username}: ${cleanContent}`.trim();
+        // 1. Discord Bot から相手へ 1対1 DM 送信
+        let discordMsgId = null;
+        try {
+            discordMsgId = await (0, discord_js_1.sendDiscordDm)(session.discord_user_id, discordText, cleanAttachments);
+        }
+        catch (err) {
+            return res.status(400).json({ error: err.message || 'Discord への DM 送信に失敗しました' });
+        }
+        // 2. メッセージを暗号化保存
+        const encrypted = (0, crypto_js_1.encryptMessageContent)(cleanContent, `dm-${sessionId}`);
+        const insMsg = await db_js_1.pool.query(`INSERT INTO discord_dm_messages (session_id, sender_type, sender_name, content, attachments, discord_message_id)
+       VALUES ($1, 'asdf', $2, $3, $4, $5) RETURNING *`, [sessionId, req.user.username, encrypted, JSON.stringify(cleanAttachments), discordMsgId]);
+        await db_js_1.pool.query(`UPDATE discord_dm_sessions SET last_message_at = NOW() WHERE id = $1`, [sessionId]);
+        const savedMsg = {
+            ...insMsg.rows[0],
+            content: cleanContent,
+        };
+        // 3. 自分宛てのみリアルタイム配信
+        publish({
+            type: 'DM_MESSAGE_CREATED',
+            payload: {
+                sessionId,
+                message: savedMsg,
+                session: {
+                    ...session,
+                    last_message_at: new Date().toISOString(),
+                },
+            },
+        }, { targetUserId: userId });
+        res.json(savedMsg);
+    }
+    catch (err) {
+        console.error('POST /api/dm/sessions/:id/messages error:', err);
+        res.status(500).json({ error: 'DMメッセージ送信エラー' });
+    }
+});
+// DM メッセージ削除
+app.delete('/api/dm/sessions/:id/messages/:msgId', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const sessionId = parseInt(req.params.id, 10);
+        const msgId = parseInt(req.params.msgId, 10);
+        const sRes = await db_js_1.pool.query(`SELECT * FROM discord_dm_sessions WHERE id = $1 AND asdf_user_id = $2`, [sessionId, userId]);
+        if (sRes.rows.length === 0) {
+            return res.status(403).json({ error: '権限がありません' });
+        }
+        const session = sRes.rows[0];
+        const mRes = await db_js_1.pool.query(`SELECT * FROM discord_dm_messages WHERE id = $1 AND session_id = $2`, [msgId, sessionId]);
+        if (mRes.rows.length === 0) {
+            return res.status(404).json({ error: 'メッセージが見つかりません' });
+        }
+        const msg = mRes.rows[0];
+        // Discord 上のメッセージ削除を試行 (asdf側からの送信メッセージのみ)
+        if (msg.sender_type === 'asdf' && msg.discord_message_id) {
+            await (0, discord_js_1.deleteDiscordDm)(session.discord_user_id, msg.discord_message_id).catch(() => { });
+        }
+        await db_js_1.pool.query(`DELETE FROM discord_dm_messages WHERE id = $1`, [msgId]);
+        publish({
+            type: 'DM_MESSAGE_DELETED',
+            payload: { sessionId, messageId: msgId },
+        }, { targetUserId: userId });
+        res.json({ success: true });
+    }
+    catch (err) {
+        console.error('DELETE /api/dm/sessions/:id/messages/:msgId error:', err);
+        res.status(500).json({ error: 'DMメッセージ削除エラー' });
+    }
+});
+// DM 既読化
+app.post('/api/dm/sessions/:id/read', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const sessionId = parseInt(req.params.id, 10);
+        const sRes = await db_js_1.pool.query(`SELECT * FROM discord_dm_sessions WHERE id = $1 AND asdf_user_id = $2`, [sessionId, userId]);
+        if (sRes.rows.length === 0) {
+            return res.status(403).json({ error: '権限がありません' });
+        }
+        await db_js_1.pool.query(`UPDATE discord_dm_messages SET is_read = TRUE WHERE session_id = $1 AND sender_type = 'discord' AND is_read = FALSE`, [sessionId]);
+        publish({ type: 'DM_READ', payload: { sessionId } }, { targetUserId: userId });
+        res.json({ success: true });
+    }
+    catch (err) {
+        console.error('POST /api/dm/sessions/:id/read error:', err);
+        res.status(500).json({ error: 'DM既読更新エラー' });
+    }
+});
+// DM 入力中通知
+app.post('/api/dm/sessions/:id/typing', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const sessionId = parseInt(req.params.id, 10);
+        const sRes = await db_js_1.pool.query(`SELECT * FROM discord_dm_sessions WHERE id = $1 AND asdf_user_id = $2`, [sessionId, userId]);
+        if (sRes.rows.length > 0) {
+            (0, discord_js_1.triggerDiscordDmTyping)(sRes.rows[0].discord_user_id).catch(() => { });
+        }
+        res.json({ success: true });
+    }
+    catch (err) {
+        res.json({ success: false });
+    }
+});
 // Assignments API
 app.get('/api/assignments', authMiddleware, async (req, res) => {
     try {
@@ -4845,6 +5059,78 @@ server.listen(PORT, async () => {
             },
             uploadDir: UPLOAD_DIR,
             audit: (action, details) => logAudit(null, action, 'discord', null, details),
+            ingestDmMessage: async (info) => {
+                try {
+                    // 1. 当該 Discord ユーザーとの既存セッションを検索 (直近アクティブ順)
+                    let sessionRes = await db_js_1.pool.query(`SELECT * FROM discord_dm_sessions WHERE discord_user_id = $1 ORDER BY last_message_at DESC LIMIT 1`, [info.discordUserId]);
+                    let session = sessionRes.rows[0];
+                    // 2. セッションがまだ存在しない場合の自動ルーティング
+                    //    直近アクティブなユーザー、または管理者、または最初のユーザーに自動セッション作成
+                    if (!session) {
+                        const userRes = await db_js_1.pool.query(`SELECT id FROM users ORDER BY last_active_at DESC, id ASC LIMIT 1`);
+                        if (userRes.rows.length === 0)
+                            return;
+                        const targetUserId = userRes.rows[0].id;
+                        const insSession = await db_js_1.pool.query(`INSERT INTO discord_dm_sessions (asdf_user_id, discord_user_id, discord_username, discord_display_name, discord_avatar_url, last_message_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())
+               ON CONFLICT (asdf_user_id, discord_user_id) DO UPDATE SET
+                 discord_username = EXCLUDED.discord_username,
+                 discord_display_name = EXCLUDED.discord_display_name,
+                 discord_avatar_url = EXCLUDED.discord_avatar_url,
+                 last_message_at = NOW()
+               RETURNING *`, [targetUserId, info.discordUserId, info.discordUsername, info.discordDisplayName || info.discordUsername, info.discordAvatarUrl]);
+                        session = insSession.rows[0];
+                    }
+                    else {
+                        // プロフィール情報 & 最終メッセージ時刻を更新
+                        await db_js_1.pool.query(`UPDATE discord_dm_sessions SET discord_username = $1, discord_display_name = $2, discord_avatar_url = $3, last_message_at = NOW() WHERE id = $4`, [info.discordUsername, info.discordDisplayName || info.discordUsername, info.discordAvatarUrl, session.id]);
+                    }
+                    // 3. メッセージを暗号化保存 (プライバシー完璧)
+                    const encrypted = (0, crypto_js_1.encryptMessageContent)(info.content || '', `dm-${session.id}`);
+                    const insMsg = await db_js_1.pool.query(`INSERT INTO discord_dm_messages (session_id, sender_type, sender_name, content, attachments, discord_message_id)
+             VALUES ($1, 'discord', $2, $3, $4, $5) RETURNING *`, [session.id, info.discordDisplayName || info.discordUsername, encrypted, JSON.stringify(info.attachments || []), info.discordMessageId]);
+                    const savedMsg = {
+                        ...insMsg.rows[0],
+                        content: info.content, // WS 受信者(本人のみ)用には復号された平文
+                    };
+                    // 4. 当該 asdfbase ユーザーのみに個別リアルタイム配信 (他ユーザーには漏れない)
+                    publish({
+                        type: 'DM_MESSAGE_CREATED',
+                        payload: {
+                            sessionId: session.id,
+                            message: savedMsg,
+                            session: {
+                                ...session,
+                                discord_username: info.discordUsername,
+                                discord_display_name: info.discordDisplayName || info.discordUsername,
+                                discord_avatar_url: info.discordAvatarUrl,
+                                last_message_at: new Date().toISOString(),
+                            },
+                        },
+                    }, { targetUserId: session.asdf_user_id });
+                }
+                catch (err) {
+                    console.error('[discord-dm] ingestDmMessage error:', err);
+                }
+            },
+            onDmTyping: async (discordUserId) => {
+                try {
+                    const sRes = await db_js_1.pool.query(`SELECT id, asdf_user_id FROM discord_dm_sessions WHERE discord_user_id = $1`, [discordUserId]);
+                    for (const s of sRes.rows) {
+                        publish({
+                            type: 'DM_TYPING',
+                            payload: {
+                                sessionId: s.id,
+                                discordUserId,
+                                t: Date.now(),
+                            },
+                        }, { targetUserId: s.asdf_user_id });
+                    }
+                }
+                catch (err) {
+                    // ignore
+                }
+            },
         });
     }
     catch (err) {

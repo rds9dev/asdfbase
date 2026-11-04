@@ -11,9 +11,37 @@ export interface PatchNote {
   items: PatchNoteItem[];
 }
 
-export const LATEST_PATCH_VERSION = 'v2.9.0';
+export const LATEST_PATCH_VERSION = 'v2.10.0';
 
 export const PATCH_NOTES: PatchNote[] = [
+  {
+    version: 'v2.10.0',
+    date: '2026-11-04',
+    title: 'asdfbasebot 経由の完全プライベート Discord DM 機能リリース',
+    summary: 'asdfbaseからDiscord上の特定ユーザーと完全暗号化プライベートDMを送受信できる機能をリリースしました。双方向の自動ルーティング、DB暗号化保存（AES-256-GCM）、リアルタイム個別配信、プロフィールからの即時DM開始に対応しています。',
+    items: [
+      {
+        title: 'asdfbasebot 経由の 1対1 ダイレクトメッセージ (DM)',
+        description: 'asdfbase から Discord ユーザーとプライベートにチャットが可能になりました。Discord 側には「ユーザー名: 本文」形式で Bot から直接 DM が届きます。'
+      },
+      {
+        title: '完全プライベート & DB暗号化 (AES-256-GCM)',
+        description: 'DM メッセージは PostgreSQL 上で暗号化保存され、監査ログにも本文を残しません。WebSocket 通信も対象ユーザーにのみ限定配信されるため、他ユーザーやサーバーに一切露出せずプライバシーが完全に保護されます。'
+      },
+      {
+        title: '双方向の完全自動ルーティング',
+        description: 'Discord 側で相手が asdfbasebot に送った DM は、該当ユーザーとの DM ルームへ自動的にルーティングされます。面倒なコード入力などは不要でシームレスに会話を継続できます。'
+      },
+      {
+        title: 'プロフィール・メンバー一覧からの即時DM開始',
+        description: '右側のメンバー一覧やプロフィールモーダルから「DMを送る」をクリックするだけで、即座に 1対1 DM チャットが開始できます。また、左端サーバーレールの最上部に「ダイレクトメッセージ」専用アイコンを新設しました。'
+      },
+      {
+        title: '画像添付・入力中表示・リアルタイム削除',
+        description: 'テキストだけでなく画像ファイルの送受信、相手の入力中（Typing）インジケーター、送信済みメッセージの双方向削除に対応しました。'
+      }
+    ]
+  },
   {
     version: 'v2.9.0',
     date: '2026-11-04',

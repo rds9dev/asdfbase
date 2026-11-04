@@ -26,6 +26,9 @@ exports.deleteRelayedOnDiscord = deleteRelayedOnDiscord;
 exports.discordUserIdToPseudoId = discordUserIdToPseudoId;
 exports.resolveDiscordReactionUsers = resolveDiscordReactionUsers;
 exports.startDiscordBot = startDiscordBot;
+exports.sendDiscordDm = sendDiscordDm;
+exports.deleteDiscordDm = deleteDiscordDm;
+exports.triggerDiscordDmTyping = triggerDiscordDmTyping;
 // Discord Bot 連携
 // - 許可されたサーバー (DISCORD_GUILD_ID) 以外では一切動作しない
 // - /setup で「この Discord チャンネル ⇔ asdfbase チャンネル」を連携
@@ -897,6 +900,42 @@ async function processDiscordMessage(msg, targets, isHistorySync = false) {
     return count;
 }
 async function handleDiscordMessage(msg) {
+    if (msg.author.bot)
+        return;
+    // DM メッセージの処理
+    if (!msg.guildId) {
+        if (deps?.ingestDmMessage) {
+            const attachments = [];
+            for (const a of msg.attachments.values()) {
+                try {
+                    const res = await fetch(a.url);
+                    if (res.ok) {
+                        const buf = Buffer.from(await res.arrayBuffer());
+                        const isImg = a.contentType?.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(a.name);
+                        const savedUrl = isImg ? await deps.saveImage(buf) : (deps.saveFile ? await deps.saveFile(buf, a.name) : await deps.saveImage(buf));
+                        attachments.push({ url: savedUrl, name: a.name });
+                    }
+                }
+                catch (err) {
+                    console.warn('[discord] DM attachment download failed:', err.message);
+                }
+            }
+            let avatarUrl = msg.author.displayAvatarURL({ extension: 'webp', size: 128 });
+            if (deps.saveAvatar) {
+                avatarUrl = (await deps.saveAvatar(msg.author.id, avatarUrl)) || avatarUrl;
+            }
+            await deps.ingestDmMessage({
+                discordUserId: msg.author.id,
+                discordUsername: msg.author.username,
+                discordDisplayName: msg.author.displayName || msg.author.globalName || msg.author.username,
+                discordAvatarUrl: avatarUrl,
+                content: msg.cleanContent || msg.content || '',
+                attachments,
+                discordMessageId: msg.id,
+            });
+        }
+        return;
+    }
     if (!isGuildAllowed(msg.guildId))
         return;
     if (isOurEchoMessage(msg))
@@ -1428,7 +1467,7 @@ async function resolveDiscordReactionUsers(links) {
     return result;
 }
 function createClient(_withMessageContent) {
-    // 特権インテント (GuildMembers, GuildPresences, MessageContent) を全て有効化
+    // 特権インテント (GuildMembers, GuildPresences, MessageContent) を全て有効化 + DM インテント
     const intents = [
         discord_js_1.GatewayIntentBits.Guilds,
         discord_js_1.GatewayIntentBits.GuildMembers,
@@ -1438,6 +1477,9 @@ function createClient(_withMessageContent) {
         discord_js_1.GatewayIntentBits.GuildMessageReactions,
         discord_js_1.GatewayIntentBits.GuildVoiceStates,
         discord_js_1.GatewayIntentBits.MessageContent,
+        discord_js_1.GatewayIntentBits.DirectMessages,
+        discord_js_1.GatewayIntentBits.DirectMessageTyping,
+        discord_js_1.GatewayIntentBits.DirectMessageReactions,
     ];
     return new discord_js_1.Client({
         intents,
@@ -1647,9 +1689,15 @@ async function startDiscordBot(d) {
         });
         c.on(discord_js_1.Events.TypingStart, async (typing) => {
             try {
-                if (!isGuildAllowed(typing.guild?.id))
-                    return;
                 if (typing.user?.bot)
+                    return;
+                if (!typing.guild) {
+                    if (deps?.onDmTyping) {
+                        deps.onDmTyping(typing.user.id);
+                    }
+                    return;
+                }
+                if (!isGuildAllowed(typing.guild?.id))
                     return;
                 if (!deps?.onTyping)
                     return;
@@ -1699,4 +1747,72 @@ async function startDiscordBot(d) {
         }
     };
     await boot(true);
+}
+// ---------------- DM (ダイレクトメッセージ) 送信・管理関数 ----------------
+async function sendDiscordDm(discordUserId, text, attachments) {
+    if (!client || !connected) {
+        throw new Error('Discord Bot が起動または接続されていません');
+    }
+    try {
+        const user = await client.users.fetch(discordUserId);
+        if (!user)
+            throw new Error('Discord ユーザーが見つかりません');
+        const files = [];
+        if (attachments && attachments.length > 0 && deps?.uploadDir) {
+            for (const att of attachments) {
+                const cleanPath = att.url.replace(/^\/uploads\//, '');
+                const localPath = path_1.default.join(deps.uploadDir, cleanPath);
+                if (fs_1.default.existsSync(localPath)) {
+                    files.push({ attachment: localPath, name: att.name || path_1.default.basename(localPath) });
+                }
+            }
+        }
+        const payload = {};
+        if (text && text.trim())
+            payload.content = text;
+        if (files.length > 0)
+            payload.files = files;
+        if (!payload.content && (!payload.files || payload.files.length === 0)) {
+            throw new Error('送信内容がありません');
+        }
+        const sent = await user.send(payload);
+        return sent.id;
+    }
+    catch (err) {
+        if (err.code === 50007) {
+            throw new Error('相手のDiscord設定でBotからのDMが許可されていません（共通サーバーからのDM許可を確認してください）');
+        }
+        console.error(`[discord] sendDiscordDm failed to ${discordUserId}:`, err.message);
+        throw err;
+    }
+}
+async function deleteDiscordDm(discordUserId, discordMessageId) {
+    if (!client || !connected)
+        return false;
+    try {
+        const user = await client.users.fetch(discordUserId);
+        const dmChannel = user.dmChannel || (await user.createDM());
+        const msg = await dmChannel.messages.fetch(discordMessageId).catch(() => null);
+        if (msg && msg.deletable) {
+            await msg.delete().catch(() => { });
+            return true;
+        }
+        return false;
+    }
+    catch (err) {
+        console.warn('[discord] deleteDiscordDm error:', err);
+        return false;
+    }
+}
+async function triggerDiscordDmTyping(discordUserId) {
+    if (!client || !connected)
+        return;
+    try {
+        const user = await client.users.fetch(discordUserId);
+        const dmChannel = user.dmChannel || (await user.createDM());
+        await dmChannel.sendTyping().catch(() => { });
+    }
+    catch {
+        // ignore
+    }
 }

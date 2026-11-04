@@ -268,6 +268,31 @@ async function initDb() {
         allow_everyone BOOLEAN DEFAULT TRUE,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS discord_dm_sessions (
+        id SERIAL PRIMARY KEY,
+        asdf_user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        discord_user_id VARCHAR(64) NOT NULL,
+        discord_username VARCHAR(100) NOT NULL,
+        discord_display_name VARCHAR(100),
+        discord_avatar_url TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        last_message_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        UNIQUE(asdf_user_id, discord_user_id)
+      );
+      CREATE INDEX IF NOT EXISTS discord_dm_sessions_asdf_user_idx ON discord_dm_sessions (asdf_user_id, last_message_at DESC);
+      CREATE INDEX IF NOT EXISTS discord_dm_sessions_discord_user_idx ON discord_dm_sessions (discord_user_id, last_message_at DESC);
+      CREATE TABLE IF NOT EXISTS discord_dm_messages (
+        id SERIAL PRIMARY KEY,
+        session_id INT NOT NULL REFERENCES discord_dm_sessions(id) ON DELETE CASCADE,
+        sender_type VARCHAR(20) NOT NULL,
+        sender_name VARCHAR(100) NOT NULL,
+        content TEXT NOT NULL,
+        attachments JSONB DEFAULT '[]',
+        discord_message_id VARCHAR(64),
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS discord_dm_msgs_session_idx ON discord_dm_messages (session_id, id ASC);
     `).catch(err => console.warn('Migration class/edit/discord/homework warning:', err.message));
         // メッセージの AES-256-GCM 暗号化マイグレーション (初回のみ)
         const encMigrated = await client.query(`SELECT 1 FROM system_settings WHERE key = 'migr_encrypt_messages_v1'`).catch(() => ({ rows: [] }));
