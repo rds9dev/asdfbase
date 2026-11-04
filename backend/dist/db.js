@@ -182,6 +182,7 @@ async function initDb() {
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS author_avatar TEXT DEFAULT NULL;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_bot BOOLEAN DEFAULT FALSE;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS author_discord_id VARCHAR(32) DEFAULT NULL;
       ALTER TABLE notes ADD COLUMN IF NOT EXISTS language VARCHAR(30) DEFAULT 'typescript';
       CREATE INDEX IF NOT EXISTS timetables_class_idx ON timetables (class_no, day_of_week, period);
       CREATE TABLE IF NOT EXISTS discord_message_links (

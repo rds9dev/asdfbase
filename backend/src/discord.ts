@@ -33,6 +33,7 @@ export interface DiscordIngestMeta {
   // 本文 (テキスト部分) のときだけ。あとで Discord 側の編集を反映するのに使う
   discordMessageId: string | null;
   replyToDiscordMsgId?: string | null;
+  authorDiscordId?: string | null;
   createdAt?: string | null;
   isBot?: boolean;
 }
@@ -98,6 +99,8 @@ export interface DiscordDeps {
   uploadDir: string;
   audit: (action: string, details: object) => void;
   getMessageCount?: (asdfChannelId: number) => Promise<number>;
+  createAsdfChannel?: (name: string, type: string, position: number, serverId: string) => Promise<{ id: number; name: string; type: string; server_id?: string | null } | null>;
+  onBindingsUpdated?: () => void;
 }
 
 const BINDINGS_KEY = 'discord_bindings';
@@ -1015,6 +1018,7 @@ async function processDiscordMessage(msg: DiscordMessage, targets: DiscordBindin
         discordChannelId: msg.channelId,
         discordMessageId: i === 0 ? msg.id : null,
         replyToDiscordMsgId: i === 0 ? replyToDiscordMsgId : null,
+        authorDiscordId: msg.author.id,
         createdAt,
         isBot: Boolean(msg.author.bot || msg.webhookId),
       });
@@ -1112,6 +1116,78 @@ export async function syncDiscordHistory(opts?: {
   }
 
   return { syncedMessages, checkedChannels };
+}
+
+// 承認済みサーバーの全チャンネル (テキスト & VC) を自動走査・同期して asdfbase にバインド
+export async function syncGuildChannels(targetGuildId?: string): Promise<{ createdCount: number; boundCount: number }> {
+  if (!client || !connected || !deps) return { createdCount: 0, boundCount: 0 };
+  const targetGuildIds = targetGuildId ? [targetGuildId] : allowedGuildIds;
+  let totalCreated = 0;
+  let totalBound = 0;
+
+  for (const gid of targetGuildIds) {
+    if (!isGuildAllowed(gid)) continue;
+    const guild = client.guilds.cache.get(gid);
+    if (!guild) continue;
+
+    const existingChannels: { id: number; name: string; type: string; server_id?: string | null }[] = await deps.listAsdfChannels().catch(() => []);
+    const bindings = await getBindings();
+    const boundDiscordIds = new Set(bindings.map(b => b.discordChannelId));
+    const boundAsdfIds = new Set(bindings.map(b => b.asdfChannelId));
+
+    for (const ch of guild.channels.cache.values()) {
+      if (!ch) continue;
+      if (boundDiscordIds.has(ch.id)) continue;
+
+      const isVoice = ch.isVoiceBased();
+      const isText = 'isTextBased' in ch && typeof (ch as any).isTextBased === 'function' && (ch as any).isTextBased() && !isVoice;
+      if (!isText && !isVoice) continue;
+
+      const chType = isVoice ? 'voice' : 'text';
+      const pos = ((ch as any).rawPosition ?? (ch as any).position) ?? 0;
+
+      // 同一サーバーかつ同一type、同一名前で未バインドの既存チャンネルがあれば再利用
+      let targetAsdfCh = existingChannels.find(
+        c => c.server_id === gid && c.type === chType && c.name.toLowerCase() === ch.name.toLowerCase() && !boundAsdfIds.has(c.id)
+      );
+
+      if (!targetAsdfCh && deps.createAsdfChannel) {
+        targetAsdfCh = (await deps.createAsdfChannel(ch.name, chType, pos, gid)) || undefined;
+        if (targetAsdfCh) {
+          existingChannels.push(targetAsdfCh);
+          totalCreated++;
+        }
+      }
+
+      if (targetAsdfCh) {
+        await addDiscordBinding(ch.id, targetAsdfCh.id, gid);
+        boundDiscordIds.add(ch.id);
+        boundAsdfIds.add(targetAsdfCh.id);
+        totalBound++;
+      }
+    }
+  }
+
+  if (totalCreated > 0 || totalBound > 0) {
+    if (deps?.onBindingsUpdated) {
+      deps.onBindingsUpdated();
+    }
+  }
+
+  return { createdCount: totalCreated, boundCount: totalBound };
+}
+
+let autoSyncTimer: any = null;
+export function startChannelAutoSyncTimer() {
+  if (autoSyncTimer) clearInterval(autoSyncTimer);
+  // 10分間隔で走査 (Discord APIのキャッシュを参照するためレートリミット消費なし)
+  autoSyncTimer = setInterval(async () => {
+    try {
+      await syncGuildChannels();
+    } catch (err: any) {
+      console.warn('[discord] auto sync channels error:', err.message);
+    }
+  }, 10 * 60 * 1000);
 }
 
 // Discord 側の編集: 本文が変わっていれば asdfbase の該当メッセージも書き換える
@@ -1559,6 +1635,9 @@ export async function startDiscordBot(d: DiscordDeps) {
       }
       // ダウンタイム中の未取得メッセージを自動でバックグラウンド取得 (直近1時間以内のみ)
       syncDiscordHistory({ limit: 10, maxAgeHours: 1 }).catch(err => console.warn('[discord] startup history sync error:', err.message));
+      // 起動時に全チャンネルを自動走査して同期 & 10分おきの自動定期走査を開始
+      syncGuildChannels().catch(err => console.warn('[discord] startup channel sync error:', err.message));
+      startChannelAutoSyncTimer();
     });
     c.on(Events.ShardDisconnect, () => {
       connected = false;
@@ -1661,6 +1740,29 @@ export async function startDiscordBot(d: DiscordDeps) {
         }
       } catch (err: any) {
         console.error('[discord] pinsUpdate failed:', err.message);
+      }
+    });
+    // 新規チャンネル作成時の即時自動同期 (テキスト & VC)
+    c.on(Events.ChannelCreate, async channel => {
+      try {
+        const guildId = (channel as any).guildId || (channel as any).guild?.id;
+        if (guildId && isGuildAllowed(guildId)) {
+          await syncGuildChannels(guildId);
+        }
+      } catch (err: any) {
+        console.error('[discord] channelCreate sync failed:', err.message);
+      }
+    });
+    // チャンネル削除時のバインド解除
+    c.on(Events.ChannelDelete, async channel => {
+      try {
+        const guildId = (channel as any).guildId || (channel as any).guild?.id;
+        if (guildId && isGuildAllowed(guildId)) {
+          await removeDiscordBinding({ discordChannelId: channel.id });
+          deps?.onBindingsUpdated?.();
+        }
+      } catch (err: any) {
+        console.error('[discord] channelDelete cleanup failed:', err.message);
       }
     });
     c.on(Events.VoiceStateUpdate, (_oldState, newState) => {

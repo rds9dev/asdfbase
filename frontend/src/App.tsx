@@ -437,6 +437,18 @@ export default function App() {
   const [serverPermAllowedRoles, setServerPermAllowedRoles] = useState<string[]>([]);
   const [serverPermAllowedUsers, setServerPermAllowedUsers] = useState<number[]>([]);
   const [isSavingServerPerm, setIsSavingServerPerm] = useState(false);
+  const [serverContextMenu, setServerContextMenu] = useState<{ srvId: string; srvName: string; x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    if (!serverContextMenu) return;
+    const closeMenu = () => setServerContextMenu(null);
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('contextmenu', closeMenu);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('contextmenu', closeMenu);
+    };
+  }, [serverContextMenu]);
 
   const discordUsernames = useMemo(() => {
     const s = new Set<string>();
@@ -5574,6 +5586,10 @@ export default function App() {
                           const src = e.dataTransfer.getData('text/plain');
                           if (src) handleReorderServer(src, srv.id);
                         }}
+                        onContextMenu={e => {
+                          e.preventDefault();
+                          setServerContextMenu({ srvId: srv.id, srvName: srv.name, x: e.clientX, y: e.clientY });
+                        }}
                         onClick={() => {
                           setSelectedServerId(srv.id);
                           if (srvChannels.length > 0 && !srvChannels.some(c => c.id === activeChannelId)) {
@@ -5582,7 +5598,7 @@ export default function App() {
                             setActiveChannelId(targetChannel.id);
                           }
                         }}
-                        title={`${srv.name} (ドラッグで並び替え)${vcCount > 0 ? ` (VC ${vcCount}人)` : ''}`}
+                        title={`${srv.name} (右クリックでメニュー)${vcCount > 0 ? ` (VC ${vcCount}人)` : ''}`}
                         className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group cursor-grab active:cursor-grabbing ${
                           isSelected
                             ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
@@ -5941,9 +5957,7 @@ export default function App() {
                               const hasMembers = Array.isArray(vc.members) && vc.members.length > 0;
                               const targetChannel = channels.find(c =>
                                 (vc.boundAsdfChannelId && c.id === vc.boundAsdfChannelId) ||
-                                c.discord_channel_id === vc.id ||
-                                c.name.toLowerCase() === vc.name.toLowerCase() ||
-                                c.name.toLowerCase() === `${vc.name.toLowerCase()}-chat`
+                                c.discord_channel_id === vc.id
                               );
                               const isCurrentVcChat = targetChannel && targetChannel.id === activeChannelId;
 
@@ -5956,7 +5970,7 @@ export default function App() {
                                       if (targetChannel) {
                                         setActiveChannelId(targetChannel.id);
                                       } else {
-                                        toast(`VC「${vc.name}」のチャットはまだバインドされていません`, { kind: 'info' });
+                                        toast(`VC「${vc.name}」のチャットはまだバインドされていません (自動同期中)`, { kind: 'info' });
                                       }
                                     }}
                                     title={`VC「${vc.name}」のチャットを開く`}
@@ -6948,7 +6962,7 @@ export default function App() {
                     <div className="flex items-center gap-2 px-3 py-1.5 mb-1 rounded-lg bg-stone-900/80 border border-stone-800 text-xs text-stone-400 anim-fade">
                       <Reply className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                       <span className="shrink-0">
-                        <span className="text-amber-300 font-bold">{replyToMessage.sender_username || replyToMessage.username}</span> に返信
+                        <span className="text-amber-300 font-bold">{splitSenderName(replyToMessage.sender_username || replyToMessage.username || '').name}</span> に返信
                       </span>
                       <span className="truncate text-stone-500">{summarizeContent(replyToMessage.content)}</span>
                       <button
@@ -12334,6 +12348,56 @@ export default function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* サーバーアイコンの右クリックメニュー (このサーバーをすべて既読にする 等) */}
+      {serverContextMenu && (
+        <div
+          style={{
+            top: `${Math.min(serverContextMenu.y, (typeof window !== 'undefined' ? window.innerHeight : 800) - 160)}px`,
+            left: `${serverContextMenu.x + 8}px`,
+          }}
+          className="fixed z-50 min-w-[220px] py-1.5 rounded-xl bg-[#14161C] border border-stone-800 shadow-2xl text-xs text-stone-200 select-none anim-fade"
+          onClick={e => e.stopPropagation()}
+        >
+          <div className="px-3 py-1 font-bold text-stone-400 border-b border-stone-800/80 truncate mb-1">
+            {serverContextMenu.srvName}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              handleMarkAllRead(serverContextMenu.srvId);
+              setServerContextMenu(null);
+            }}
+            className="w-full px-3 py-2 text-left flex items-center gap-2 hover:bg-stone-800 hover:text-amber-300 transition text-stone-300 font-medium"
+          >
+            <CheckCheck className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>このサーバーをすべて既読にする</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              handleSyncDiscordHistory({ guildId: serverContextMenu.srvId });
+              setServerContextMenu(null);
+            }}
+            className="w-full px-3 py-2 text-left flex items-center gap-2 hover:bg-stone-800 hover:text-indigo-300 transition text-stone-300 font-medium"
+          >
+            <RefreshCw className="w-4 h-4 text-indigo-400 shrink-0" />
+            <span>Discord未取得履歴を同期</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setLinkGuildId(serverContextMenu.srvId);
+              setShowDiscordServerModal(true);
+              setServerContextMenu(null);
+            }}
+            className="w-full px-3 py-2 text-left flex items-center gap-2 hover:bg-stone-800 hover:text-white transition text-stone-300 font-medium"
+          >
+            <Server className="w-4 h-4 text-stone-400 shrink-0" />
+            <span>チャンネル紐付け管理</span>
+          </button>
         </div>
       )}
 

@@ -178,16 +178,30 @@ export async function relayMessage(msg: { id?: number; channel_id: number; usern
         targetDiscordMsgId = linkRes.rows[0].discord_message_id;
       }
       const origRes = await pool.query(
-        `SELECT username, content, channel_id FROM messages WHERE id = $1 LIMIT 1`,
+        `SELECT username, content, channel_id, author_discord_id FROM messages WHERE id = $1 LIMIT 1`,
         [msg.reply_to_id]
       );
       if (origRes.rows.length > 0) {
-        const origUser = origRes.rows[0].username || 'unknown';
+        let origUser = origRes.rows[0].username || 'unknown';
+        const discordAuthorId = origRes.rows[0].author_discord_id;
         const decryptedOrig = decryptMessageContent(origRes.rows[0].content, origRes.rows[0].channel_id);
         let origText = (decryptedOrig || '').trim().split('\n')[0] || '';
         if (/!\[[^\]]*\]\([^)\s]+\)/.test(origText)) origText = '[画像]';
         if (origText.length > 80) origText = origText.slice(0, 80) + '…';
-        replyQuote = `> **@${origUser}**: ${origText}\n`;
+
+        // [Discord] プレフィックスを除去
+        if (origUser.startsWith('[Discord] ')) {
+          origUser = origUser.slice(10);
+        } else if (origUser === '[Discord]') {
+          origUser = 'Discordユーザー';
+        }
+
+        // Discord ユーザーへの返信なら <@userId> メンションを付与して相手に直接通知
+        if (discordAuthorId) {
+          replyQuote = `> <@${discordAuthorId}> ${origText}\n`;
+        } else {
+          replyQuote = `> **@${origUser}**: ${origText}\n`;
+        }
       }
     }
 
@@ -937,10 +951,6 @@ app.post('/api/channels', authMiddleware, adminOnly, async (req: AuthRequest, re
       return res.status(400).json({ error: 'チャンネル名を入力してください' });
     }
     const cleanName = name.trim().toLowerCase().replace(/\s+/g, '-');
-    const existing = await pool.query(`SELECT id FROM channels WHERE name = $1`, [cleanName]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
-    }
     const chType = type === 'voice' ? 'voice' : 'text';
     const defaultGuildId = /rds9|bot/i.test(cleanName)
       ? '1550475182643347466'
@@ -948,6 +958,14 @@ app.post('/api/channels', authMiddleware, adminOnly, async (req: AuthRequest, re
     const cleanServerId = cleanName === 'general'
       ? null
       : (server_id ? String(server_id).trim() : defaultGuildId);
+
+    const existing = await pool.query(
+      `SELECT id FROM channels WHERE name = $1 AND (server_id = $2 OR ($2 IS NULL AND server_id IS NULL))`,
+      [cleanName, cleanServerId]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'このサーバーには同じ名前のチャンネルが既に存在します' });
+    }
     const cleanViewRoles = Array.isArray(view_roles) ? view_roles.map(String) : [];
     const cleanWriteRoles = Array.isArray(write_roles) ? write_roles.map(String) : [];
 
@@ -979,14 +997,16 @@ app.put('/api/channels/:id', authMiddleware, adminOnly, async (req: AuthRequest,
     }
     const cur = curRes.rows[0];
     const cleanName = name && name.trim() ? name.trim().toLowerCase().replace(/\s+/g, '-') : cur.name;
-    if (cleanName !== cur.name) {
-      const existing = await pool.query(`SELECT id FROM channels WHERE name = $1 AND id != $2`, [cleanName, id]);
+    const nextServerId = server_id !== undefined ? (server_id ? String(server_id).trim() : null) : cur.server_id;
+    if (cleanName !== cur.name || nextServerId !== cur.server_id) {
+      const existing = await pool.query(
+        `SELECT id FROM channels WHERE name = $1 AND id != $2 AND (server_id = $3 OR ($3 IS NULL AND server_id IS NULL))`,
+        [cleanName, id, nextServerId]
+      );
       if (existing.rows.length > 0) {
-        return res.status(400).json({ error: '同じ名前のチャンネルが既に存在します' });
+        return res.status(400).json({ error: 'このサーバーには同じ名前のチャンネルが既に存在します' });
       }
     }
-
-    const nextServerId = server_id !== undefined ? (server_id ? String(server_id).trim() : null) : cur.server_id;
     const nextViewRoles = Array.isArray(view_roles) ? view_roles.map(String) : (cur.view_roles || []);
     const nextWriteRoles = Array.isArray(write_roles) ? write_roles.map(String) : (cur.write_roles || []);
     const nextOverwrites = permissions_overwrites !== undefined
@@ -1063,13 +1083,13 @@ async function attachReplies<T extends { reply_to_id?: number | null; channel_id
   const ids = Array.from(new Set(rows.map(r => r.reply_to_id).filter((v): v is number => typeof v === 'number')));
   if (ids.length === 0) return rows;
   const res = await pool.query(
-    `SELECT m.id, m.content, m.channel_id, m.user_id, COALESCE(u.username, m.username) AS username
+    `SELECT m.id, m.content, m.channel_id, m.user_id, m.author_discord_id, COALESCE(u.username, m.username) AS username
      FROM messages m LEFT JOIN users u ON u.id = m.user_id WHERE m.id = ANY($1::int[])`,
     [ids]
   );
   const map = new Map(res.rows.map(r => {
     const dec = decryptMessageContent(r.content, r.channel_id);
-    return [r.id, { id: r.id, username: r.username, user_id: r.user_id, content: String(dec || '').slice(0, 200) }];
+    return [r.id, { id: r.id, username: r.username, user_id: r.user_id, author_discord_id: r.author_discord_id, content: String(dec || '').slice(0, 200) }];
   }));
   return rows.map(r => (r.reply_to_id ? { ...r, reply_to: map.get(r.reply_to_id) || { id: r.reply_to_id, deleted: true } } : r));
 }
@@ -1244,23 +1264,28 @@ app.post('/api/channels/read-all', authMiddleware, async (req: AuthRequest, res)
     const userId = req.user!.id;
     const { serverId, channelIds: targetChannelIds } = req.body || {};
 
-    let query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages GROUP BY channel_id`;
+    let query: string;
     let queryParams: any[] = [];
 
-    if (Array.isArray(targetChannelIds) && targetChannelIds.length > 0) {
-      const validIds = targetChannelIds.map(Number).filter(Number.isFinite);
-      if (validIds.length > 0) {
-        query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages WHERE channel_id = ANY($1) GROUP BY channel_id`;
-        queryParams = [validIds];
+    if (Array.isArray(targetChannelIds)) {
+      const validIds = targetChannelIds.map(Number).filter(id => Number.isFinite(id) && id > 0);
+      if (validIds.length === 0) {
+        return res.json({ success: true, readUpdates: {} });
       }
+      query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages WHERE channel_id = ANY($1::int[]) GROUP BY channel_id`;
+      queryParams = [validIds];
     } else if (serverId && serverId !== 'all') {
       // serverId に紐付くチャンネルIDを channels テーブルから抽出
       const chRows = await pool.query(`SELECT id FROM channels WHERE server_id = $1`, [String(serverId).trim()]);
-      const validIds = chRows.rows.map(r => Number(r.id));
-      if (validIds.length > 0) {
-        query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages WHERE channel_id = ANY($1) GROUP BY channel_id`;
-        queryParams = [validIds];
+      const validIds = chRows.rows.map(r => Number(r.id)).filter(id => Number.isFinite(id) && id > 0);
+      if (validIds.length === 0) {
+        return res.json({ success: true, readUpdates: {} });
       }
+      query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages WHERE channel_id = ANY($1::int[]) GROUP BY channel_id`;
+      queryParams = [validIds];
+    } else {
+      query = `SELECT channel_id, COALESCE(MAX(id), 0) AS max_id FROM messages GROUP BY channel_id`;
+      queryParams = [];
     }
 
     const latestPerChannel = await pool.query(query, queryParams);
@@ -2881,7 +2906,10 @@ app.post('/api/discord/bindings', authMiddleware, async (req: AuthRequest, res) 
     let targetAsdfChId = asdfChannelId ? Number(asdfChannelId) : 0;
     if (!targetAsdfChId && newChannelName && String(newChannelName).trim()) {
       const cleanName = String(newChannelName).trim().toLowerCase().replace(/\s+/g, '-');
-      const existing = await pool.query(`SELECT * FROM channels WHERE name = $1`, [cleanName]);
+      const existing = await pool.query(
+        `SELECT * FROM channels WHERE name = $1 AND (server_id = $2 OR ($2 IS NULL AND server_id IS NULL))`,
+        [cleanName, cleanGuildId || null]
+      );
       if (existing.rows.length > 0) {
         targetAsdfChId = existing.rows[0].id;
         if (cleanGuildId) {
@@ -2941,7 +2969,10 @@ app.post('/api/discord/link-requests/:id/approve', authMiddleware, adminOnly, as
     let targetAsdfChId = linkReq.asdf_channel_id ? Number(linkReq.asdf_channel_id) : 0;
     if (!targetAsdfChId && linkReq.new_channel_name) {
       const cleanName = String(linkReq.new_channel_name).trim().toLowerCase().replace(/\s+/g, '-');
-      const existing = await pool.query(`SELECT * FROM channels WHERE name = $1`, [cleanName]);
+      const existing = await pool.query(
+        `SELECT * FROM channels WHERE name = $1 AND (server_id = $2 OR ($2 IS NULL AND server_id IS NULL))`,
+        [cleanName, linkReq.guild_id || null]
+      );
       if (existing.rows.length > 0) {
         targetAsdfChId = existing.rows[0].id;
       } else {
@@ -5108,6 +5139,21 @@ server.listen(PORT, async () => {
       getSetting,
       setSetting,
       listAsdfChannels: async () => (await pool.query(`SELECT id, name, type, server_id FROM channels ORDER BY position ASC, id ASC`)).rows,
+      createAsdfChannel: async (name, type, position, serverId) => {
+        const maxPosRes = await pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM channels`);
+        const pos = position || maxPosRes.rows[0].next_pos;
+        const ins = await pool.query(
+          `INSERT INTO channels (name, type, position, server_id) VALUES ($1, $2, $3, $4) RETURNING *`,
+          [name, type || 'text', pos, serverId]
+        );
+        const ch = ins.rows[0];
+        if (ch) broadcast({ type: 'CHANNEL_CREATED', payload: ch });
+        return ch || null;
+      },
+      onBindingsUpdated: async () => {
+        const status = await getDiscordStatus();
+        broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: status });
+      },
       assignChannelServer: async (asdfChannelId, guildId) => {
         const upd = await pool.query(
           `UPDATE channels SET server_id = $1 WHERE id = $2 RETURNING *`,
@@ -5144,12 +5190,12 @@ server.listen(PORT, async () => {
         const encrypted = encryptMessageContent(content, asdfChannelId);
         const result = meta.createdAt
           ? await pool.query(
-              `INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, created_at, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7) RETURNING *`,
-              [asdfChannelId, username, encrypted, meta.avatarUrl, replyToId, meta.createdAt, Boolean(meta.isBot)]
+              `INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, created_at, is_bot, author_discord_id) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+              [asdfChannelId, username, encrypted, meta.avatarUrl, replyToId, meta.createdAt, Boolean(meta.isBot), meta.authorDiscordId || null]
             )
           : await pool.query(
-              `INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, is_bot) VALUES ($1, NULL, $2, $3, $4, $5, $6) RETURNING *`,
-              [asdfChannelId, username, encrypted, meta.avatarUrl, replyToId, Boolean(meta.isBot)]
+              `INSERT INTO messages (channel_id, user_id, username, content, author_avatar, reply_to_id, is_bot, author_discord_id) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7) RETURNING *`,
+              [asdfChannelId, username, encrypted, meta.avatarUrl, replyToId, Boolean(meta.isBot), meta.authorDiscordId || null]
             );
         const saved = result.rows[0];
         if (meta.discordMessageId) {
