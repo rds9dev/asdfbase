@@ -322,20 +322,31 @@ button:not(:disabled):active {
   background: rgba(56, 189, 248, 0.28);
   text-decoration: underline;
 }
-.composer-mention,
-.composer-channel {
+.composer-text mark {
   color: transparent;
   border-radius: 0.25rem;
-  background: rgba(56, 189, 248, 0.28);
-  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.45);
+}
+.composer-mention,
+.composer-channel,
+.composer-emoji {
+  color: transparent;
+  border-radius: 0.25rem;
+}
+.composer-mention {
+  background: rgba(56, 189, 248, 0.18);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35);
 }
 .composer-channel {
-  background: rgba(16, 185, 129, 0.25);
-  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.45);
+  background: rgba(16, 185, 129, 0.18);
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.35);
+}
+.composer-emoji {
+  background: rgba(245, 158, 11, 0.16);
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.3);
 }
 
 /* ===== Markdown ===== */
-.markdown-body { line-height: 1.7; word-break: break-word; }
+.markdown-body { line-height: 1.7; word-break: break-word; overflow-wrap: anywhere; }
 .markdown-body > :first-child { margin-top: 0; }
 .markdown-body > :last-child { margin-bottom: 0; }
 .markdown-body p { margin: 0.5em 0; }
@@ -356,7 +367,7 @@ button:not(:disabled):active {
 .markdown-body li { margin: 0.15em 0; }
 .markdown-body a { color: #38bdf8; text-decoration: underline; }
 .markdown-body strong { color: #fff; }
-.markdown-body blockquote { border-left: 3px solid #f59e0b80; padding-left: 0.8em; color: #a8a29e; margin: 0.6em 0; }
+.markdown-body blockquote { border-left: 3px solid #f59e0b80; padding-left: 0.8em; color: #a8a29e; margin: 0.6em 0; overflow-wrap: anywhere; word-break: break-word; }
 .markdown-body code { font-family: var(--font-mono); font-size: 0.88em; background: #1f2229; padding: 0.1em 0.35em; border-radius: 0.3em; color: #fcd34d; }
 .markdown-body pre { background: #0c0d10; border: 1px solid #2a2d35; border-radius: 0.6em; padding: 0.8em 1em; overflow-x: auto; margin: 0.6em 0; }
 .markdown-body pre code { background: none; padding: 0; color: #e7e5e4; }
@@ -365,6 +376,7 @@ button:not(:disabled):active {
 .markdown-body th { background: #1a1c22; color: #fff; }
 .markdown-body hr { border: 0; border-top: 1px solid #2a2d35; margin: 1em 0; }
 .markdown-body img { max-width: 100%; border-radius: 0.5em; }
+.markdown-body img.inline-emoji { max-width: none; border-radius: 0 !important; border: none !important; background: transparent !important; box-shadow: none !important; }
 
 /* スマホの下部ナビの分 */
 .pb-safe { padding-bottom: env(safe-area-inset-bottom); }

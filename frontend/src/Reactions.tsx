@@ -6,9 +6,9 @@ const LONG_PRESS_MS = 450;
 
 export const DEFAULT_QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏', '✅', '❌', ':swim:'];
 
-export function renderReactionEmoji(emoji: string, customEmojis?: Map<string, string>, sizeClass = 'w-4 h-4') {
+export function renderReactionEmoji(emoji: string, customEmojis?: Map<string, string>, sizeClass = 'w-4 h-4', token?: string) {
   if (emoji.startsWith(':') && emoji.endsWith(':')) {
-    const node = renderEmojiToken(emoji, customEmojis, undefined, sizeClass);
+    const node = renderEmojiToken(emoji, customEmojis, token, sizeClass);
     if (node) return node;
   }
   if (emoji.startsWith('<') && emoji.endsWith('>')) {
@@ -18,7 +18,7 @@ export function renderReactionEmoji(emoji: string, customEmojis?: Map<string, st
       const url = `https://cdn.discordapp.com/emojis/${matchDc[3]}.${ext}?size=48&quality=lossless`;
       return (
         <img
-          src={toProxiedMediaUrl(url)}
+          src={toProxiedMediaUrl(url, token)}
           alt={`:${matchDc[2]}:`}
           title={`:${matchDc[2]}:`}
           className={`${sizeClass} inline-block object-contain align-middle`}
@@ -37,6 +37,7 @@ function ReactionChip({
   count,
   mine,
   customEmojis,
+  token,
   onToggle,
   onResolveUnknown,
 }: {
@@ -46,6 +47,7 @@ function ReactionChip({
   count: number;
   mine: boolean;
   customEmojis?: Map<string, string>;
+  token?: string;
   onToggle: () => void;
   onResolveUnknown?: () => void;
 }) {
@@ -121,7 +123,7 @@ function ReactionChip({
             : 'bg-[#14161C] border-stone-800 text-stone-400 hover:border-stone-600 hover:text-stone-200'
         }`}
       >
-        {renderReactionEmoji(emoji, customEmojis, 'w-4 h-4')}
+        {renderReactionEmoji(emoji, customEmojis, 'w-4 h-4', token)}
         <span className="tabular-nums font-mono text-[11px]">{count}</span>
       </button>
 
@@ -133,7 +135,7 @@ function ReactionChip({
         >
           <div className="flex items-center justify-between pb-1 border-b border-stone-800 text-[11px] font-bold text-stone-400">
             <span className="flex items-center gap-1.5">
-              {renderReactionEmoji(emoji, customEmojis, 'w-4 h-4')}
+              {renderReactionEmoji(emoji, customEmojis, 'w-4 h-4', token)}
               <span>リアクション ({count}人)</span>
             </span>
             <button
@@ -173,7 +175,7 @@ function ReactionChip({
           role="tooltip"
           className="hidden group-hover/rx:block absolute bottom-full left-0 mb-1.5 z-30 w-max max-w-[18rem] px-2.5 py-1.5 rounded-lg bg-[#16181D] border border-stone-700 shadow-xl text-[11px] text-stone-200 leading-relaxed pointer-events-none anim-fade"
         >
-          <span className="mr-1 align-middle">{renderReactionEmoji(emoji, customEmojis, 'w-3.5 h-3.5')}</span>
+          <span className="mr-1 align-middle">{renderReactionEmoji(emoji, customEmojis, 'w-3.5 h-3.5', token)}</span>
           <b className="text-white">
             {names.length > 0
               ? names.slice(0, 6).join('、') + (names.length > 6 || unknown > 0 ? ` ほか${Math.max(0, names.length - 6) + unknown}人` : '')
@@ -191,6 +193,7 @@ export function ReactionBar({
   meId,
   nameOf,
   customEmojis,
+  token,
   onToggle,
   onResolveUnknown,
 }: {
@@ -198,6 +201,7 @@ export function ReactionBar({
   meId?: number;
   nameOf: (userId: number) => string | undefined;
   customEmojis?: Map<string, string>;
+  token?: string;
   onToggle: (emoji: string) => void;
   onResolveUnknown?: () => void;
 }) {
@@ -214,6 +218,7 @@ export function ReactionBar({
           count={userIds.length}
           mine={meId !== undefined && userIds.includes(meId)}
           customEmojis={customEmojis}
+          token={token}
           onToggle={() => onToggle(emoji)}
           onResolveUnknown={onResolveUnknown}
         />

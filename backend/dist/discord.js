@@ -270,13 +270,22 @@ async function handleCommand(interaction) {
         await interaction.reply({ content: `**asdfbase 同期状態**\n${lines}${status.intentWarning ? `\n⚠️ ${status.intentWarning}` : ''}`, ephemeral: true });
     }
 }
-function formatDiscordContent(content) {
+function formatDiscordContent(content, guild) {
     if (!content)
         return '';
     let text = content;
     // カスタム絵文字 <:name:id> / <a:name:id> を Markdown 画像に変換
     text = text.replace(/<a:([a-zA-Z0-9_]+):([0-9]+)>/g, '![$1](https://cdn.discordapp.com/emojis/$2.gif?size=48&quality=lossless)');
     text = text.replace(/<:([a-zA-Z0-9_]+):([0-9]+)>/g, '![$1](https://cdn.discordapp.com/emojis/$2.webp?size=48&quality=lossless)');
+    // チャンネルメンション <#channelId> を #チャンネル名 に変換
+    text = text.replace(/<#([0-9]+)>/g, (match, chId) => {
+        if (client) {
+            const ch = client.channels.cache.get(chId) || (guild?.channels?.cache?.get(chId));
+            if (ch && 'name' in ch && ch.name)
+                return `#${ch.name}`;
+        }
+        return match;
+    });
     // @everyone / @here を強調
     text = text.replace(/@(everyone|here)\b/g, '**[@$1]**');
     return text;
@@ -287,7 +296,11 @@ function formatEmbeds(embeds) {
         if (e.video)
             continue;
         const lines = [];
-        const title = e.title?.trim();
+        if (e.author?.name?.trim()) {
+            lines.push(`> 👤 **${e.author.name.trim().replace(/\n/g, ' ')}**`);
+        }
+        const rawTitle = e.title?.trim();
+        const title = rawTitle ? rawTitle.replace(/\n/g, ' ') : '';
         const url = e.url?.trim();
         if (title && url) {
             lines.push(`> 🔗 **[${title}](${url})**`);
@@ -299,14 +312,26 @@ function formatEmbeds(embeds) {
             lines.push(`> 🔗 <${url}>`);
         }
         if (e.description?.trim()) {
-            const desc = e.description.trim().slice(0, 300);
+            const desc = e.description.trim().slice(0, 1000);
             lines.push(`> ${desc.replace(/\n/g, '\n> ')}`);
+        }
+        if (Array.isArray(e.fields) && e.fields.length > 0) {
+            for (const f of e.fields.slice(0, 10)) {
+                if (!f.name && !f.value)
+                    continue;
+                const fname = (f.name || '').trim().replace(/\n/g, ' ');
+                const fval = (f.value || '').trim();
+                lines.push(`> **${fname}**\n> ${fval.replace(/\n/g, '\n> ')}`);
+            }
         }
         if (e.image?.url) {
             lines.push(`> ![embed-image](${e.image.url})`);
         }
         else if (e.thumbnail?.url && !e.image) {
             lines.push(`> ![embed-thumb](${e.thumbnail.url})`);
+        }
+        if (e.footer?.text?.trim()) {
+            lines.push(`> ⎯⎯⎯\n> ℹ️ *${e.footer.text.trim().replace(/\n/g, ' ')}*`);
         }
         if (lines.length > 0) {
             parts.push(lines.join('\n'));
@@ -424,17 +449,22 @@ async function getDiscordServers(includeUnapproved = false) {
                                 video,
                             });
                         }
-                        if (vcMembers.length > 0) {
-                            voiceChannels.push({
-                                guildId: guild.id,
-                                guildName: guild.name,
-                                channelName: channel.name,
-                                channelId: channel.id,
-                                members: vcMembers,
-                            });
-                        }
+                        const binding = bindings.find(b => b.discordChannelId === channel.id);
+                        const vcPos = (channel.rawPosition ?? channel.position) ?? 0;
+                        voiceChannels.push({
+                            guildId: guild.id,
+                            guildName: guild.name,
+                            channelName: channel.name,
+                            channelId: channel.id,
+                            id: channel.id,
+                            name: channel.name,
+                            boundAsdfChannelId: binding ? binding.asdfChannelId : null,
+                            position: vcPos,
+                            members: vcMembers,
+                        });
                     }
                 }
+                voiceChannels.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
                 // テキスト & アナウンスチャンネル一覧 (キャッシュ優先で即座に取得)
                 const textChannels = [];
                 const channelCollection = guild.channels.cache;
@@ -688,22 +718,57 @@ async function getOrCreateWebhook(channel) {
     }
     return null;
 }
-// 本文中の @メンバー名 を Discord の <@userId> 記法に変換
+// 本文中の @メンバー名 を Discord の <@userId> 記法に変換 (最長一致でスペース・記号入り名前にも対応)
 async function resolveDiscordMentions(guild, text) {
-    if (!guild || !text.includes('@'))
+    if (!guild)
         return text;
+    let resolved = text;
     try {
-        const members = guild.members.cache;
-        return text.replace(/@([^\s@#]+)/g, (match, name) => {
+        const members = Array.from(guild.members.cache.values());
+        // 名前の長い順にソートして、部分一致よりも最長一致を優先 (スペース・記号入り完全対応)
+        const sortedMembers = [];
+        for (const m of members) {
+            if (m.displayName)
+                sortedMembers.push({ name: m.displayName, id: m.id });
+            if (m.user?.globalName && m.user.globalName !== m.displayName)
+                sortedMembers.push({ name: m.user.globalName, id: m.id });
+            if (m.user?.username && m.user.username !== m.displayName && m.user.username !== m.user?.globalName)
+                sortedMembers.push({ name: m.user.username, id: m.id });
+        }
+        sortedMembers.sort((a, b) => b.name.length - a.name.length);
+        for (const sm of sortedMembers) {
+            if (sm.name.length < 2)
+                continue;
+            const targetTag = `@${sm.name}`;
+            if (resolved.includes(targetTag)) {
+                resolved = resolved.split(targetTag).join(`<@${sm.id}>`);
+            }
+        }
+        // 残りの単語メンション (@user)
+        resolved = resolved.replace(/@([^\s@#]+)/g, (match, name) => {
             if (name === 'everyone' || name === 'here')
                 return match;
             const target = members.find((m) => m.displayName === name || m.user?.username === name || m.user?.globalName === name);
             return target ? `<@${target.id}>` : match;
         });
+        // #チャンネル名 を <#channelId> に変換
+        if (resolved.includes('#')) {
+            const channels = Array.from(guild.channels.cache.values());
+            const sortedChannels = channels
+                .filter((c) => c.name && c.id)
+                .sort((a, b) => b.name.length - a.name.length);
+            for (const ch of sortedChannels) {
+                const tag = `#${ch.name}`;
+                if (resolved.includes(tag)) {
+                    resolved = resolved.split(tag).join(`<#${ch.id}>`);
+                }
+            }
+        }
     }
     catch {
         return text;
     }
+    return resolved;
 }
 // 自分の送信・Webhookエコー判定 (他の外部Botや他Webhookは通す)
 function isOurEchoMessage(msg) {
@@ -722,9 +787,43 @@ async function processDiscordMessage(msg, targets, isHistorySync = false) {
     const avatarUrl = await avatarFor(msg);
     const parts = [];
     const rawText = msg.cleanContent?.trim();
-    const text = rawText ? formatDiscordContent(rawText) : '';
+    const text = rawText ? formatDiscordContent(rawText, msg.guild) : '';
     if (text)
         parts.push(text);
+    // Discord 転送メッセージ (Forwarded Messages / messageSnapshots) の展開
+    const snapshots = msg.messageSnapshots;
+    if (snapshots && (snapshots.size > 0 || (Array.isArray(snapshots) && snapshots.length > 0))) {
+        const snapList = snapshots.values ? Array.from(snapshots.values()) : snapshots;
+        for (const snap of snapList) {
+            const snapLines = ['> ↪ **転送されたメッセージ**'];
+            const snapText = (snap.cleanContent || snap.content || '').trim();
+            if (snapText) {
+                const formattedSnap = formatDiscordContent(snapText, msg.guild);
+                snapLines.push(`> ${formattedSnap.replace(/\n/g, '\n> ')}`);
+            }
+            if (snap.attachments) {
+                const attList = snap.attachments.values ? Array.from(snap.attachments.values()) : snap.attachments;
+                for (const att of attList) {
+                    if (isVideo(att)) {
+                        snapLines.push(`> ${VIDEO_NOTICE}`);
+                    }
+                    else if (isImage(att) && att.url) {
+                        snapLines.push(`> ![image](${att.url})`);
+                    }
+                    else if (att.url) {
+                        snapLines.push(`> [📎 ${att.name || '添付ファイル'}](${att.url})`);
+                    }
+                }
+            }
+            if (snap.embeds && snap.embeds.length > 0) {
+                const snapEmbeds = formatEmbeds(snap.embeds);
+                if (snapEmbeds.length > 0) {
+                    snapLines.push(snapEmbeds.join('\n\n'));
+                }
+            }
+            parts.push(snapLines.join('\n'));
+        }
+    }
     for (const att of msg.attachments.values()) {
         if (isVideo(att)) {
             parts.push(VIDEO_NOTICE);
@@ -976,10 +1075,15 @@ async function relayReactionToDiscord(discordChannelId, discordMessageId, emoji,
         const msg = await ch.messages.fetch(discordMessageId).catch(() => null);
         if (!msg)
             return;
-        const cleanName = emoji.replace(/^:+|:+$/g, '');
+        const customMatch = emoji.match(/^<a?:([a-zA-Z0-9_]+):([0-9]+)>$/);
+        const emojiName = customMatch ? customMatch[1] : emoji.replace(/^:+|:+$/g, '').replace(/\uFE0F/g, '');
+        const emojiId = customMatch ? customMatch[2] : null;
         const rx = msg.reactions.resolve(emoji)
-            || msg.reactions.cache.find((r) => r.emoji.name === emoji ||
-                r.emoji.name === cleanName ||
+            || msg.reactions.resolve(emojiId || '')
+            || msg.reactions.cache.find((r) => (emojiId && r.emoji.id === emojiId) ||
+                r.emoji.name === emoji ||
+                r.emoji.name === emojiName ||
+                r.emoji.name?.replace(/\uFE0F/g, '') === emojiName ||
                 r.emoji.identifier === emoji ||
                 r.emoji.toString() === emoji);
         if (isRemove) {
@@ -990,12 +1094,19 @@ async function relayReactionToDiscord(discordChannelId, discordMessageId, emoji,
             }
         }
         else {
-            await msg.react(emoji).catch(async () => {
-                const guild = msg.guild;
-                const customEmoji = guild?.emojis.cache.find((e) => e.name === cleanName);
-                if (customEmoji)
-                    await msg.react(customEmoji).catch(() => { });
-            });
+            if (emojiId) {
+                await msg.react(emojiId).catch(async () => {
+                    await msg.react(emoji).catch(() => { });
+                });
+            }
+            else {
+                await msg.react(emoji).catch(async () => {
+                    const guild = msg.guild;
+                    const customEmoji = guild?.emojis.cache.find((e) => e.name === emojiName);
+                    if (customEmoji)
+                        await msg.react(customEmoji).catch(() => { });
+                });
+            }
         }
     }
     catch (err) {
@@ -1341,6 +1452,20 @@ async function startDiscordBot(d) {
                 console.error('[discord] delete error:', err.message);
             }
         });
+        c.on(discord_js_1.Events.MessageBulkDelete, messages => {
+            try {
+                if (!deps?.ingestDelete)
+                    return;
+                for (const m of messages.values()) {
+                    if (m.guildId && !isGuildAllowed(m.guildId))
+                        continue;
+                    deps.ingestDelete(m.id).catch(() => { });
+                }
+            }
+            catch (err) {
+                console.error('[discord] bulkDelete error:', err.message);
+            }
+        });
         c.on(discord_js_1.Events.MessageReactionAdd, async (reaction, user) => {
             try {
                 if (user.partial)
@@ -1351,10 +1476,12 @@ async function startDiscordBot(d) {
                 const fullMsg = fullRx.message.partial ? await fullRx.message.fetch().catch(() => null) : fullRx.message;
                 if (!fullMsg || !isGuildAllowed(fullMsg.guildId))
                     return;
-                const emoji = fullRx.emoji.name;
-                if (!emoji || !deps?.ingestReaction)
+                const emojiName = fullRx.emoji.name;
+                if (!emojiName || !deps?.ingestReaction)
                     return;
-                const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
+                const finalEmoji = fullRx.emoji.id
+                    ? `<${fullRx.emoji.animated ? 'a' : ''}:${emojiName}:${fullRx.emoji.id}>`
+                    : emojiName;
                 const member = fullMsg.guild
                     ? (fullMsg.guild.members.cache.get(user.id) || await fullMsg.guild.members.fetch(user.id).catch(() => null))
                     : null;
@@ -1372,18 +1499,24 @@ async function startDiscordBot(d) {
                 if (user.bot)
                     return;
                 const fullRx = reaction.partial ? await reaction.fetch().catch(() => reaction) : reaction;
-                const fullMsg = fullRx.message.partial ? await fullRx.message.fetch().catch(() => null) : fullRx.message;
-                if (!fullMsg || !isGuildAllowed(fullMsg.guildId))
+                const messageId = fullRx.message?.id || reaction.message?.id;
+                const guildId = fullRx.message?.guildId || reaction.message?.guildId;
+                if (guildId && !isGuildAllowed(guildId))
                     return;
-                const emoji = fullRx.emoji.name;
-                if (!emoji || !deps?.ingestReaction)
+                const emojiName = fullRx.emoji?.name || reaction.emoji?.name;
+                const emojiId = fullRx.emoji?.id || reaction.emoji?.id;
+                if (!emojiName || !messageId || !deps?.ingestReaction)
                     return;
-                const finalEmoji = fullRx.emoji.id ? `:${emoji}:` : emoji;
-                const member = fullMsg.guild
-                    ? (fullMsg.guild.members.cache.get(user.id) || await fullMsg.guild.members.fetch(user.id).catch(() => null))
+                const isAnimated = Boolean(fullRx.emoji?.animated || reaction.emoji?.animated);
+                const finalEmoji = emojiId
+                    ? `<${isAnimated ? 'a' : ''}:${emojiName}:${emojiId}>`
+                    : emojiName;
+                const guild = fullRx.message?.guild || reaction.message?.guild;
+                const member = guild
+                    ? (guild.members.cache.get(user.id) || await guild.members.fetch(user.id).catch(() => null))
                     : null;
                 const senderName = member?.displayName || user.globalName || user.username || undefined;
-                await deps.ingestReaction(fullMsg.id, finalEmoji, user.id, 'remove', senderName);
+                await deps.ingestReaction(messageId, finalEmoji, user.id, 'remove', senderName);
             }
             catch (err) {
                 console.error('[discord] reactionRemove failed:', err.message);

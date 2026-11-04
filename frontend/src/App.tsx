@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import { 
   Volume2,
   VolumeX,
@@ -155,6 +155,7 @@ interface ChannelItem {
   type: string;
   position?: number;
   server_id?: string | null;
+  discord_channel_id?: string;
   view_roles?: string[];
   write_roles?: string[];
   permissions_overwrites?: PermissionOverwrite[];
@@ -166,6 +167,7 @@ interface Message {
   user_id: number;
   username: string;
   sender_username?: string;
+  discord_author_id?: string;
   content: string;
   attachments?: string[];
   reply_to_id?: number | null;
@@ -648,6 +650,10 @@ export default function App() {
   const [rtPollInterval, setRtPollIntervalState] = useState<number>(() => getPollInterval());
   const [connRoute, setConnRouteState] = useState<ConnectionRoute>(() => getConnectionRoute());
   const [messages, setMessages] = useState<Message[]>([]);
+  const [isPinsOpen, setIsPinsOpen] = useState(false);
+  const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
+  const [isLoadingPins, setIsLoadingPins] = useState(false);
+  const [pinsError, setPinsError] = useState<string | null>(null);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
   const [discordReactionUsers, setDiscordReactionUsers] = useState<Record<number, string>>({});
@@ -1848,6 +1854,7 @@ export default function App() {
         setShowMemberProgressModalId(null);
         setFloatingAiSummary(null);
         setSelectedProfileMember(null);
+        setIsPinsOpen(false);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -4886,6 +4893,91 @@ export default function App() {
   const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
   const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
 
+  const fetchPins = useCallback(async (channelId: number) => {
+    if (!token) return;
+    setIsLoadingPins(true);
+    setPinsError(null);
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels/${channelId}/pins`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 403) {
+        setPinsError('このチャンネルのピン留めメッセージを閲覧する権限がありません');
+        setPinnedMessages([]);
+        return;
+      }
+      if (!res.ok) {
+        setPinsError('ピン留めメッセージの読み込みに失敗しました');
+        return;
+      }
+      const data = await res.json();
+      setPinnedMessages(Array.isArray(data) ? data : []);
+    } catch (err: any) {
+      setPinsError(err?.message || '読み込みエラーが発生しました');
+    } finally {
+      setIsLoadingPins(false);
+    }
+  }, [token]);
+
+  const pinsContainerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isPinsOpen) return;
+    const handlePointerDown = (e: PointerEvent) => {
+      if (!pinsContainerRef.current?.contains(e.target as Node)) {
+        setIsPinsOpen(false);
+      }
+    };
+    const t = setTimeout(() => document.addEventListener('pointerdown', handlePointerDown), 0);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [isPinsOpen]);
+
+  useEffect(() => {
+    if (isPinsOpen) {
+      fetchPins(activeChannelId);
+    }
+  }, [isPinsOpen, activeChannelId, fetchPins]);
+
+  const openSpeakerProfile = (m: Message) => {
+    if (m.user_id && m.user_id > 0) {
+      const foundUser = userById.get(m.user_id) || onlineUsers.find(u => u.id === m.user_id);
+      if (foundUser) {
+        setSelectedProfileMember({ kind: 'asdf', user: foundUser });
+        return;
+      }
+      const syntheticUser: User = {
+        id: m.user_id,
+        username: m.username || m.sender_username || `user-${m.user_id}`,
+        role: 'member',
+        avatar_url: m.author_avatar || null,
+        status: 'offline',
+      };
+      setSelectedProfileMember({ kind: 'asdf', user: syntheticUser });
+      return;
+    }
+
+    const sName = splitSenderName(m.sender_username || m.username || '').name;
+    const dcMembers = selectedServer?.members || [];
+    const foundDc = dcMembers.find((dm: any) =>
+      (m.discord_author_id && dm.id === m.discord_author_id) ||
+      (dm.displayName || dm.username) === sName
+    );
+    if (foundDc) {
+      setSelectedProfileMember({ kind: 'discord', member: foundDc });
+      return;
+    }
+    const syntheticDc = {
+      id: m.discord_author_id || 'unknown',
+      username: sName,
+      displayName: sName,
+      avatarUrl: m.author_avatar || null,
+      isBot: Boolean(m.is_bot),
+    };
+    setSelectedProfileMember({ kind: 'discord', member: syntheticDc });
+  };
+
   const canWriteActiveChannel = (() => {
     if (!currentUser || currentUser.role === 'admin') return true;
     if (!activeChannelObj) return true;
@@ -4978,7 +5070,49 @@ export default function App() {
         }));
       return rankCandidates([...customPool, ...builtinPool], completion.query, x => x.label).slice(0, 8);
     }
-    const pool = channels.filter(c => c.type !== 'voice').map(c => ({ key: `c${c.id}`, label: c.name, insert: `#${c.name}` }));
+    const currentSrvChannels = channels.filter(c => resolveChannelServerId(c) === selectedServerId);
+    const otherChannels = channels.filter(c => resolveChannelServerId(c) !== selectedServerId);
+    const dcChs: { name: string; id?: string }[] = [];
+    if (selectedServer && Array.isArray(selectedServer.voiceChannels)) {
+      for (const vc of selectedServer.voiceChannels) {
+        if (vc.name) dcChs.push({ name: vc.name, id: vc.id });
+      }
+    }
+    const seen = new Set<string>();
+    const pool: { key: string; label: string; insert: string; sub?: string }[] = [];
+    for (const c of currentSrvChannels) {
+      seen.add(c.name.toLowerCase());
+      pool.push({
+        key: `c-${c.id}`,
+        label: c.name,
+        insert: `#${c.name}`,
+        sub: selectedServer ? selectedServer.name : undefined,
+      });
+    }
+    for (const dc of dcChs) {
+      if (!seen.has(dc.name.toLowerCase())) {
+        seen.add(dc.name.toLowerCase());
+        pool.push({
+          key: `dc-${dc.name}`,
+          label: dc.name,
+          insert: `#${dc.name}`,
+          sub: 'Discord VC / チャンネル',
+        });
+      }
+    }
+    for (const c of otherChannels) {
+      if (!seen.has(c.name.toLowerCase())) {
+        seen.add(c.name.toLowerCase());
+        const srvId = resolveChannelServerId(c);
+        const srv = discordServers.find(s => s.id === srvId);
+        pool.push({
+          key: `c-${c.id}`,
+          label: c.name,
+          insert: `#${c.name}`,
+          sub: srv ? srv.name : undefined,
+        });
+      }
+    }
     return rankCandidates(pool, completion.query, x => x.label).slice(0, 8);
   })();
 
@@ -5747,7 +5881,7 @@ export default function App() {
 
                     {/* ボイスチャンネル (VC): Discord完全再現のチャンネルツリー表示 */}
                     {(() => {
-                      type VcItem = { id: string; name: string; members: any[] };
+                      type VcItem = { id: string; name: string; boundAsdfChannelId?: number; members: any[] };
                       const vcList: VcItem[] = [];
 
                       if (selectedServer && Array.isArray(selectedServer.voiceChannels) && selectedServer.voiceChannels.length > 0) {
@@ -5755,7 +5889,8 @@ export default function App() {
                           const active = discordVcs.find(d => String(d.channelId) === String(svc.id));
                           vcList.push({
                             id: svc.id,
-                            name: svc.name,
+                            name: svc.channelName || svc.name,
+                            boundAsdfChannelId: svc.boundAsdfChannelId,
                             members: active ? active.members : (svc.members || []),
                           });
                         }
@@ -5791,26 +5926,52 @@ export default function App() {
                           <div className="space-y-0.5">
                             {vcList.map(vc => {
                               const hasMembers = Array.isArray(vc.members) && vc.members.length > 0;
+                              const targetChannel = channels.find(c =>
+                                (vc.boundAsdfChannelId && c.id === vc.boundAsdfChannelId) ||
+                                c.discord_channel_id === vc.id ||
+                                c.name.toLowerCase() === vc.name.toLowerCase() ||
+                                c.name.toLowerCase() === `${vc.name.toLowerCase()}-chat`
+                              );
+                              const isCurrentVcChat = targetChannel && targetChannel.id === activeChannelId;
+
                               return (
                                 <div key={vc.id} className="rounded-lg overflow-hidden group">
                                   {/* チャンネル行 */}
-                                  <div
-                                    className={`w-full px-2 py-1.5 rounded-lg flex items-center justify-between text-left transition select-none ${
-                                      hasMembers
-                                        ? 'text-stone-200 bg-stone-900/60 font-semibold'
-                                        : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/50'
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (targetChannel) {
+                                        setActiveChannelId(targetChannel.id);
+                                      } else {
+                                        toast(`VC「${vc.name}」のチャットはまだバインドされていません`, { kind: 'info' });
+                                      }
+                                    }}
+                                    title={`VC「${vc.name}」のチャットを開く`}
+                                    className={`w-full px-2 py-1.5 rounded-lg flex items-center justify-between text-left transition select-none cursor-pointer ${
+                                      isCurrentVcChat
+                                        ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30'
+                                        : hasMembers
+                                          ? 'text-stone-200 bg-stone-900/60 font-semibold hover:bg-stone-800/80'
+                                          : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/50'
                                     }`}
                                   >
                                     <div className="flex items-center gap-2 min-w-0">
-                                      <Volume2 className={`w-4 h-4 shrink-0 ${hasMembers ? 'text-emerald-400' : 'text-stone-500 group-hover:text-stone-400'}`} />
+                                      <Volume2 className={`w-4 h-4 shrink-0 ${isCurrentVcChat ? 'text-amber-400' : hasMembers ? 'text-emerald-400' : 'text-stone-500 group-hover:text-stone-400'}`} />
                                       <span className="text-xs truncate">{vc.name}</span>
                                     </div>
-                                    {hasMembers && (
-                                      <span className="text-[10px] text-stone-500 shrink-0 font-mono">
-                                        {vc.members.length}
-                                      </span>
-                                    )}
-                                  </div>
+                                    <div className="flex items-center gap-1.5 shrink-0">
+                                      {targetChannel && (
+                                        <span title="VC内テキストチャット" className="inline-flex">
+                                          <Hash className="w-3 h-3 text-stone-500 hover:text-amber-400" />
+                                        </span>
+                                      )}
+                                      {hasMembers && (
+                                        <span className="text-[10px] text-stone-500 font-mono">
+                                          {vc.members.length}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </button>
 
                                   {/* 参加メンバー一覧 (Discord風ツリーインデント) */}
                                   {hasMembers && (
@@ -6070,6 +6231,108 @@ export default function App() {
                     </button>
                   )}
 
+                  {/* ピン留めメッセージ一覧ボタン */}
+                  <div ref={pinsContainerRef} className="relative">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsPinsOpen(v => !v);
+                      }}
+                      className={`p-1.5 rounded-lg border transition ${
+                        isPinsOpen
+                          ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                          : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-white hover:border-stone-600'
+                      }`}
+                      title="ピン留めされたメッセージ"
+                    >
+                      <Pin className="w-3.5 h-3.5" />
+                    </button>
+
+                    {/* ピン留めメッセージ ポップオーバー */}
+                    {isPinsOpen && (
+                      <div className="absolute right-0 top-full mt-2 w-[calc(100vw-2rem)] sm:w-96 max-h-[28rem] bg-[#16181D] border border-stone-800 rounded-xl shadow-2xl z-40 flex flex-col anim-pop overflow-hidden">
+                        <div className="flex items-center justify-between px-3 py-2 border-b border-stone-800 bg-[#121418]">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-stone-200">
+                            <Pin className="w-3.5 h-3.5 text-amber-400" />
+                            <span>ピン留めされたメッセージ</span>
+                            {pinnedMessages.length > 0 && (
+                              <span className="text-[10px] text-stone-500 font-mono">({pinnedMessages.length})</span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setIsPinsOpen(false)}
+                            className="text-stone-500 hover:text-stone-300 text-xs px-1"
+                          >
+                            ✕
+                          </button>
+                        </div>
+
+                        <div className="flex-1 overflow-y-auto p-2 space-y-2">
+                          {isLoadingPins ? (
+                            <div className="py-6 text-center text-xs text-stone-500 flex items-center justify-center gap-2">
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                              <span>ピン留めを読み込み中…</span>
+                            </div>
+                          ) : pinsError ? (
+                            <div className="py-6 px-4 text-center text-xs text-rose-400">
+                              {pinsError}
+                            </div>
+                          ) : pinnedMessages.length === 0 ? (
+                            <div className="py-8 text-center text-xs text-stone-500">
+                              ピン留めされたメッセージはありません
+                            </div>
+                          ) : (
+                            pinnedMessages.map(p => {
+                              const pCreated = new Date(p.created_at);
+                              const pDateStr = `${pCreated.getMonth() + 1}月${pCreated.getDate()}日 ${pCreated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+                              const sName = splitSenderName(p.sender_username || p.username || '').name;
+                              return (
+                                <div
+                                  key={p.id}
+                                  className="group/pin p-2 rounded-lg bg-[#0C0D10] border border-stone-800/80 hover:border-stone-700 transition flex flex-col gap-1 text-xs"
+                                >
+                                  <div className="flex items-center justify-between text-[11px] text-stone-400">
+                                    <div className="flex items-center gap-1.5 font-bold truncate">
+                                      <span className="text-stone-200">{sName}</span>
+                                      <span className="text-[10px] text-stone-500 font-normal">{pDateStr}</span>
+                                    </div>
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          openMessageLink(p.id);
+                                          setIsPinsOpen(false);
+                                        }}
+                                        className="text-[10px] text-amber-400 hover:underline px-1 py-0.5"
+                                      >
+                                        ジャンプ
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={async () => {
+                                          await handleTogglePin(p.id);
+                                          fetchPins(activeChannelId);
+                                        }}
+                                        className="text-[10px] text-stone-500 hover:text-rose-400 px-1 py-0.5"
+                                        title="ピン留め解除"
+                                      >
+                                        外す
+                                      </button>
+                                    </div>
+                                  </div>
+                                  <div className="text-stone-300 break-words line-clamp-3">
+                                    {p.content}
+                                  </div>
+                                </div>
+                              );
+                            })
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
                   <button
                     onClick={() => setIsMembersCollapsed(!isMembersCollapsed)}
                     className="p-1.5 rounded-lg bg-stone-900 border border-stone-800 text-stone-400 hover:text-white hover:border-stone-600"
@@ -6212,7 +6475,9 @@ export default function App() {
                       const isMentioningMe = Boolean(
                         currentUser && !isMine && ((m.content || '').includes(`@${currentUser.username}`) || (m.content || '').includes('@everyone') || m.reply_to?.user_id === currentUser.id)
                       );
-                      const timeLabel = created.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                      const isMsgToday = created.toDateString() === new Date().toDateString();
+                      const timeOnly = created.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                      const timeLabel = isMsgToday ? timeOnly : `${created.getMonth() + 1}月${created.getDate()}日 ${timeOnly}`;
 
                       const msgKey = m.client_nonce || m.id;
                       const isNewIncoming = (m.id > lastSeenAtMountRef.current || m.id < 0) && !animatedMessageIdsRef.current.has(msgKey);
@@ -6278,18 +6543,30 @@ export default function App() {
                           >
                             {isGrouped ? (
                               <div className="w-9 shrink-0 text-[10px] text-stone-600 text-right pt-1 opacity-0 group-hover:opacity-100 select-none">
-                                {timeLabel}
+                                {timeOnly}
                               </div>
                             ) : (
-                              <Avatar name={senderName} url={m.user_id ? userById.get(m.user_id)?.avatar_url : m.author_avatar} />
+                              <button
+                                type="button"
+                                onClick={() => openSpeakerProfile(m)}
+                                className="shrink-0 transition-transform hover:scale-105 active:scale-95 cursor-pointer text-left"
+                                title={`${displayName} のプロフィールを見る`}
+                              >
+                                <Avatar name={senderName} url={m.user_id ? userById.get(m.user_id)?.avatar_url : m.author_avatar} />
+                              </button>
                             )}
 
                             <div className="flex-1 min-w-0">
                               {!isGrouped && (
                                 <div className="flex items-baseline gap-2 mb-0.5">
-                                  <span className={`text-sm font-bold ${isGemini ? 'text-amber-400' : isMine ? 'text-amber-200' : fromDiscord ? 'text-indigo-200' : 'text-stone-100'}`}>
+                                  <button
+                                    type="button"
+                                    onClick={() => openSpeakerProfile(m)}
+                                    className={`text-sm font-bold hover:underline cursor-pointer text-left ${isGemini ? 'text-amber-400' : isMine ? 'text-amber-200' : fromDiscord ? 'text-indigo-200' : 'text-stone-100'}`}
+                                    title={`${displayName} のプロフィールを見る`}
+                                  >
                                     {displayName}
-                                  </span>
+                                  </button>
                                   {fromDiscord && <DiscordBadge className="self-center -ml-1" />}
                                   {(m.is_bot || isGemini || discordBotNames.has(displayName)) && (
                                     <span className="self-center -ml-1 text-[9px] px-1 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono font-bold leading-none shrink-0">
@@ -6437,6 +6714,7 @@ export default function App() {
                                   reactions={m.reactions}
                                   meId={currentUser.id}
                                   nameOf={nameOfUser}
+                                  token={token}
                                   onToggle={emoji => handleToggleReaction(m.id, emoji)}
                                   customEmojis={customEmojisMap}
                                   onResolveUnknown={() => resolveMessageReactionUsers(m.id)}

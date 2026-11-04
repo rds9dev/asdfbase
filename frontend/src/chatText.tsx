@@ -290,49 +290,56 @@ export function splitSenderName(raw: string): { name: string; fromDiscord: boole
 
 export function renderMessageText(content: string, opts: RenderOptions, emojiSizeClass = 'w-6 h-6'): React.ReactNode[] {
   const out: React.ReactNode[] = [];
-  let last = 0;
   let i = 0;
-  for (const m of content.matchAll(TOKEN_RE)) {
-    const token = m[0];
-    const idx = m.index ?? 0;
-    if (idx > last) out.push(content.slice(last, idx));
-    last = idx + token.length;
-    if (token.startsWith('@')) {
-      const name = token.slice(1);
-      const isDiscordUser = Boolean(opts.discordUsernames?.has(name));
-      const known = opts.usernames.has(name) || isDiscordUser || SPECIAL_MENTIONS.includes(name.toLowerCase());
-      if (known) {
-        const isMe = name === opts.me || name.toLowerCase() === 'everyone';
-        out.push(
-          <span key={i++} className={`mention-pill ${isMe ? 'mention-me' : isDiscordUser ? 'mention-discord' : ''}`}>
-            {token}
-            {isDiscordUser && <span className="ml-0.5 text-[8px] font-mono px-0.5 rounded bg-indigo-500/30 text-indigo-200">DC</span>}
-          </span>
-        );
+
+  // スペースや記号を含むユーザー名 (例: [0] Mythra YT〆) を最長一致で検出するためのリスト
+  const allKnownUsers = Array.from(
+    new Set([...opts.usernames, ...(opts.discordUsernames ? Array.from(opts.discordUsernames) : [])])
+  ).sort((a, b) => b.length - a.length);
+
+  // チャンネル名も長い順
+  const allChannels = Array.from(opts.channels.keys()).sort((a, b) => b.length - a.length);
+
+  let cursor = 0;
+  while (cursor < content.length) {
+    // 1. URL
+    if (content.startsWith('http://', cursor) || content.startsWith('https://', cursor)) {
+      const match = content.slice(cursor).match(/^https?:\/\/[^\s<>"]+/);
+      if (match) {
+        const url = match[0];
+        const linkedId = opts.onMessageLink ? messageLinkId(url) : null;
+        const linkedMemoSlot = opts.onMemoLink ? memoSlotId(url) : null;
+        if (linkedId !== null) {
+          out.push(
+            <button key={i++} type="button" onClick={() => opts.onMessageLink!(linkedId)} className="mention-pill channel-pill" title="このメッセージへ移動">
+              ↪ メッセージへ移動
+            </button>
+          );
+        } else if (linkedMemoSlot !== null) {
+          out.push(
+            <button key={i++} type="button" onClick={() => opts.onMemoLink!(linkedMemoSlot)} className="mention-pill channel-pill" title={`メモ #${linkedMemoSlot} を開く`}>
+              📝 メモ #{linkedMemoSlot}
+            </button>
+          );
+        } else {
+          out.push(
+            <a key={i++} href={url} target="_blank" rel="noreferrer noopener" className="text-sky-400 hover:underline break-all">
+              {url}
+            </a>
+          );
+        }
+        cursor += url.length;
         continue;
       }
-    } else if (token.startsWith('#')) {
-      const chId = opts.channels.get(token.slice(1));
-      if (chId !== undefined) {
-        out.push(
-          <button key={i++} type="button" onClick={() => opts.onChannelClick(chId)} className="mention-pill channel-pill">
-            {token}
-          </button>
-        );
-        continue;
-      }
-    } else if (token.startsWith(':') && token.endsWith(':')) {
-      const rendered = renderEmojiToken(token, opts.customEmojis, i++, emojiSizeClass, opts.token);
-      if (rendered) {
-        out.push(rendered);
-        continue;
-      }
-    } else if (token.startsWith('<') && token.endsWith('>')) {
-      const matchDc = token.match(/^<(a)?:([a-zA-Z0-9_]+):([0-9]+)>$/);
-      if (matchDc) {
-        const animated = Boolean(matchDc[1]);
-        const emojiName = matchDc[2];
-        const emojiId = matchDc[3];
+    }
+
+    // 2. カスタム絵文字 <:name:id> / <a:name:id>
+    if (content.startsWith('<', cursor)) {
+      const dcMatch = content.slice(cursor).match(/^<(a)?:([a-zA-Z0-9_]{2,32}):([0-9]+)>/);
+      if (dcMatch) {
+        const animated = Boolean(dcMatch[1]);
+        const emojiName = dcMatch[2];
+        const emojiId = dcMatch[3];
         const ext = animated ? 'gif' : 'webp';
         const url = `https://cdn.discordapp.com/emojis/${emojiId}.${ext}?size=48&quality=lossless`;
         out.push(
@@ -341,41 +348,109 @@ export function renderMessageText(content: string, opts: RenderOptions, emojiSiz
             src={toProxiedMediaUrl(url, opts.token)}
             alt={`:${emojiName}:`}
             title={`:${emojiName}:`}
-            className={`inline-block align-middle object-contain ${emojiSizeClass} mx-0.5 select-none`}
+            className={`inline-emoji inline-block align-middle object-contain ${emojiSizeClass} mx-0.5 select-none !rounded-none !border-0 !bg-transparent !shadow-none`}
             loading="lazy"
           />
         );
+        cursor += dcMatch[0].length;
         continue;
       }
-    } else {
-      const linkedId = opts.onMessageLink ? messageLinkId(token) : null;
-      if (linkedId !== null) {
-        out.push(
-          <button key={i++} type="button" onClick={() => opts.onMessageLink!(linkedId)} className="mention-pill channel-pill" title="このメッセージへ移動">
-            ↪ メッセージへ移動
-          </button>
-        );
-        continue;
-      }
-      const linkedMemoSlot = opts.onMemoLink ? memoSlotId(token) : null;
-      if (linkedMemoSlot !== null) {
-        out.push(
-          <button key={i++} type="button" onClick={() => opts.onMemoLink!(linkedMemoSlot)} className="mention-pill channel-pill" title={`メモ #${linkedMemoSlot} を開く`}>
-            📝 メモ #{linkedMemoSlot}
-          </button>
-        );
-        continue;
-      }
-      out.push(
-        <a key={i++} href={token} target="_blank" rel="noreferrer noopener" className="text-sky-400 hover:underline break-all">
-          {token}
-        </a>
-      );
-      continue;
     }
-    out.push(token);
+
+    // 3. shortcode 絵文字 :name:
+    if (content.startsWith(':', cursor)) {
+      const emMatch = content.slice(cursor).match(/^:([a-zA-Z0-9_-]{2,32}):/);
+      if (emMatch) {
+        const rendered = renderEmojiToken(emMatch[0], opts.customEmojis, i++, emojiSizeClass, opts.token);
+        if (rendered) {
+          out.push(rendered);
+          cursor += emMatch[0].length;
+          continue;
+        }
+      }
+    }
+
+    // 4. @ メンション (スペース・記号入り最長一致 -> 単語一致)
+    if (content.startsWith('@', cursor)) {
+      let matchedName: string | null = null;
+      const sub = content.slice(cursor + 1);
+
+      // 最長一致で既知ユーザーを照合
+      for (const u of allKnownUsers) {
+        if (sub.startsWith(u)) {
+          matchedName = u;
+          break;
+        }
+      }
+
+      if (!matchedName) {
+        for (const spec of SPECIAL_MENTIONS) {
+          if (sub.toLowerCase().startsWith(spec)) {
+            matchedName = spec;
+            break;
+          }
+        }
+      }
+
+      if (!matchedName) {
+        const fallbackMatch = sub.match(/^[^\s@#]+/);
+        if (fallbackMatch) {
+          const cand = fallbackMatch[0];
+          if (opts.usernames.has(cand) || opts.discordUsernames?.has(cand) || SPECIAL_MENTIONS.includes(cand.toLowerCase())) {
+            matchedName = cand;
+          }
+        }
+      }
+
+      if (matchedName) {
+        const isDiscordUser = Boolean(opts.discordUsernames?.has(matchedName));
+        const isMe = matchedName === opts.me || matchedName.toLowerCase() === 'everyone';
+        out.push(
+          <span key={i++} className={`mention-pill ${isMe ? 'mention-me' : isDiscordUser ? 'mention-discord' : ''}`}>
+            @{matchedName}
+            {isDiscordUser && <span className="ml-0.5 text-[8px] font-mono px-0.5 rounded bg-indigo-500/30 text-indigo-200">DC</span>}
+          </span>
+        );
+        cursor += 1 + matchedName.length;
+        continue;
+      }
+    }
+
+    // 5. # チャンネル
+    if (content.startsWith('#', cursor)) {
+      let matchedCh: string | null = null;
+      const sub = content.slice(cursor + 1);
+      for (const chName of allChannels) {
+        if (sub.startsWith(chName)) {
+          matchedCh = chName;
+          break;
+        }
+      }
+      if (!matchedCh) {
+        const fallbackMatch = sub.match(/^[^\s@#]+/);
+        if (fallbackMatch && opts.channels.has(fallbackMatch[0])) {
+          matchedCh = fallbackMatch[0];
+        }
+      }
+      if (matchedCh) {
+        const chId = opts.channels.get(matchedCh)!;
+        out.push(
+          <button key={i++} type="button" onClick={() => opts.onChannelClick(chId)} className="mention-pill channel-pill">
+            #{matchedCh}
+          </button>
+        );
+        cursor += 1 + matchedCh.length;
+        continue;
+      }
+    }
+
+    // 通常文字
+    const nextSpecial = content.slice(cursor + 1).search(/[@#:<h]/);
+    const sliceLen = nextSpecial === -1 ? content.length - cursor : nextSpecial + 1;
+    out.push(content.slice(cursor, cursor + sliceLen));
+    cursor += sliceLen;
   }
-  if (last < content.length) out.push(content.slice(last));
+
   return out;
 }
 
@@ -534,12 +609,31 @@ export const SmartMarkdown = React.memo(function SmartMarkdown({
             );
           },
           blockquote: ({ children }) => (
-            <div className="my-1.5 pl-3 pr-2.5 py-1.5 border-l-4 border-indigo-500/80 bg-[#16181F]/90 rounded-r-lg text-stone-200 text-xs sm:text-[13px] leading-relaxed shadow-sm">
+            <div className="my-1.5 pl-3 pr-2.5 py-1.5 border-l-4 border-indigo-500/80 bg-[#16181F]/90 rounded-r-lg text-stone-200 text-xs sm:text-[13px] leading-relaxed shadow-sm overflow-wrap-anywhere break-words max-w-full">
               {children}
             </div>
           ),
           img: ({ src, alt }) => {
             const proxied = toProxiedMediaUrl(src || '', opts.token || '');
+            const rawSrc = String(src || '');
+            const isEmoji = Boolean(
+              rawSrc.includes('cdn.discordapp.com/emojis') ||
+              rawSrc.includes('/uploads/emoji-') ||
+              rawSrc.includes('twemoji') ||
+              rawSrc.includes('/api/discord/emoji')
+            );
+
+            if (isEmoji) {
+              return (
+                <img
+                  src={proxied}
+                  alt={alt || ''}
+                  loading="lazy"
+                  className="inline-emoji w-5 h-5 inline-block object-contain align-middle mx-0.5 select-none !rounded-none !border-0 !bg-transparent !shadow-none"
+                />
+              );
+            }
+
             return (
               <span className="relative my-1 inline-block max-w-full align-middle">
                 <img
@@ -574,48 +668,150 @@ export function renderComposerHighlight(
   text: string,
   usernames: Set<string>,
   channels: Map<string, number>,
-  customEmojis?: Map<string, string>
+  customEmojis?: Map<string, string>,
+  discordUsernames?: Set<string>
 ): React.ReactNode[] {
   const out: React.ReactNode[] = [];
-  let last = 0;
+  const allUsers = Array.from(new Set([...usernames, ...(discordUsernames ? Array.from(discordUsernames) : [])])).sort((a, b) => b.length - a.length);
+  const allChannels = Array.from(channels.keys()).sort((a, b) => b.length - a.length);
+
+  let cursor = 0;
   let i = 0;
-  for (const m of text.matchAll(TOKEN_RE)) {
-    const token = m[0];
-    const idx = m.index ?? 0;
-    const body = token.slice(1);
-    const valid = token.startsWith('@')
-      ? usernames.has(body) || SPECIAL_MENTIONS.includes(body.toLowerCase())
-      : token.startsWith('#')
-      ? channels.has(body)
-      : token.startsWith(':') && token.endsWith(':')
-      ? Boolean(resolveEmojiUrl(token, customEmojis) || BUILTIN_SHORTCODES[token.slice(1, -1).toLowerCase()])
-      : token.startsWith('<') && /^<a?:[a-zA-Z0-9_]{2,32}:[0-9]+>$/.test(token);
-    if (!valid) continue;
-    if (idx > last) out.push(text.slice(last, idx));
-    out.push(
-      <mark key={i++} className={token.startsWith('@') ? 'composer-mention' : token.startsWith('#') ? 'composer-channel' : 'composer-emoji'}>
-        {token}
-      </mark>
-    );
-    last = idx + token.length;
+
+  while (cursor < text.length) {
+    // 1. @ メンション (最長一致)
+    if (text.startsWith('@', cursor)) {
+      let matched: string | null = null;
+      const sub = text.slice(cursor + 1);
+      for (const u of allUsers) {
+        if (sub.startsWith(u)) {
+          matched = u;
+          break;
+        }
+      }
+      if (!matched) {
+        for (const spec of SPECIAL_MENTIONS) {
+          if (sub.toLowerCase().startsWith(spec)) {
+            matched = spec;
+            break;
+          }
+        }
+      }
+      if (!matched) {
+        const fallback = sub.match(/^[^\s@#]+/);
+        if (fallback && (usernames.has(fallback[0]) || discordUsernames?.has(fallback[0]) || SPECIAL_MENTIONS.includes(fallback[0].toLowerCase()))) {
+          matched = fallback[0];
+        }
+      }
+      if (matched) {
+        out.push(
+          <mark key={i++} className="composer-mention">
+            @{matched}
+          </mark>
+        );
+        cursor += 1 + matched.length;
+        continue;
+      }
+    }
+
+    // 2. # チャンネル (最長一致)
+    if (text.startsWith('#', cursor)) {
+      let matchedCh: string | null = null;
+      const sub = text.slice(cursor + 1);
+      for (const ch of allChannels) {
+        if (sub.startsWith(ch)) {
+          matchedCh = ch;
+          break;
+        }
+      }
+      if (!matchedCh) {
+        const fallback = sub.match(/^[^\s@#]+/);
+        if (fallback && channels.has(fallback[0])) {
+          matchedCh = fallback[0];
+        }
+      }
+      if (matchedCh) {
+        out.push(
+          <mark key={i++} className="composer-channel">
+            #{matchedCh}
+          </mark>
+        );
+        cursor += 1 + matchedCh.length;
+        continue;
+      }
+    }
+
+    // 3. 絵文字 (:name: または <a:name:id>)
+    if (text.startsWith(':', cursor)) {
+      const emMatch = text.slice(cursor).match(/^:([a-zA-Z0-9_-]{2,32}):/);
+      if (emMatch && (resolveEmojiUrl(emMatch[0], customEmojis) || BUILTIN_SHORTCODES[emMatch[1].toLowerCase()])) {
+        out.push(
+          <mark key={i++} className="composer-emoji">
+            {emMatch[0]}
+          </mark>
+        );
+        cursor += emMatch[0].length;
+        continue;
+      }
+    }
+
+    if (text.startsWith('<', cursor)) {
+      const dcMatch = text.slice(cursor).match(/^<a?:[a-zA-Z0-9_]{2,32}:[0-9]+>/);
+      if (dcMatch) {
+        out.push(
+          <mark key={i++} className="composer-emoji">
+            {dcMatch[0]}
+          </mark>
+        );
+        cursor += dcMatch[0].length;
+        continue;
+      }
+    }
+
+    // 通常文字
+    const nextSpecial = text.slice(cursor + 1).search(/[@#:<]/);
+    const sliceLen = nextSpecial === -1 ? text.length - cursor : nextSpecial + 1;
+    out.push(text.slice(cursor, cursor + sliceLen));
+    cursor += sliceLen;
   }
-  out.push(text.slice(last));
+
   // 末尾の改行でも高さが揃うように
   out.push('​');
   return out;
 }
 
-// キャレット位置にある @… / #… / :… を探す
+// キャレット位置にある @… / #… / :… を探す (スペースを含むユーザー名入力にも対応)
 export function findCompletionToken(value: string, caret: number): { kind: '@' | '#' | ':'; query: string; start: number } | null {
+  // まず直近の空白まで遡る
   let start = caret;
   while (start > 0 && !/\s/.test(value[start - 1])) start--;
-  const token = value.slice(start, caret);
-  if (token.length === 0) return null;
-  const kind = token[0];
+  let token = value.slice(start, caret);
+  let kind = token[0];
+
+  // @ メンションの場合: スペースを含むユーザー名 (例: @[0] Mythra YT〆) を打っている途中の場合、
+  // 行頭または直前の空白/区切りまで遡って @ を探す
+  if (kind !== '@' && kind !== '#' && kind !== ':') {
+    let lineStart = caret;
+    while (lineStart > 0 && value[lineStart - 1] !== '\n') lineStart--;
+    const lineBeforeCaret = value.slice(lineStart, caret);
+    const lastAtIdx = lineBeforeCaret.lastIndexOf('@');
+    if (lastAtIdx !== -1) {
+      if (lastAtIdx === 0 || /\s/.test(lineBeforeCaret[lastAtIdx - 1])) {
+        const potentialStart = lineStart + lastAtIdx;
+        const potentialQuery = value.slice(potentialStart + 1, caret);
+        if (!potentialQuery.includes('\n') && (potentialQuery.match(/\s/g) || []).length <= 3) {
+          start = potentialStart;
+          token = value.slice(start, caret);
+          kind = '@';
+        }
+      }
+    }
+  }
+
   if (kind !== '@' && kind !== '#' && kind !== ':') return null;
   const query = token.slice(1);
   if (kind === ':' && query.length === 0) return null;
-  if (/[@#:]/.test(query)) return null;
+  if (/[#:]/.test(query)) return null;
   return { kind, query, start };
 }
 

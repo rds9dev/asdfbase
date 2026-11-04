@@ -1287,9 +1287,10 @@ app.delete('/api/messages/:messageId', authMiddleware, async (req, res) => {
         if (userRole !== 'admin' && msg.user_id !== userId) {
             return res.status(403).json({ error: '削除権限がありません' });
         }
+        // Discord側のメッセージ削除を messages テーブルの CASCADE 削除前に実行
+        await relayDelete(messageId);
         await db_js_1.pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
         broadcast({ type: 'MESSAGE_DELETED', payload: { messageId, channelId: msg.channel_id } });
-        relayDelete(messageId);
         logAudit(req.user, 'message_delete', 'message', messageId, {
             message: `メッセージ削除 (${msg.username} の投稿)`,
             channel_id: msg.channel_id,
@@ -1444,6 +1445,7 @@ app.post('/api/channels/:channelId/messages', authMiddleware, async (req, res) =
             notifyImportant(`📢 ${username} から全員への連絡`, String(content));
         }
         replyAsGemini(channelId, savedMessage);
+        pruneChannelMessageCount(channelId).catch(() => { });
         res.json(savedMessage);
     }
     catch (err) {
@@ -1636,6 +1638,32 @@ app.post('/api/messages/:messageId/pin', authMiddleware, async (req, res) => {
     }
     catch (err) {
         res.status(500).json({ error: 'ピン留め更新エラー' });
+    }
+});
+// チャンネルのピン留めメッセージ一覧 (閲覧権限チェック付き)
+app.get('/api/channels/:channelId/pins', authMiddleware, async (req, res) => {
+    try {
+        const channelId = parseInt(req.params.channelId, 10);
+        const chRes = await db_js_1.pool.query(`SELECT * FROM channels WHERE id = $1`, [channelId]);
+        if (chRes.rows.length === 0)
+            return res.status(404).json({ error: 'チャンネルが見つかりません' });
+        const ch = chRes.rows[0];
+        const uRes = await db_js_1.pool.query(`SELECT role, custom_roles FROM users WHERE id = $1`, [req.user.id]);
+        const role = uRes.rows[0]?.role || 'member';
+        const customRoles = Array.isArray(uRes.rows[0]?.custom_roles) ? uRes.rows[0].custom_roles : [];
+        const isAdmin = role === 'admin';
+        const roles = [role, ...customRoles];
+        if (!(await checkServerPermission(req.user.id, role, ch.server_id)) ||
+            !checkChannelViewPermission(isAdmin, roles, ch)) {
+            return res.status(403).json({ error: 'このチャンネルの閲覧権限がありません' });
+        }
+        const messages = await db_js_1.pool.query(`SELECT * FROM messages WHERE channel_id = $1 AND is_pinned = TRUE ORDER BY id DESC LIMIT 100`, [channelId]);
+        const decrypted = messages.rows.map(decryptMessageRow);
+        const attached = await attachReplies(decrypted);
+        res.json(attached);
+    }
+    catch (err) {
+        res.status(500).json({ error: 'ピン留め取得エラー' });
     }
 });
 // Assignments API
@@ -4462,6 +4490,29 @@ async function removeUnreferencedUploads(contents) {
     }
     return removed;
 }
+const MAX_CHANNEL_MESSAGES = 1500;
+const MAX_TOTAL_MESSAGES = 25000;
+// チャンネル内メッセージ件数が上限を超えた場合に古いメッセージを切り詰める (ピン留めは保護)
+async function pruneChannelMessageCount(channelId) {
+    try {
+        const countRes = await db_js_1.pool.query(`SELECT COUNT(*)::int AS cnt FROM messages WHERE channel_id = $1`, [channelId]);
+        const cnt = countRes.rows[0]?.cnt || 0;
+        if (cnt > MAX_CHANNEL_MESSAGES) {
+            const excess = cnt - MAX_CHANNEL_MESSAGES;
+            const del = await db_js_1.pool.query(`DELETE FROM messages WHERE id IN (
+           SELECT id FROM messages
+           WHERE channel_id = $1 AND is_pinned = FALSE
+           ORDER BY id ASC LIMIT $2
+         ) RETURNING content, channel_id`, [channelId, excess]);
+            if (del.rows.length > 0) {
+                removeUnreferencedUploads(del.rows.map(r => (0, crypto_js_1.decryptMessageContent)(r.content, r.channel_id))).catch(() => { });
+            }
+        }
+    }
+    catch (err) {
+        console.warn(`[retention] prune channel ${channelId} failed:`, err.message);
+    }
+}
 let retentionRunning = false;
 async function runRetention() {
     if (retentionRunning)
@@ -4494,6 +4545,32 @@ async function runRetention() {
                     deletedMessages += del.rows.length;
                     deletedFiles += await removeUnreferencedUploads(del.rows.map(r => (0, crypto_js_1.decryptMessageContent)(r.content, r.channel_id)));
                 }
+            }
+        }
+        // 荒らし対策: チャンネル別の上限件数 (MAX_CHANNEL_MESSAGES) 超過分をクリーンアップ
+        const excessDel = await db_js_1.pool.query(`DELETE FROM messages WHERE id IN (
+         SELECT id FROM (
+           SELECT id, is_pinned, ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY id DESC) AS rn
+           FROM messages
+         ) t
+         WHERE t.rn > $1 AND t.is_pinned = FALSE
+         LIMIT 1000
+       ) RETURNING content, channel_id`, [MAX_CHANNEL_MESSAGES]);
+        if (excessDel.rows.length > 0) {
+            deletedMessages += excessDel.rows.length;
+            deletedFiles += await removeUnreferencedUploads(excessDel.rows.map(r => (0, crypto_js_1.decryptMessageContent)(r.content, r.channel_id)));
+        }
+        // 荒らし対策: 全体メッセージ数が MAX_TOTAL_MESSAGES を超えている場合の全体クリーンアップ
+        const totalCountRes = await db_js_1.pool.query(`SELECT COUNT(*)::int AS cnt FROM messages`);
+        const totalCnt = totalCountRes.rows[0]?.cnt || 0;
+        if (totalCnt > MAX_TOTAL_MESSAGES) {
+            const totalExcess = totalCnt - MAX_TOTAL_MESSAGES;
+            const totalDel = await db_js_1.pool.query(`DELETE FROM messages WHERE id IN (
+           SELECT id FROM messages WHERE is_pinned = FALSE ORDER BY id ASC LIMIT $1
+         ) RETURNING content, channel_id`, [Math.min(totalExcess, 1000)]);
+            if (totalDel.rows.length > 0) {
+                deletedMessages += totalDel.rows.length;
+                deletedFiles += await removeUnreferencedUploads(totalDel.rows.map(r => (0, crypto_js_1.decryptMessageContent)(r.content, r.channel_id)));
             }
         }
         // メモの変更履歴は読まれていないので、各メモ直近だけ残す
@@ -4582,6 +4659,7 @@ server.listen(PORT, async () => {
                 if (/@gemini\b/i.test(String(content || '')) || /<@!?\d+>/.test(String(content || ''))) {
                     replyAsGemini(asdfChannelId, attached);
                 }
+                pruneChannelMessageCount(asdfChannelId).catch(() => { });
             },
             ingestEdit: async (discordMessageId, content) => {
                 const links = (await db_js_1.pool.query(`SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1 AND direction = 'in'`, [discordMessageId])).rows;
@@ -4600,19 +4678,11 @@ server.listen(PORT, async () => {
             ingestDelete: async (discordMessageId) => {
                 const links = (await db_js_1.pool.query(`SELECT asdf_message_id FROM discord_message_links WHERE discord_message_id = $1`, [discordMessageId])).rows;
                 for (const l of links) {
-                    const cur = await db_js_1.pool.query(`SELECT id, channel_id, content FROM messages WHERE id = $1`, [l.asdf_message_id]);
+                    const cur = await db_js_1.pool.query(`SELECT id, channel_id FROM messages WHERE id = $1`, [l.asdf_message_id]);
                     if (cur.rows.length === 0)
                         continue;
-                    const originalContent = (0, crypto_js_1.decryptMessageContent)(cur.rows[0].content, cur.rows[0].channel_id);
-                    if (originalContent.includes('*(Discordで削除されました)*'))
-                        continue;
-                    const newContent = `~~${originalContent}~~ *(Discordで削除されました)*`;
-                    const encrypted = (0, crypto_js_1.encryptMessageContent)(newContent, cur.rows[0].channel_id);
-                    const updated = (await db_js_1.pool.query(`UPDATE messages SET content = $1, updated_at = NOW(), edited_at = NOW() WHERE id = $2 RETURNING *`, [encrypted, l.asdf_message_id])).rows;
-                    for (const r of updated) {
-                        const [attached] = await attachReplies([{ ...r, content: newContent, sender_username: r.username }]);
-                        broadcast({ type: 'MESSAGE_UPDATED', payload: attached });
-                    }
+                    await db_js_1.pool.query(`DELETE FROM messages WHERE id = $1`, [l.asdf_message_id]);
+                    broadcast({ type: 'MESSAGE_DELETED', payload: { messageId: l.asdf_message_id, channelId: cur.rows[0].channel_id } });
                 }
             },
             ingestReaction: async (discordMessageId, emoji, discordUserId, action, username) => {
@@ -4623,21 +4693,55 @@ server.listen(PORT, async () => {
                     const displayUname = username.startsWith('[Discord]') ? username : `[Discord] ${username}`;
                     saveDiscordReactionUsername(pseudoUserId, displayUname);
                 }
+                const normEmoji = emoji.replace(/\uFE0F/g, '');
+                const customMatch = emoji.match(/^<a?:([a-zA-Z0-9_]+):([0-9]+)>$/);
+                const emojiName = customMatch ? customMatch[1] : emoji.replace(/^:+|:+$/g, '');
                 for (const l of links) {
                     const msgRes = await db_js_1.pool.query(`SELECT reactions, channel_id FROM messages WHERE id = $1`, [l.asdf_message_id]);
                     if (msgRes.rows.length === 0)
                         continue;
                     const reactions = msgRes.rows[0].reactions || {};
-                    const users = (reactions[emoji] || []).map((u) => Number(u));
+                    // 対象絵文字キーを特定 (完全一致 -> 正規化一致 -> shortcode一致)
+                    let targetKey = emoji;
+                    if (!reactions[targetKey]) {
+                        const foundKey = Object.keys(reactions).find(k => {
+                            if (k.replace(/\uFE0F/g, '') === normEmoji)
+                                return true;
+                            if (k === `:${emojiName}:` || k === emojiName)
+                                return true;
+                            const kMatch = k.match(/^<a?:([a-zA-Z0-9_]+):([0-9]+)>$/);
+                            if (kMatch && kMatch[1] === emojiName)
+                                return true;
+                            return false;
+                        });
+                        if (foundKey)
+                            targetKey = foundKey;
+                    }
+                    const users = (reactions[targetKey] || []).map((u) => Number(u));
                     if (action === 'add') {
                         if (!users.includes(pseudoUserId)) {
-                            reactions[emoji] = [...users, pseudoUserId];
+                            reactions[targetKey] = [...users, pseudoUserId];
                         }
                     }
                     else {
-                        reactions[emoji] = users.filter((u) => u !== pseudoUserId);
-                        if (reactions[emoji].length === 0)
-                            delete reactions[emoji];
+                        // remove: targetKey から削除、見つからない場合は pseudoUserId を持つすべてのキーから除去
+                        if (users.includes(pseudoUserId)) {
+                            reactions[targetKey] = users.filter((u) => u !== pseudoUserId);
+                            if (reactions[targetKey].length === 0)
+                                delete reactions[targetKey];
+                        }
+                        else {
+                            for (const [k, uList] of Object.entries(reactions)) {
+                                const list = uList.map(Number);
+                                if (list.includes(pseudoUserId)) {
+                                    const nextList = list.filter(u => u !== pseudoUserId);
+                                    if (nextList.length === 0)
+                                        delete reactions[k];
+                                    else
+                                        reactions[k] = nextList;
+                                }
+                            }
+                        }
                     }
                     const updated = await db_js_1.pool.query(`UPDATE messages SET reactions = $1 WHERE id = $2 RETURNING *`, [JSON.stringify(reactions), l.asdf_message_id]);
                     broadcast({
