@@ -1115,6 +1115,53 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDown);
   }, [isNotifyPopoverOpen]);
 
+  const pinsContainerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isPinsOpen) return;
+    const handlePointerDown = (e: PointerEvent) => {
+      if (!pinsContainerRef.current?.contains(e.target as Node)) {
+        setIsPinsOpen(false);
+      }
+    };
+    const t = setTimeout(() => document.addEventListener('pointerdown', handlePointerDown), 0);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [isPinsOpen]);
+
+  const fetchPins = useCallback(async (channelId: number) => {
+    if (!token) return;
+    setIsLoadingPins(true);
+    setPinsError(null);
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels/${channelId}/pins`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 403) {
+        setPinsError('このチャンネルのピン留めメッセージを閲覧する権限がありません');
+        setPinnedMessages([]);
+        return;
+      }
+      if (!res.ok) {
+        setPinsError('ピン留めメッセージの読み込みに失敗しました');
+        return;
+      }
+      const data = await res.json();
+      setPinnedMessages(Array.isArray(data) ? data : []);
+    } catch (err: any) {
+      setPinsError(err?.message || '読み込みエラーが発生しました');
+    } finally {
+      setIsLoadingPins(false);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (isPinsOpen) {
+      fetchPins(activeChannelId);
+    }
+  }, [isPinsOpen, activeChannelId, fetchPins]);
+
   // Fetch Current User
   useEffect(() => {
     if (!token) {
@@ -1141,6 +1188,14 @@ export default function App() {
         setIsCheckingAuth(false);
       });
   }, [token]);
+
+  const patchToastShownRef = useRef(false);
+  useEffect(() => {
+    if (currentUser && hasUnreadPatchNotes && !patchToastShownRef.current) {
+      patchToastShownRef.current = true;
+      toast(`🎉 新バージョン ${LATEST_PATCH_VERSION} が公開されました！「その他」タブでパッチノートを確認できます`, { kind: 'info' });
+    }
+  }, [currentUser, hasUnreadPatchNotes]);
 
   const channelsRef = useRef(channels);
   channelsRef.current = channels;
@@ -4893,53 +4948,6 @@ export default function App() {
   const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
   const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
 
-  const fetchPins = useCallback(async (channelId: number) => {
-    if (!token) return;
-    setIsLoadingPins(true);
-    setPinsError(null);
-    try {
-      const res = await safeFetch(`${API_BASE_URL}/api/channels/${channelId}/pins`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.status === 403) {
-        setPinsError('このチャンネルのピン留めメッセージを閲覧する権限がありません');
-        setPinnedMessages([]);
-        return;
-      }
-      if (!res.ok) {
-        setPinsError('ピン留めメッセージの読み込みに失敗しました');
-        return;
-      }
-      const data = await res.json();
-      setPinnedMessages(Array.isArray(data) ? data : []);
-    } catch (err: any) {
-      setPinsError(err?.message || '読み込みエラーが発生しました');
-    } finally {
-      setIsLoadingPins(false);
-    }
-  }, [token]);
-
-  const pinsContainerRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!isPinsOpen) return;
-    const handlePointerDown = (e: PointerEvent) => {
-      if (!pinsContainerRef.current?.contains(e.target as Node)) {
-        setIsPinsOpen(false);
-      }
-    };
-    const t = setTimeout(() => document.addEventListener('pointerdown', handlePointerDown), 0);
-    return () => {
-      clearTimeout(t);
-      document.removeEventListener('pointerdown', handlePointerDown);
-    };
-  }, [isPinsOpen]);
-
-  useEffect(() => {
-    if (isPinsOpen) {
-      fetchPins(activeChannelId);
-    }
-  }, [isPinsOpen, activeChannelId, fetchPins]);
-
   const openSpeakerProfile = (m: Message) => {
     if (m.user_id && m.user_id > 0) {
       const foundUser = userById.get(m.user_id) || onlineUsers.find(u => u.id === m.user_id);
@@ -5180,7 +5188,12 @@ export default function App() {
               return (
                 <button
                   key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => {
+                    setActiveTab(tab.id);
+                    if (tab.id === 'more' && hasUnreadPatchNotes) {
+                      setMoreSubTab('patch_notes');
+                    }
+                  }}
                   title={tab.label}
                   className={`relative px-2 lg:px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 whitespace-nowrap border ${
                     isActive 
@@ -9488,6 +9501,9 @@ export default function App() {
                   key={tab.id}
                   onClick={() => {
                     setActiveTab(tab.id);
+                    if (tab.id === 'more' && hasUnreadPatchNotes) {
+                      setMoreSubTab('patch_notes');
+                    }
                     setIsMobileMenuOpen(false);
                   }}
                   className={`relative flex flex-col items-center gap-1 py-3 rounded-xl text-[11px] ${
