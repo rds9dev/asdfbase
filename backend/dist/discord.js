@@ -25,6 +25,7 @@ exports.editRelayedOnDiscord = editRelayedOnDiscord;
 exports.deleteRelayedOnDiscord = deleteRelayedOnDiscord;
 exports.discordUserIdToPseudoId = discordUserIdToPseudoId;
 exports.resolveDiscordReactionUsers = resolveDiscordReactionUsers;
+exports.getDiscordUserPresence = getDiscordUserPresence;
 exports.startDiscordBot = startDiscordBot;
 exports.sendDiscordDm = sendDiscordDm;
 exports.deleteDiscordDm = deleteDiscordDm;
@@ -1493,15 +1494,34 @@ function createClient(_withMessageContent) {
         makeCache: discord_js_1.Options.cacheWithLimits({
             ...discord_js_1.Options.DefaultMakeCacheSettings,
             MessageManager: 0,
-            PresenceManager: 200,
+            PresenceManager: 2000,
             ReactionManager: 0,
-            GuildMemberManager: 200,
-            UserManager: 200,
+            GuildMemberManager: 2000,
+            UserManager: 2000,
             GuildEmojiManager: 0,
             GuildStickerManager: 0,
             VoiceStateManager: 50,
         }),
     });
+}
+function getDiscordUserPresence(discordUserId) {
+    if (!client)
+        return { status: 'offline', activity: null };
+    for (const guild of client.guilds.cache.values()) {
+        const member = guild.members.cache.get(discordUserId);
+        if (member) {
+            const p = member.presence;
+            const status = (p?.status || (member.voice?.channelId ? 'online' : 'offline'));
+            const acts = p?.activities || [];
+            const gameAct = acts.find(a => a.type === 0 || a.type === 1 || a.type === 2 || a.type === 3 || a.type === 5);
+            const customAct = acts.find(a => a.type === 4);
+            const activityText = gameAct ? `${gameAct.name}${gameAct.details ? `: ${gameAct.details}` : ''}` : (customAct?.state || null);
+            if (status !== 'offline') {
+                return { status, activity: activityText };
+            }
+        }
+    }
+    return { status: 'offline', activity: null };
 }
 async function startDiscordBot(d) {
     deps = d;
@@ -1538,6 +1558,12 @@ async function startDiscordBot(d) {
             // 起動時に全チャンネルを自動走査して同期 & 10分おきの自動定期走査を開始
             syncGuildChannels().catch(err => console.warn('[discord] startup channel sync error:', err.message));
             startChannelAutoSyncTimer();
+            // 全サーバーのメンバー一覧とオンラインプレゼンスをキャッシュにロード
+            for (const guild of ready.guilds.cache.values()) {
+                guild.members.fetch({ withPresences: true }).catch(err => {
+                    console.warn(`[discord] Failed to fetch members with presences for ${guild.name}:`, err.message);
+                });
+            }
         });
         c.on(discord_js_1.Events.ShardDisconnect, () => {
             connected = false;
@@ -1548,6 +1574,10 @@ async function startDiscordBot(d) {
         });
         c.on(discord_js_1.Events.ShardReady, () => {
             connected = true;
+        });
+        c.on(discord_js_1.Events.PresenceUpdate, () => {
+            // メンバーのステータス変更時にサーバーキャッシュを無効化
+            cachedDiscordServers = null;
         });
         c.on(discord_js_1.Events.Error, err => {
             lastError = err.message;

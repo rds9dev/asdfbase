@@ -20,7 +20,7 @@ import {
   startDiscordBot, relayToDiscordBot, editRelayedOnDiscord, deleteRelayedOnDiscord, getDiscordStatus, getDiscordGuildStatus, refreshDiscordCommands, getBoundAsdfChannelIds,
   relayReactionToDiscord, relayPinToDiscord, resolveDiscordReactionUsers,
   getDiscordServers, addDiscordBinding, removeDiscordBinding, syncDiscordHistory, approveDiscordGuild, removeApprovedDiscordGuild,
-  sendDiscordDm, deleteDiscordDm, triggerDiscordDmTyping,
+  sendDiscordDm, deleteDiscordDm, triggerDiscordDmTyping, getDiscordUserPresence,
 } from './discord.js';
 import {
   DEFAULT_SCHEDULES, DEFAULT_DAY_PERIOD_COUNTS, DEFAULT_SPECIAL_DAY_PERIOD_COUNTS, SCHEDULE_TYPES, isValidSchedule, nowInTokyo, nextLessonDate, nextWeekday,
@@ -1949,8 +1949,11 @@ app.get('/api/dm/sessions', authMiddleware, async (req: AuthRequest, res) => {
           content: decryptMessageContent(lastMsg.content, `dm-${s.id}`),
         };
       }
+      const presence = getDiscordUserPresence(s.discord_user_id);
       return {
         ...s,
+        status: presence.status,
+        activity: presence.activity,
         last_message: lastMsg,
       };
     });

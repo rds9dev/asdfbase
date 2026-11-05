@@ -1741,8 +1741,11 @@ app.get('/api/dm/sessions', authMiddleware, async (req, res) => {
                     content: (0, crypto_js_1.decryptMessageContent)(lastMsg.content, `dm-${s.id}`),
                 };
             }
+            const presence = (0, discord_js_1.getDiscordUserPresence)(s.discord_user_id);
             return {
                 ...s,
+                status: presence.status,
+                activity: presence.activity,
                 last_message: lastMsg,
             };
         });

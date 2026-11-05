@@ -173,6 +173,8 @@ interface DmSession {
   created_at: string;
   last_message_at: string;
   unread_count?: number;
+  status?: 'online' | 'idle' | 'dnd' | 'offline';
+  activity?: string | null;
   last_message?: {
     id: number;
     sender_type: 'asdf' | 'discord';
@@ -5306,6 +5308,16 @@ export default function App() {
   const bindingByAsdfId = new Map(discordBindings.map((b: any) => [Number(b.asdfChannelId), b]));
   const activeChannelBinding = bindingByAsdfId.get(activeChannelId);
   const selectedServer = selectedServerId !== 'all' ? discordServers.find(s => s.id === selectedServerId) : null;
+  const getDiscordUserPresence = (discordUserId?: string): { status: 'online' | 'idle' | 'dnd' | 'offline'; activity?: string | null } => {
+    if (!discordUserId) return { status: 'offline', activity: null };
+    for (const srv of discordServers) {
+      const m = (srv.members || []).find((mem: any) => mem.id === discordUserId);
+      if (m && m.status && m.status !== 'offline') {
+        return { status: m.status, activity: m.activity || null };
+      }
+    }
+    return { status: 'offline', activity: null };
+  };
 
   const openSpeakerProfile = (m: Message) => {
     if (m.user_id && m.user_id > 0) {
@@ -6016,6 +6028,15 @@ export default function App() {
                             {name.slice(0, 1)}
                           </div>
                         )}
+                        {/* オンラインステータス丸 */}
+                        {(() => {
+                          const presence = getDiscordUserPresence(session.discord_user_id);
+                          const st = session.status || presence.status;
+                          const stColor = st === 'online' ? 'bg-emerald-400' : st === 'idle' ? 'bg-amber-400' : st === 'dnd' ? 'bg-rose-400' : 'bg-stone-600';
+                          return (
+                            <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#14161C] ${stColor}`} />
+                          );
+                        })()}
                         {unread > 0 && (
                           <span className="absolute -top-1 -right-1 px-1 min-w-[16px] h-4 rounded-full bg-rose-500 text-white text-[9px] font-bold flex items-center justify-center ring-2 ring-[#08090B] anim-badge">
                             {unread > 99 ? '99+' : unread}
@@ -6396,7 +6417,11 @@ export default function App() {
                                         <span className="absolute -left-0.5 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-white anim-badge" />
                                       ) : null}
                                       <button
-                                        onClick={() => setActiveChannelId(ch.id)}
+                                        onClick={() => {
+                                          const srvId = resolveChannelServerId(ch);
+                                          if (srvId && srvId !== selectedServerId) setSelectedServerId(srvId);
+                                          setActiveChannelId(ch.id);
+                                        }}
                                         className="flex items-center gap-1.5 flex-1 text-left min-w-0"
                                       >
                                         {isThread ? (
@@ -6658,14 +6683,21 @@ export default function App() {
                             {currentUser?.username?.slice(0, 1)?.toUpperCase() || '?'}
                           </div>
                         )}
-                        <span className="absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full bg-emerald-500 ring-2 ring-[#090A0D]" title="オンライン" />
+                        {(() => {
+                          const mySt = currentUser?.status || 'online';
+                          const myColor = mySt === 'away' ? 'bg-amber-400' : mySt === 'offline' ? 'bg-stone-500' : 'bg-emerald-500';
+                          const myLabel = mySt === 'away' ? '離席中' : mySt === 'offline' ? 'オフライン' : 'オンライン';
+                          return (
+                            <span className={`absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full ${myColor} ring-2 ring-[#090A0D]`} title={myLabel} />
+                          );
+                        })()}
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="text-xs font-bold text-stone-200 truncate group-hover:text-white">
                           {currentUser?.username}
                         </div>
                         <div className="text-[10px] text-stone-500 truncate font-mono">
-                          {currentUser?.role === 'admin' ? '管理者' : 'メンバー'}
+                          {currentUser?.status === 'away' ? '離席中' : (currentUser?.role === 'admin' ? '管理者' : 'メンバー')}
                         </div>
                       </div>
                     </button>
@@ -6726,25 +6758,45 @@ export default function App() {
                           >
                             {isChannelsCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
                           </button>
-                          <div className="relative shrink-0">
-                            {currentDmSession.discord_avatar_url ? (
-                              <img
-                                src={toProxiedMediaUrl(currentDmSession.discord_avatar_url, token)}
-                                alt=""
-                                className="w-7 h-7 rounded-full object-cover"
-                              />
-                            ) : (
-                              <div className="w-7 h-7 rounded-full bg-stone-800 flex items-center justify-center text-xs font-bold text-stone-300">
-                                {currentDmSession.discord_display_name?.slice(0, 1) || currentDmSession.discord_username?.slice(0, 1) || '?'}
-                              </div>
-                            )}
-                          </div>
-                          <div className="min-w-0">
-                            <span className="font-bold text-white text-sm truncate flex items-center gap-1.5">
-                              {currentDmSession.discord_display_name || currentDmSession.discord_username}
-                              <span className="text-[10px] text-stone-500 font-mono">@{currentDmSession.discord_username}</span>
-                            </span>
-                          </div>
+                          {(() => {
+                            const dmPresence = getDiscordUserPresence(currentDmSession.discord_user_id);
+                            const dmStatus = currentDmSession.status || dmPresence.status;
+                            const dmStatusColor = dmStatus === 'online' ? 'bg-emerald-400' : dmStatus === 'idle' ? 'bg-amber-400' : dmStatus === 'dnd' ? 'bg-rose-400' : 'bg-stone-600';
+                            const dmStatusLabel = dmStatus === 'online' ? 'オンライン' : dmStatus === 'idle' ? '離席中' : dmStatus === 'dnd' ? '取り込み中' : 'オフライン';
+                            const dmActivity = currentDmSession.activity || dmPresence.activity;
+
+                            return (
+                              <>
+                                <div className="relative shrink-0">
+                                  {currentDmSession.discord_avatar_url ? (
+                                    <img
+                                      src={toProxiedMediaUrl(currentDmSession.discord_avatar_url, token)}
+                                      alt=""
+                                      className="w-7 h-7 rounded-full object-cover"
+                                    />
+                                  ) : (
+                                    <div className="w-7 h-7 rounded-full bg-stone-800 flex items-center justify-center text-xs font-bold text-stone-300">
+                                      {currentDmSession.discord_display_name?.slice(0, 1) || currentDmSession.discord_username?.slice(0, 1) || '?'}
+                                    </div>
+                                  )}
+                                  <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0C0D10] ${dmStatusColor}`} title={dmStatusLabel} />
+                                </div>
+                                <div className="min-w-0">
+                                  <div className="font-bold text-white text-sm truncate flex items-center gap-1.5 leading-tight">
+                                    <span className="truncate">{currentDmSession.discord_display_name || currentDmSession.discord_username}</span>
+                                    <span className="text-[10px] text-stone-500 font-mono shrink-0">@{currentDmSession.discord_username}</span>
+                                  </div>
+                                  <div className="text-[10px] flex items-center gap-1 truncate font-sans">
+                                    <span className={`w-1.5 h-1.5 rounded-full ${dmStatusColor}`} />
+                                    <span className={dmStatus === 'online' ? 'text-emerald-400 font-medium' : dmStatus === 'idle' ? 'text-amber-400' : dmStatus === 'dnd' ? 'text-rose-400' : 'text-stone-500'}>
+                                      {dmStatusLabel}
+                                    </span>
+                                    {dmActivity && <span className="text-stone-400 truncate">— {dmActivity}</span>}
+                                  </div>
+                                </div>
+                              </>
+                            );
+                          })()}
                           <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[10px] shrink-0 font-sans">
                             <Lock className="w-3 h-3" />
                             プライベートDM (暗号化)
@@ -8120,73 +8172,92 @@ export default function App() {
                       );
                     }
                     return (
-                      <div className="space-y-4">
-                        <div className="text-[10px] uppercase tracking-wider text-indigo-400 font-extrabold flex items-center justify-between px-1">
-                          <span>ダイレクトメッセージ</span>
-                        </div>
-                        <div className="relative rounded-2xl bg-gradient-to-b from-indigo-950/30 to-[#12141B] border border-indigo-500/20 p-4 flex flex-col items-center text-center">
-                          <div className="relative mb-3">
-                            {activeDmSession.discord_avatar_url ? (
-                              <img
-                                src={toProxiedMediaUrl(activeDmSession.discord_avatar_url, token)}
-                                alt=""
-                                className="w-16 h-16 rounded-full object-cover shadow-lg border-2 border-indigo-500/30"
-                              />
-                            ) : (
-                              <div className="w-16 h-16 rounded-full bg-stone-800 flex items-center justify-center text-xl font-bold text-stone-200 border-2 border-indigo-500/30">
-                                {activeDmSession.discord_display_name?.slice(0, 1) || activeDmSession.discord_username?.slice(0, 1) || '?'}
-                              </div>
-                            )}
-                          </div>
-                          <h4 className="font-bold text-white text-base truncate max-w-full">
-                            {activeDmSession.discord_display_name || activeDmSession.discord_username}
-                          </h4>
-                          <div className="text-xs text-stone-400 font-mono mb-3 truncate max-w-full">
-                            @{activeDmSession.discord_username}
-                          </div>
-                          <div className="w-full pt-3 border-t border-stone-800/80 space-y-2 text-left text-xs">
-                            <div>
-                              <span className="text-[10px] text-stone-500 block uppercase font-mono">Discord ID</span>
-                              <span className="font-mono text-stone-300 text-[11px] select-all break-all">{activeDmSession.discord_user_id}</span>
-                            </div>
-                            <div>
-                              <span className="text-[10px] text-stone-500 block uppercase font-mono">通信保護</span>
-                              <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
-                                <Lock className="w-3 h-3" /> E2E 暗号化保存
-                              </span>
-                            </div>
-                          </div>
-                        </div>
+                      (() => {
+                        const activePresence = getDiscordUserPresence(activeDmSession.discord_user_id);
+                        const dmStatus = activeDmSession.status || activePresence.status;
+                        const dmStatusColor = dmStatus === 'online' ? 'bg-emerald-400' : dmStatus === 'idle' ? 'bg-amber-400' : dmStatus === 'dnd' ? 'bg-rose-400' : 'bg-stone-600';
+                        const dmStatusLabel = dmStatus === 'online' ? 'オンライン' : dmStatus === 'idle' ? '離席中' : dmStatus === 'dnd' ? '取り込み中' : 'オフライン';
+                        const dmActivity = activeDmSession.activity || activePresence.activity;
 
-                        <div className="space-y-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setSelectedProfileMember({
-                                kind: 'discord',
-                                member: {
-                                  id: activeDmSession.discord_user_id,
-                                  username: activeDmSession.discord_username,
-                                  displayName: activeDmSession.discord_display_name,
-                                  avatarUrl: activeDmSession.discord_avatar_url,
-                                }
-                              });
-                            }}
-                            className="w-full py-2 px-3 rounded-xl bg-stone-900 border border-stone-800 hover:border-indigo-500/50 hover:bg-stone-800/80 text-stone-200 text-xs font-medium flex items-center justify-center gap-2 transition"
-                          >
-                            <User className="w-3.5 h-3.5 text-indigo-400" />
-                            プロフィール詳細を表示
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteDmSession(activeDmSession.id, activeDmSession.discord_display_name || activeDmSession.discord_username)}
-                            className="w-full py-2 px-3 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-xs font-medium flex items-center justify-center gap-2 transition"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            DM履歴を削除
-                          </button>
-                        </div>
-                      </div>
+                        return (
+                          <div className="space-y-4">
+                            <div className="text-[10px] uppercase tracking-wider text-indigo-400 font-extrabold flex items-center justify-between px-1">
+                              <span>ダイレクトメッセージ</span>
+                            </div>
+                            <div className="relative rounded-2xl bg-gradient-to-b from-indigo-950/30 to-[#12141B] border border-indigo-500/20 p-4 flex flex-col items-center text-center">
+                              <div className="relative mb-3">
+                                {activeDmSession.discord_avatar_url ? (
+                                  <img
+                                    src={toProxiedMediaUrl(activeDmSession.discord_avatar_url, token)}
+                                    alt=""
+                                    className="w-16 h-16 rounded-full object-cover shadow-lg border-2 border-indigo-500/30"
+                                  />
+                                ) : (
+                                  <div className="w-16 h-16 rounded-full bg-stone-800 flex items-center justify-center text-xl font-bold text-stone-200 border-2 border-indigo-500/30">
+                                    {activeDmSession.discord_display_name?.slice(0, 1) || activeDmSession.discord_username?.slice(0, 1) || '?'}
+                                  </div>
+                                )}
+                                <span className={`absolute bottom-0 right-0 w-4 h-4 rounded-full border-2 border-[#12141B] ${dmStatusColor}`} title={dmStatusLabel} />
+                              </div>
+                              <h4 className="font-bold text-white text-base truncate max-w-full">
+                                {activeDmSession.discord_display_name || activeDmSession.discord_username}
+                              </h4>
+                              <div className="text-xs text-stone-400 font-mono mb-3 truncate max-w-full">
+                                @{activeDmSession.discord_username}
+                              </div>
+                              <div className="w-full pt-3 border-t border-stone-800/80 space-y-2 text-left text-xs">
+                                <div>
+                                  <span className="text-[10px] text-stone-500 block uppercase font-mono">ステータス</span>
+                                  <div className="flex items-center gap-1.5 text-[11px] font-medium text-stone-300">
+                                    <span className={`w-2 h-2 rounded-full ${dmStatusColor}`} />
+                                    <span>{dmStatusLabel}</span>
+                                    {dmActivity && <span className="text-stone-500 text-[10px] truncate">({dmActivity})</span>}
+                                  </div>
+                                </div>
+                                <div>
+                                  <span className="text-[10px] text-stone-500 block uppercase font-mono">Discord ID</span>
+                                  <span className="font-mono text-stone-300 text-[11px] select-all break-all">{activeDmSession.discord_user_id}</span>
+                                </div>
+                                <div>
+                                  <span className="text-[10px] text-stone-500 block uppercase font-mono">通信保護</span>
+                                  <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
+                                    <Lock className="w-3 h-3" /> E2E 暗号化保存
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="space-y-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedProfileMember({
+                                    kind: 'discord',
+                                    member: {
+                                      id: activeDmSession.discord_user_id,
+                                      username: activeDmSession.discord_username,
+                                      displayName: activeDmSession.discord_display_name,
+                                      avatarUrl: activeDmSession.discord_avatar_url,
+                                    }
+                                  });
+                                }}
+                                className="w-full py-2 px-3 rounded-xl bg-stone-900 border border-stone-800 hover:border-indigo-500/50 hover:bg-stone-800/80 text-stone-200 text-xs font-medium flex items-center justify-center gap-2 transition"
+                              >
+                                <User className="w-3.5 h-3.5 text-indigo-400" />
+                                プロフィール詳細を表示
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteDmSession(activeDmSession.id, activeDmSession.discord_display_name || activeDmSession.discord_username)}
+                                className="w-full py-2 px-3 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-xs font-medium flex items-center justify-center gap-2 transition"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                DM履歴を削除
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })()
                     );
                   })()
                 ) : (
