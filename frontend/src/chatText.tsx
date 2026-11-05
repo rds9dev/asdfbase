@@ -140,6 +140,8 @@ export interface RenderOptions {
   onMessageLink?: (id: number) => void;
   // メモリンク (…/#memo-3) ジャンプ
   onMemoLink?: (slot: number) => void;
+  // メンションクリックでbioを開く
+  onMentionClick?: (username: string) => void;
   token?: string;
 }
 
@@ -405,11 +407,19 @@ export function renderMessageText(content: string, opts: RenderOptions, emojiSiz
       if (matchedName) {
         const isDiscordUser = Boolean(opts.discordUsernames?.has(matchedName));
         const isMe = matchedName === opts.me || matchedName.toLowerCase() === 'everyone';
+        const isClickable = Boolean(opts.onMentionClick && matchedName.toLowerCase() !== 'everyone' && matchedName.toLowerCase() !== 'here');
         out.push(
-          <span key={i++} className={`mention-pill ${isMe ? 'mention-me' : isDiscordUser ? 'mention-discord' : ''}`}>
+          <button
+            key={i++}
+            type="button"
+            onClick={isClickable ? (e) => { e.stopPropagation(); opts.onMentionClick!(matchedName!); } : undefined}
+            disabled={!isClickable}
+            title={isClickable ? `@${matchedName} のプロフィールを表示` : `@${matchedName}`}
+            className={`mention-pill ${isMe ? 'mention-me' : isDiscordUser ? 'mention-discord' : ''} ${isClickable ? 'cursor-pointer hover:underline active:scale-95 transition-transform' : 'cursor-default'}`}
+          >
             @{matchedName}
             {isDiscordUser && <span className="ml-0.5 text-[8px] font-mono px-0.5 rounded bg-indigo-500/30 text-indigo-200">DC</span>}
-          </span>
+          </button>
         );
         cursor += 1 + matchedName.length;
         continue;

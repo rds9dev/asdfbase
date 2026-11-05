@@ -28,6 +28,7 @@ import {
   Camera,
   LogOut,
   Send,
+  CornerDownRight,
   Hash,
   ShieldAlert,
   Mic,
@@ -1033,7 +1034,11 @@ export default function App() {
   const noteSyncTimerRef = useRef<any>(null);
   const handleFetchTimetablesRef = useRef<() => void>(() => {});
 
-  const scrollToBottom = () => scheduleScrollToBottom(true);
+  const scrollToBottom = () => {
+    setNewBelowCount(0);
+    setUnreadAnchor(null);
+    scheduleScrollToBottom(true);
+  };
 
   // 過去ログ読み込み後にスクロール位置を維持
   useLayoutEffect(() => {
@@ -1310,7 +1315,16 @@ export default function App() {
         dmChatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
       }, 50);
     } catch (err: any) {
-      toast(err.message || 'DM送信に失敗しました', { kind: 'error' });
+      const errMsg = err?.message || 'DM送信に失敗しました';
+      if (errMsg.includes('プライバシー設定') || errMsg.includes('50278') || errMsg.includes('50007') || errMsg.includes('mutual guilds')) {
+        await confirmDialog({
+          title: 'Discord DM送信エラー',
+          message: errMsg,
+          confirmLabel: '確認した',
+        });
+      } else {
+        toast(errMsg, { kind: 'error' });
+      }
       setDmInputText(textToSend);
       setDmAttachments(attsToSend);
     } finally {
@@ -1602,6 +1616,8 @@ export default function App() {
   // 未読数と既読位置 (サーバー ⇔ この端末) を取り直す。最新のメッセージIDを返す
   const unreadCountsRef = useRef(unreadCounts);
   unreadCountsRef.current = unreadCounts;
+  const mentionCountsRef = useRef(mentionCounts);
+  mentionCountsRef.current = mentionCounts;
   const refreshUnreadCounts = async (): Promise<number | null> => {
     const tk = tokenRef.current;
     if (!tk) return null;
@@ -2382,8 +2398,13 @@ export default function App() {
   useEffect(() => {
     if (!token || !activeChannelId) return;
     const channelId = activeChannelId;
+    const hasUnread = (unreadCountsRef.current[channelId] || 0) > 0 || (mentionCountsRef.current[channelId] || 0) > 0;
     const anchorId = lastReadMessageIdsRef.current[channelId] || 0;
-    setUnreadAnchor({ channelId, lastReadId: anchorId });
+    if (hasUnread && anchorId > 0) {
+      setUnreadAnchor({ channelId, lastReadId: anchorId });
+    } else {
+      setUnreadAnchor(null);
+    }
     setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
     setMentionCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
     setNewBelowCount(0);
@@ -2451,7 +2472,12 @@ export default function App() {
     chatScrollTopRef.current = el.scrollTop;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     isNearBottomRef.current = nearBottom && !hasNewerRef.current;
-    if (nearBottom && newBelowCount > 0 && !hasNewerMessages) setNewBelowCount(0);
+    if (nearBottom && !hasNewerMessages) {
+      if (newBelowCount > 0) setNewBelowCount(0);
+      if (unreadAnchor && unreadAnchor.channelId === activeChannelIdRef.current) {
+        setUnreadAnchor(null);
+      }
+    }
     // 最上端付近での過去ログ読み込み (過剰フェッチ・スクロール時の急激な雪だるまロードを防止)
     if (el.scrollTop < 20 && hasMoreMessages && !isLoadingMoreMessages && !chatSearchQuery) {
       handleLoadMoreMessages();
@@ -5205,7 +5231,20 @@ export default function App() {
   const dateText = `${now.getMonth() + 1}/${now.getDate()}(${DAY_LABELS[now.getDay()]})`;
   const showNotifyBanner = notifyPermission === 'default' && !notifyBannerDismissed && (notifyPrefs.important || notifyPrefs.messages);
   const userById = new Map(onlineUsers.map(u => [u.id, u]));
-  const knownUsernames = new Set(onlineUsers.map(u => u.username));
+  const knownUsernames = useMemo(() => {
+    const set = new Set<string>();
+    for (const u of onlineUsers) {
+      if (u.username) set.add(u.username);
+    }
+    for (const srv of discordServers) {
+      for (const m of (srv.members || [])) {
+        if (m.displayName) set.add(m.displayName);
+        if (m.username) set.add(m.username);
+        if (m.globalName) set.add(m.globalName);
+      }
+    }
+    return set;
+  }, [onlineUsers, discordServers]);
   const channelByName = new Map(channels.filter(c => c.type !== 'voice').map(c => [c.name, c.id]));
   const typingHere = Object.entries(typingUsers).filter(([, v]) => v.channelId === activeChannelId).map(([, v]) => v.username);
   // 今日・明日が期限で、まだやっていない自分のクラスの宿題
@@ -5304,6 +5343,37 @@ export default function App() {
       isBot: Boolean(m.is_bot),
     };
     setSelectedProfileMember({ kind: 'discord', member: syntheticDc });
+  };
+
+  const openUserProfileByName = (rawName: string) => {
+    const clean = rawName.replace(/^@/, '').trim();
+    if (!clean) return;
+    const asdfUser = onlineUsers.find(u => u.username.toLowerCase() === clean.toLowerCase());
+    if (asdfUser) {
+      setSelectedProfileMember({ kind: 'asdf', user: asdfUser });
+      return;
+    }
+    for (const srv of discordServers) {
+      for (const dm of (srv.members || [])) {
+        if (
+          (dm.displayName && dm.displayName.toLowerCase() === clean.toLowerCase()) ||
+          (dm.username && dm.username.toLowerCase() === clean.toLowerCase()) ||
+          (dm.globalName && dm.globalName.toLowerCase() === clean.toLowerCase())
+        ) {
+          setSelectedProfileMember({ kind: 'discord', member: dm });
+          return;
+        }
+      }
+    }
+    setSelectedProfileMember({
+      kind: 'asdf',
+      user: {
+        id: -1,
+        username: clean,
+        role: 'member',
+        status: 'offline',
+      },
+    });
   };
 
   const canWriteActiveChannel = (() => {
@@ -5886,16 +5956,18 @@ export default function App() {
                     }}
                     title="ダイレクトメッセージ (DM)"
                     className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group ${
-                      selectedServerId === 'dm'
+                      selectedServerId === 'dm' && !selectedDmSessionId
                         ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-600 text-white'
                         : 'bg-[#14161C] hover:bg-indigo-600 hover:text-white hover:rounded-xl text-stone-400 border border-stone-800/80'
                     }`}
                   >
-                    {selectedServerId === 'dm' ? (
+                    {selectedServerId === 'dm' && !selectedDmSessionId ? (
                       <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-indigo-400" />
                     ) : totalDmUnread > 0 ? (
                       <span className="absolute -left-1.5 w-1 h-2.5 rounded-r bg-white" />
-                    ) : null}
+                    ) : (
+                      <span className="absolute -left-1.5 w-1 h-0 rounded-r bg-white opacity-0 group-hover:h-2.5 group-hover:opacity-100 transition-all duration-200" />
+                    )}
                     <MessageSquare className="w-4 h-4" />
                     {totalDmUnread > 0 && (
                       <span className="absolute -top-1 -right-1 px-1 min-w-[16px] h-4 rounded-full bg-rose-500 text-white text-[9px] font-bold flex items-center justify-center ring-2 ring-[#08090B]">
@@ -5903,6 +5975,53 @@ export default function App() {
                       </span>
                     )}
                   </button>
+
+                  {/* DM相手のアバター一覧 (Discord風 DM通知レール) */}
+                  {dmSessions.map(session => {
+                    const isSelected = selectedServerId === 'dm' && selectedDmSessionId === session.id;
+                    const unread = session.unread_count || 0;
+                    const name = session.discord_display_name || session.discord_username;
+                    return (
+                      <button
+                        key={session.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedServerId('dm');
+                          setSelectedDmSessionId(session.id);
+                        }}
+                        title={`DM: ${name}${unread > 0 ? ` (${unread}件の未読)` : ''}`}
+                        className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group cursor-pointer ${
+                          isSelected
+                            ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
+                            : 'bg-[#14161C] hover:rounded-xl border border-stone-800/80 hover:border-indigo-400/50'
+                        }`}
+                      >
+                        {isSelected ? (
+                          <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-indigo-400" />
+                        ) : unread > 0 ? (
+                          <span className="absolute -left-1.5 w-1 h-2.5 rounded-r bg-white" />
+                        ) : (
+                          <span className="absolute -left-1.5 w-1 h-0 rounded-r bg-white opacity-0 group-hover:h-2.5 group-hover:opacity-100 transition-all duration-200" />
+                        )}
+                        {session.discord_avatar_url ? (
+                          <img
+                            src={toProxiedMediaUrl(session.discord_avatar_url, token)}
+                            alt=""
+                            className="w-full h-full rounded-[inherit] object-cover pointer-events-none"
+                          />
+                        ) : (
+                          <div className="w-full h-full rounded-[inherit] bg-stone-800 flex items-center justify-center text-xs font-bold text-stone-300">
+                            {name.slice(0, 1)}
+                          </div>
+                        )}
+                        {unread > 0 && (
+                          <span className="absolute -top-1 -right-1 px-1 min-w-[16px] h-4 rounded-full bg-rose-500 text-white text-[9px] font-bold flex items-center justify-center ring-2 ring-[#08090B] anim-badge">
+                            {unread > 99 ? '99+' : unread}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
 
                   <div className="w-6 h-[1px] bg-stone-800 my-0.5 shrink-0" />
 
@@ -5948,7 +6067,9 @@ export default function App() {
                           <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-indigo-400" />
                         ) : srvUnread > 0 ? (
                           <span className="absolute -left-1.5 w-1 h-2.5 rounded-r bg-white" />
-                        ) : null}
+                        ) : (
+                          <span className="absolute -left-1.5 w-1 h-0 rounded-r bg-white opacity-0 group-hover:h-2.5 group-hover:opacity-100 transition-all duration-200" />
+                        )}
                         {srv.iconUrl ? (
                           <img
                             src={toProxiedMediaUrl(srv.iconUrl, token)}
@@ -6247,15 +6368,18 @@ export default function App() {
                             {!isCollapsed && (
                               <div className="space-y-0.5">
                                 {group.channels.map((ch, idx, textChannels) => {
+                                  const binding = bindingByAsdfId.get(ch.id);
+                                  const isThread = ch.type === 'thread' || Boolean(binding && (binding as any).isThread) || ch.name.startsWith('ticket-') || ch.name.startsWith('closed-');
                                   const isActiveCh = activeChannelId === ch.id;
                                   const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0);
                                   const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0);
-                                  const binding = bindingByAsdfId.get(ch.id);
                                   const hasRoleRestriction = (Array.isArray(ch.view_roles) && ch.view_roles.length > 0) || (Array.isArray(ch.write_roles) && ch.write_roles.length > 0);
                                   return (
                                     <div
                                       key={ch.id}
-                                      className={`group relative flex items-center justify-between pl-2.5 pr-1.5 py-1.5 rounded-lg text-sm transition ${
+                                      className={`group relative flex items-center justify-between pr-1.5 py-1.5 rounded-lg text-sm transition ${
+                                        isThread ? 'ml-3 pl-2 border-l border-stone-800' : 'pl-2.5'
+                                      } ${
                                         isActiveCh
                                           ? 'bg-amber-500/15 text-amber-300 font-bold'
                                           : unread > 0
@@ -6273,8 +6397,17 @@ export default function App() {
                                         onClick={() => setActiveChannelId(ch.id)}
                                         className="flex items-center gap-1.5 flex-1 text-left min-w-0"
                                       >
-                                        <Hash className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : binding ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
+                                        {isThread ? (
+                                          <CornerDownRight className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-500'}`} />
+                                        ) : (
+                                          <Hash className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : binding ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
+                                        )}
                                         <span className="truncate flex-1">{ch.name}</span>
+                                        {isThread && (
+                                          <span className="text-[9px] px-1 py-0.2 rounded bg-stone-800/80 text-stone-400 font-mono shrink-0">
+                                            スレッド
+                                          </span>
+                                        )}
                                         {binding && (
                                           <span
                                             className="shrink-0 flex items-center justify-center p-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
@@ -6500,6 +6633,50 @@ export default function App() {
                       );
                     })()}
                   </div>
+
+                  {/* Discord風 ユーザーコントロールバー (左下) */}
+                  <div className="shrink-0 h-13 px-2 py-1.5 bg-[#090A0D] border-t border-stone-800/80 flex items-center justify-between gap-1 select-none">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (currentUser) setSelectedProfileMember({ kind: 'asdf', user: currentUser });
+                      }}
+                      className="flex items-center gap-2 p-1 rounded-lg hover:bg-stone-800/80 transition min-w-0 flex-1 text-left cursor-pointer group"
+                      title="プロフィールを表示"
+                    >
+                      <div className="relative shrink-0">
+                        {currentUser?.avatar_url ? (
+                          <img
+                            src={toProxiedMediaUrl(currentUser.avatar_url, token)}
+                            alt=""
+                            className="w-8 h-8 rounded-full object-cover"
+                          />
+                        ) : (
+                          <div className="w-8 h-8 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center justify-center font-bold text-xs">
+                            {currentUser?.username?.slice(0, 1)?.toUpperCase() || '?'}
+                          </div>
+                        )}
+                        <span className="absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full bg-emerald-500 ring-2 ring-[#090A0D]" title="オンライン" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-bold text-stone-200 truncate group-hover:text-white">
+                          {currentUser?.username}
+                        </div>
+                        <div className="text-[10px] text-stone-500 truncate font-mono">
+                          {currentUser?.role === 'admin' ? '管理者' : 'メンバー'}
+                        </div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('settings')}
+                      className="p-2 rounded-lg text-stone-400 hover:text-white hover:bg-stone-800/80 transition shrink-0 cursor-pointer"
+                      title="設定"
+                    >
+                      <Settings className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               );
             })()}
@@ -6573,6 +6750,18 @@ export default function App() {
                         </div>
 
                         <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => setIsMembersCollapsed(!isMembersCollapsed)}
+                            className={`p-1.5 rounded-lg border transition ${
+                              !isMembersCollapsed
+                                ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/40'
+                                : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-white hover:border-stone-600'
+                            }`}
+                            title={isMembersCollapsed ? 'プロフィールを表示' : 'プロフィールを隠す'}
+                          >
+                            <User className="w-4 h-4" />
+                          </button>
                           <button
                             type="button"
                             onClick={() => handleDeleteDmSession(currentDmSession.id, currentDmSession.discord_display_name || currentDmSession.discord_username)}
@@ -7411,6 +7600,7 @@ export default function App() {
                                           token,
                                           customEmojis: customEmojisMap,
                                           discordUsernames,
+                                          onMentionClick: openUserProfileByName,
                                         }}
                                       />
                                     </div>
@@ -7913,9 +8103,92 @@ export default function App() {
             </section>
             )}
 
-            {/* Right: Members Sidebar */}
+            {/* Right: Members Sidebar または DMプロフィール */}
             {!isMembersCollapsed && (
-              <aside className="absolute lg:static inset-y-0 right-0 z-40 w-60 lg:w-56 border-l border-stone-800 bg-[#0C0D10] p-3 flex flex-col shrink-0 min-h-0 overflow-y-auto anim-slide-right lg:animate-none shadow-2xl lg:shadow-none">
+              <aside className="absolute lg:static inset-y-0 right-0 z-40 w-64 lg:w-60 border-l border-stone-800 bg-[#0C0D10] p-3 flex flex-col shrink-0 min-h-0 overflow-y-auto anim-slide-right lg:animate-none shadow-2xl lg:shadow-none">
+                {selectedServerId === 'dm' ? (
+                  (() => {
+                    const activeDmSession = dmSessions.find(s => s.id === selectedDmSessionId);
+                    if (!activeDmSession) {
+                      return (
+                        <div className="flex-1 flex flex-col items-center justify-center p-4 text-center text-xs text-stone-500">
+                          <MessageSquare className="w-8 h-8 text-stone-600 mb-2" />
+                          <span>DMを選択すると相手の情報が表示されます</span>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div className="space-y-4">
+                        <div className="text-[10px] uppercase tracking-wider text-indigo-400 font-extrabold flex items-center justify-between px-1">
+                          <span>ダイレクトメッセージ</span>
+                        </div>
+                        <div className="relative rounded-2xl bg-gradient-to-b from-indigo-950/30 to-[#12141B] border border-indigo-500/20 p-4 flex flex-col items-center text-center">
+                          <div className="relative mb-3">
+                            {activeDmSession.discord_avatar_url ? (
+                              <img
+                                src={toProxiedMediaUrl(activeDmSession.discord_avatar_url, token)}
+                                alt=""
+                                className="w-16 h-16 rounded-full object-cover shadow-lg border-2 border-indigo-500/30"
+                              />
+                            ) : (
+                              <div className="w-16 h-16 rounded-full bg-stone-800 flex items-center justify-center text-xl font-bold text-stone-200 border-2 border-indigo-500/30">
+                                {activeDmSession.discord_display_name?.slice(0, 1) || activeDmSession.discord_username?.slice(0, 1) || '?'}
+                              </div>
+                            )}
+                          </div>
+                          <h4 className="font-bold text-white text-base truncate max-w-full">
+                            {activeDmSession.discord_display_name || activeDmSession.discord_username}
+                          </h4>
+                          <div className="text-xs text-stone-400 font-mono mb-3 truncate max-w-full">
+                            @{activeDmSession.discord_username}
+                          </div>
+                          <div className="w-full pt-3 border-t border-stone-800/80 space-y-2 text-left text-xs">
+                            <div>
+                              <span className="text-[10px] text-stone-500 block uppercase font-mono">Discord ID</span>
+                              <span className="font-mono text-stone-300 text-[11px] select-all break-all">{activeDmSession.discord_user_id}</span>
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-stone-500 block uppercase font-mono">通信保護</span>
+                              <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
+                                <Lock className="w-3 h-3" /> E2E 暗号化保存
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedProfileMember({
+                                kind: 'discord',
+                                member: {
+                                  id: activeDmSession.discord_user_id,
+                                  username: activeDmSession.discord_username,
+                                  displayName: activeDmSession.discord_display_name,
+                                  avatarUrl: activeDmSession.discord_avatar_url,
+                                }
+                              });
+                            }}
+                            className="w-full py-2 px-3 rounded-xl bg-stone-900 border border-stone-800 hover:border-indigo-500/50 hover:bg-stone-800/80 text-stone-200 text-xs font-medium flex items-center justify-center gap-2 transition"
+                          >
+                            <User className="w-3.5 h-3.5 text-indigo-400" />
+                            プロフィール詳細を表示
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteDmSession(activeDmSession.id, activeDmSession.discord_display_name || activeDmSession.discord_username)}
+                            className="w-full py-2 px-3 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-xs font-medium flex items-center justify-center gap-2 transition"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            DM履歴を削除
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })()
+                ) : (
+                  <>
                 {/* 選択中のDiscordサーバーの人数・オンラインサマリー (右メンバー一覧の拡張) */}
                 {selectedServer && (
                   <div className="mb-3 p-2.5 rounded-xl bg-[#12141B] border border-indigo-500/25 shrink-0">
@@ -8119,6 +8392,8 @@ export default function App() {
                     );
                   })}
                 </div>
+                </>
+                )}
               </aside>
             )}
           </div>
@@ -8545,6 +8820,8 @@ export default function App() {
                             onMemoLink: slot => setSelectedSlotIndex(slot),
                             token,
                             customEmojis: customEmojisMap,
+                            discordUsernames,
+                            onMentionClick: openUserProfileByName,
                           }}
                         />
                       ) : (
@@ -8590,6 +8867,8 @@ export default function App() {
                               onMemoLink: slot => setSelectedSlotIndex(slot),
                               token,
                               customEmojis: customEmojisMap,
+                              discordUsernames,
+                              onMentionClick: openUserProfileByName,
                             }}
                           />
                         ) : (
@@ -8755,14 +9034,34 @@ export default function App() {
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] text-stone-400 block mb-1">締切日 *</label>
-                    <input
-                      type="date"
-                      required
-                      value={newAssignDeadline}
-                      onChange={e => setNewAssignDeadline(e.target.value)}
-                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
-                    />
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[10px] text-stone-400 block">締切日 *</label>
+                      <button
+                        type="button"
+                        onClick={() => setNewAssignDeadline(newAssignDeadline === '9999-12-31' ? '' : '9999-12-31')}
+                        className={`text-[10px] px-2 py-0.5 rounded transition ${
+                          newAssignDeadline === '9999-12-31'
+                            ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/40'
+                            : 'bg-stone-800 text-stone-400 hover:text-stone-200'
+                        }`}
+                      >
+                        {newAssignDeadline === '9999-12-31' ? '✓ 期限: 不明' : '期限を「不明」にする'}
+                      </button>
+                    </div>
+                    {newAssignDeadline === '9999-12-31' ? (
+                      <div className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-amber-400 font-mono text-xs flex items-center justify-between">
+                        <span>提出期限: 不明</span>
+                        <span className="text-[10px] text-stone-500">未定・不明設定</span>
+                      </div>
+                    ) : (
+                      <input
+                        type="date"
+                        required
+                        value={newAssignDeadline}
+                        onChange={e => setNewAssignDeadline(e.target.value)}
+                        className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                      />
+                    )}
                   </div>
                   <div>
                     <label className="text-[10px] text-stone-400 block mb-1">再提出締切日</label>
@@ -8931,17 +9230,21 @@ export default function App() {
                         </div>
 
                         <div className="flex flex-wrap items-center gap-4 text-xs font-mono text-stone-400">
-                          <div>締切: <span className="text-stone-200 font-bold">{new Date(item.deadline).toLocaleDateString()}</span>
-                            {(() => {
-                              const days = Math.ceil((new Date(item.deadline).setHours(23, 59, 59) - now.getTime()) / 86400000);
-                              if (item.my_status === 'submitted' || item.my_status === 'passed') return null;
-                              return (
-                                <span className={`ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${days < 0 ? 'bg-red-500/20 text-red-300' : days <= 1 ? 'bg-amber-500/20 text-amber-300' : 'bg-stone-800 text-stone-400'}`}>
-                                  {days < 0 ? '期限切れ' : days === 0 ? '今日まで' : days === 1 ? '明日まで' : `あと${days}日`}
-                                </span>
-                              );
-                            })()}
-                          </div>
+                          {item.deadline && item.deadline.slice(0, 10) === '9999-12-31' ? (
+                            <div>締切: <span className="ml-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">期限: 不明</span></div>
+                          ) : (
+                            <div>締切: <span className="text-stone-200 font-bold">{new Date(item.deadline).toLocaleDateString()}</span>
+                              {(() => {
+                                const days = Math.ceil((new Date(item.deadline).setHours(23, 59, 59) - now.getTime()) / 86400000);
+                                if (item.my_status === 'submitted' || item.my_status === 'passed') return null;
+                                return (
+                                  <span className={`ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${days < 0 ? 'bg-red-500/20 text-red-300' : days <= 1 ? 'bg-amber-500/20 text-amber-300' : 'bg-stone-800 text-stone-400'}`}>
+                                    {days < 0 ? '期限切れ' : days === 0 ? '今日まで' : days === 1 ? '明日まで' : `あと${days}日`}
+                                  </span>
+                                );
+                              })()}
+                            </div>
+                          )}
                           {item.resubmit_deadline && (
                             <div>再提出締切: <span className="text-amber-300 font-bold">{new Date(item.resubmit_deadline).toLocaleDateString()}</span></div>
                           )}
@@ -12300,9 +12603,20 @@ export default function App() {
         </div>
       )}
 
-      {/* Ctrl+K コマンドパレット (キーボード操作 ↑/↓/Tab/Enter & 機能拡充) */}
+      {/* Ctrl+K コマンドパレット (Discord Quick Switcher 準拠の使いやすさ刷新) */}
       {isPaletteOpen && (() => {
-        const q = paletteQuery.toLowerCase().trim();
+        const rawQ = paletteQuery.trim();
+        const prefix = rawQ.startsWith('#')
+          ? '#'
+          : rawQ.startsWith('@')
+          ? '@'
+          : rawQ.startsWith('/')
+          ? '/'
+          : rawQ.startsWith('!')
+          ? '!'
+          : null;
+        const q = (prefix ? rawQ.slice(1) : rawQ).toLowerCase().trim();
+
         const tabItems = [
           { id: 'tab-chat', label: 'チャットへ移動', desc: '/chat', category: 'タブ', run: () => { setActiveTab('chat'); } },
           { id: 'tab-memo', label: 'リアルタイムメモへ移動', desc: '/memo', category: 'タブ', run: () => { setActiveTab('memo'); } },
@@ -12318,14 +12632,33 @@ export default function App() {
         const channelItems = channels.filter(c => c.type !== 'voice').map(c => {
           const srvId = resolveChannelServerId(c);
           const srv = discordServers.find(s => s.id === srvId);
+          const isThread = (c as any).isThread || c.type === 'thread';
           return {
             id: `ch-${c.id}`,
-            label: `#${c.name}`,
+            label: isThread ? `🧵 ${c.name}` : `#${c.name}`,
             desc: srv ? srv.name : 'チャンネル',
-            category: 'チャンネル',
+            category: isThread ? 'スレッド' : 'チャンネル',
+            badge: undefined as number | undefined,
             run: () => {
               if (srvId) setSelectedServerId(srvId);
               setActiveChannelId(c.id);
+              setActiveTab('chat');
+            }
+          };
+        });
+
+        const dmItems = dmSessions.map(s => {
+          const name = s.discord_display_name || s.discord_username;
+          const unread = s.unread_count || 0;
+          return {
+            id: `dm-${s.id}`,
+            label: `@${name}`,
+            desc: unread > 0 ? `未読 ${unread} 件` : `@${s.discord_username}`,
+            category: 'DM',
+            badge: unread > 0 ? unread : undefined,
+            run: () => {
+              setSelectedServerId('dm');
+              setSelectedDmSessionId(s.id);
               setActiveTab('chat');
             }
           };
@@ -12336,6 +12669,7 @@ export default function App() {
           label: `サーバー: ${s.name}`,
           desc: `オンライン ${s.onlineCount || 0}人`,
           category: 'サーバー',
+          badge: undefined as number | undefined,
           run: () => {
             setSelectedServerId(s.id);
             setActiveTab('chat');
@@ -12343,20 +12677,39 @@ export default function App() {
         }));
 
         const actionItems = [
-          { id: 'act-tt', label: '時間割モーダルを開く', desc: '今日の授業コマ・週予定確認', category: 'クイック操作', run: () => { setIsTimetableModalOpen(true); } },
-          { id: 'act-cam', label: 'カメラ小窓を切り替え', desc: 'ノートや黒板の確認', category: 'クイック操作', run: () => { setShowCamera(v => !v); } },
-          { id: 'act-read', label: '全チャンネルを既読にする', desc: 'Shift + Esc', category: 'クイック操作', run: () => { handleMarkAllRead(); } },
-          { id: 'act-sync', label: 'Discord未取得履歴を同期', desc: 'Botダウンタイム補完', category: 'クイック操作', run: () => { handleSyncDiscordHistory(selectedServer ? { guildId: selectedServer.id } : undefined); } },
+          { id: 'act-new-dm', label: '新しいDMを開始', desc: '!dm', category: 'クイック操作', badge: undefined as number | undefined, run: () => { setShowNewDmModal(true); } },
+          { id: 'act-tt', label: '時間割モーダルを開く', desc: '!timetable', category: 'クイック操作', badge: undefined as number | undefined, run: () => { setIsTimetableModalOpen(true); } },
+          { id: 'act-cam', label: 'カメラ小窓を切り替え', desc: '!camera', category: 'クイック操作', badge: undefined as number | undefined, run: () => { setShowCamera(v => !v); } },
+          { id: 'act-read', label: '全チャンネルを既読にする', desc: '!read (Shift+Esc)', category: 'クイック操作', badge: undefined as number | undefined, run: () => { handleMarkAllRead(); } },
+          { id: 'act-sync', label: 'Discord未取得履歴を同期', desc: '!sync', category: 'クイック操作', badge: undefined as number | undefined, run: () => { handleSyncDiscordHistory(selectedServer ? { guildId: selectedServer.id } : undefined); } },
         ];
 
-        const allItems = [...tabItems, ...actionItems, ...channelItems, ...serverItems];
+        let pool: typeof actionItems = [];
+        if (prefix === '#') {
+          pool = channelItems;
+        } else if (prefix === '@') {
+          pool = dmItems;
+        } else if (prefix === '/') {
+          pool = tabItems.map(t => ({ ...t, badge: undefined as number | undefined }));
+        } else if (prefix === '!') {
+          pool = actionItems;
+        } else {
+          pool = [
+            ...dmItems,
+            ...tabItems.map(t => ({ ...t, badge: undefined as number | undefined })),
+            ...actionItems,
+            ...channelItems,
+            ...serverItems,
+          ];
+        }
+
         const filteredItems = q
-          ? allItems.filter(item =>
+          ? pool.filter(item =>
               item.label.toLowerCase().includes(q) ||
               item.desc.toLowerCase().includes(q) ||
               item.category.toLowerCase().includes(q)
             )
-          : allItems.slice(0, 16);
+          : pool.slice(0, 24);
 
         const activeIndex = filteredItems.length > 0 ? ((paletteSelectedIndex % filteredItems.length) + filteredItems.length) % filteredItems.length : 0;
 
@@ -12367,11 +12720,11 @@ export default function App() {
               className="w-full max-w-xl bg-[#111214] border border-stone-800 rounded-2xl shadow-2xl overflow-hidden anim-pop font-mono text-xs max-h-[80vh] flex flex-col"
             >
               <div className="p-3 border-b border-stone-800 flex items-center gap-2 shrink-0">
-                <Command className="w-4 h-4 text-amber-400" />
+                <Command className="w-4 h-4 text-amber-400 shrink-0" />
                 <input
                   autoFocus
                   type="text"
-                  placeholder="チャンネル名・タブ・操作・計算式 (例: #雑談, /memo, 12 * 85)"
+                  placeholder="チャンネル・DM・コマンド・計算 (例: #雑談, @ユーザー, /memo, 12 * 85)"
                   value={paletteQuery}
                   onChange={e => {
                     handlePaletteInput(e.target.value);
@@ -12398,7 +12751,42 @@ export default function App() {
                   }}
                   className="w-full bg-transparent text-white focus:outline-none placeholder-stone-600 text-sm"
                 />
-                <span className="text-[10px] text-stone-500 border border-stone-800 px-1.5 py-0.5 rounded">↑↓ / Tab / Enter</span>
+                <span className="text-[10px] text-stone-500 border border-stone-800 px-1.5 py-0.5 rounded shrink-0 hidden sm:inline-block">↑↓ / Tab / Enter</span>
+              </div>
+
+              {/* プレフィックスフィルターバッジ */}
+              <div className="px-3 py-1.5 border-b border-stone-800/60 bg-[#0C0D10]/50 flex items-center gap-1.5 overflow-x-auto shrink-0 text-[11px]">
+                <span className="text-stone-500 text-[10px] mr-1">絞り込み:</span>
+                {[
+                  { prefix: '#', label: 'チャンネル', color: 'hover:text-amber-400 hover:border-amber-500/40' },
+                  { prefix: '@', label: 'DM', color: 'hover:text-indigo-400 hover:border-indigo-500/40' },
+                  { prefix: '/', label: 'タブ', color: 'hover:text-emerald-400 hover:border-emerald-500/40' },
+                  { prefix: '!', label: 'クイック操作', color: 'hover:text-sky-400 hover:border-sky-500/40' },
+                ].map(b => {
+                  const isActive = prefix === b.prefix;
+                  return (
+                    <button
+                      key={b.prefix}
+                      type="button"
+                      onClick={() => {
+                        if (isActive) {
+                          setPaletteQuery('');
+                        } else {
+                          setPaletteQuery(b.prefix);
+                        }
+                        setPaletteSelectedIndex(0);
+                      }}
+                      className={`px-2 py-0.5 rounded-lg border transition text-[10px] font-mono flex items-center gap-1 ${
+                        isActive
+                          ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 font-bold'
+                          : `bg-stone-900 border-stone-800 text-stone-400 ${b.color}`
+                      }`}
+                    >
+                      <span>{b.prefix}</span>
+                      <span>{b.label}</span>
+                    </button>
+                  );
+                })}
               </div>
 
               {/* 計算機結果 */}
@@ -12424,7 +12812,14 @@ export default function App() {
                     return (
                       <button
                         key={item.id}
-                        onMouseEnter={() => setPaletteSelectedIndex(idx)}
+                        ref={el => {
+                          if (isSelected && el) {
+                            el.scrollIntoView({ block: 'nearest' });
+                          }
+                        }}
+                        onMouseMove={() => {
+                          if (paletteSelectedIndex !== idx) setPaletteSelectedIndex(idx);
+                        }}
                         onClick={() => {
                           item.run();
                           setIsPaletteOpen(false);
@@ -12437,10 +12832,21 @@ export default function App() {
                         }`}
                       >
                         <div className="flex items-center gap-2 min-w-0">
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-stone-800 text-stone-400 font-mono shrink-0">
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono shrink-0 ${
+                            item.category === 'DM'
+                              ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
+                              : item.category === 'スレッド'
+                              ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
+                              : 'bg-stone-800 text-stone-400'
+                          }`}>
                             {item.category}
                           </span>
                           <span className="truncate font-medium">{item.label}</span>
+                          {item.badge != null && (
+                            <span className="px-1.5 py-0.2 rounded-full bg-red-500 text-white text-[9px] font-bold">
+                              {item.badge}
+                            </span>
+                          )}
                         </div>
                         <span className="text-stone-500 text-[10px] shrink-0 ml-2">{item.desc}</span>
                       </button>
@@ -12879,14 +13285,37 @@ export default function App() {
                   </select>
                 </div>
                 <div>
-                  <label className="text-[10px] text-stone-400 block mb-1">提出締切日 *</label>
-                  <input
-                    type="date"
-                    required
-                    value={editingAssignment.deadline ? editingAssignment.deadline.slice(0, 10) : ''}
-                    onChange={e => setEditingAssignment({ ...editingAssignment, deadline: e.target.value })}
-                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
-                  />
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[10px] text-stone-400 block">提出締切日 *</label>
+                    <button
+                      type="button"
+                      onClick={() => setEditingAssignment({
+                        ...editingAssignment,
+                        deadline: (editingAssignment.deadline?.slice(0, 10) === '9999-12-31') ? '' : '9999-12-31'
+                      })}
+                      className={`text-[10px] px-2 py-0.5 rounded transition ${
+                        editingAssignment.deadline?.slice(0, 10) === '9999-12-31'
+                          ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/40'
+                          : 'bg-stone-800 text-stone-400 hover:text-stone-200'
+                      }`}
+                    >
+                      {editingAssignment.deadline?.slice(0, 10) === '9999-12-31' ? '✓ 期限: 不明' : '期限を「不明」にする'}
+                    </button>
+                  </div>
+                  {editingAssignment.deadline?.slice(0, 10) === '9999-12-31' ? (
+                    <div className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-amber-400 font-mono text-xs flex items-center justify-between">
+                      <span>提出期限: 不明</span>
+                      <span className="text-[10px] text-stone-500">未定・不明設定</span>
+                    </div>
+                  ) : (
+                    <input
+                      type="date"
+                      required
+                      value={editingAssignment.deadline ? editingAssignment.deadline.slice(0, 10) : ''}
+                      onChange={e => setEditingAssignment({ ...editingAssignment, deadline: e.target.value })}
+                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                    />
+                  )}
                 </div>
               </div>
 
@@ -12981,7 +13410,11 @@ export default function App() {
                           <span className="font-bold text-white text-sm">{targetAssignment.title}</span>
                         </div>
                         <div className="text-[11px] text-stone-400">
-                          締切: {new Date(targetAssignment.deadline).toLocaleDateString()}
+                          締切: {targetAssignment.deadline?.slice(0, 10) === '9999-12-31' ? (
+                            <span className="font-bold text-amber-300">期限: 不明</span>
+                          ) : (
+                            new Date(targetAssignment.deadline).toLocaleDateString()
+                          )}
                         </div>
                         {/* 進捗プログレスバー */}
                         <div className="mt-2.5 space-y-1">

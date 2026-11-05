@@ -30,7 +30,8 @@ interface Props {
 
 type ClassView = number | 'all';
 
-function dueLabel(days: number) {
+function dueLabel(days: number, dueDate?: string) {
+  if (dueDate === '9999-12-31') return { text: '期限: 不明', cls: 'bg-stone-800 text-stone-400 border-stone-700' };
   if (days < 0) return { text: `${-days}日過ぎ`, cls: 'bg-red-500/20 text-red-300 border-red-500/30' };
   if (days === 0) return { text: '今日まで', cls: 'bg-amber-500/25 text-amber-200 border-amber-500/40' };
   if (days === 1) return { text: '明日まで', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/30' };
@@ -81,9 +82,14 @@ export default function HomeworkTab({ token, safeFetch, currentUser, users, home
   // 期限ごとにまとめる
   const groups: { key: string; title: string; items: Homework[] }[] = [];
   for (const h of pending) {
+    const isUnknown = h.due_date === '9999-12-31';
     const d = daysFromToday(h.due_date);
-    const key = d < 0 ? 'overdue' : h.due_date;
-    const title = d < 0 ? '期限が過ぎた宿題' : `${shortDateLabel(h.due_date)}${d === 0 ? ' · 今日' : d === 1 ? ' · 明日' : ''}`;
+    const key = isUnknown ? 'unknown' : d < 0 ? 'overdue' : h.due_date;
+    const title = isUnknown
+      ? '提出期限 : 不明'
+      : d < 0
+      ? '期限が過ぎた宿題'
+      : `${shortDateLabel(h.due_date)}${d === 0 ? ' · 今日' : d === 1 ? ' · 明日' : ''}`;
     const g = groups.find(x => x.key === key);
     if (g) g.items.push(h);
     else groups.push({ key, title, items: [h] });
@@ -162,8 +168,9 @@ export default function HomeworkTab({ token, safeFetch, currentUser, users, home
   };
 
   const renderItem = (h: Homework) => {
+    const isUnknown = h.due_date === '9999-12-31';
     const days = daysFromToday(h.due_date);
-    const due = dueLabel(days);
+    const due = dueLabel(days, h.due_date);
     const isEditing = editing?.id === h.id;
     return (
       <div
@@ -186,7 +193,7 @@ export default function HomeworkTab({ token, safeFetch, currentUser, users, home
 
         {isEditing ? (
           <div className="flex-1 min-w-0 space-y-2 text-xs">
-            <div className="flex flex-wrap gap-2">
+            <div className="flex flex-wrap gap-2 items-center">
               <select
                 value={editing.subject}
                 onChange={e => setEditing({ ...editing, subject: e.target.value })}
@@ -196,10 +203,22 @@ export default function HomeworkTab({ token, safeFetch, currentUser, users, home
               </select>
               <input
                 type="date"
-                value={editing.due}
+                disabled={editing.due === '9999-12-31'}
+                value={editing.due === '9999-12-31' ? '' : editing.due}
                 onChange={e => setEditing({ ...editing, due: e.target.value })}
-                className="bg-[#16181D] border border-stone-800 rounded-lg px-2 py-1.5 text-white"
+                className="bg-[#16181D] border border-stone-800 rounded-lg px-2 py-1.5 text-white disabled:opacity-40"
               />
+              <button
+                type="button"
+                onClick={() => setEditing({ ...editing, due: editing.due === '9999-12-31' ? nextLesson?.date || '' : '9999-12-31' })}
+                className={`px-2 py-1 rounded-lg border text-xs font-bold transition ${
+                  editing.due === '9999-12-31'
+                    ? 'bg-amber-500 text-black border-amber-400'
+                    : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-white'
+                }`}
+              >
+                期限: 不明
+              </button>
             </div>
             <input
               autoFocus
@@ -222,7 +241,7 @@ export default function HomeworkTab({ token, safeFetch, currentUser, users, home
             <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
               <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-amber-400 font-bold">{h.subject}</span>
               {!h.my_done && <span className={`px-1.5 py-0.5 rounded-md border font-bold ${due.cls}`}>{due.text}</span>}
-              <span className="text-stone-500">{shortDateLabel(h.due_date)}まで</span>
+              <span className="text-stone-500">{isUnknown ? '提出期限: 不明' : `${shortDateLabel(h.due_date)}まで`}</span>
               {view === 'all' && <span className="text-stone-600">{h.class_no ? `${h.class_no}組` : '全クラス'}</span>}
             </div>
             <div className={`mt-1 text-sm whitespace-pre-wrap break-words ${h.my_done ? 'text-stone-500 line-through' : 'text-stone-100'}`}>{h.content}</div>
@@ -330,16 +349,28 @@ export default function HomeworkTab({ token, safeFetch, currentUser, users, home
             <span>期限:</span>
             <input
               type="date"
-              value={shownDue}
+              disabled={dueOverride === '9999-12-31'}
+              value={dueOverride === '9999-12-31' ? '' : shownDue}
               onChange={e => setDueOverride(e.target.value)}
-              className="bg-[#16181D] border border-stone-800 rounded-lg px-2 py-1 text-white"
+              className="bg-[#16181D] border border-stone-800 rounded-lg px-2 py-1 text-white disabled:opacity-40"
             />
-            {!dueOverride && nextLesson && (
+            <button
+              type="button"
+              onClick={() => setDueOverride(dueOverride === '9999-12-31' ? '' : '9999-12-31')}
+              className={`px-2.5 py-1 rounded-lg border text-xs font-bold transition ${
+                dueOverride === '9999-12-31'
+                  ? 'bg-amber-500 text-black border-amber-400'
+                  : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-white'
+              }`}
+            >
+              提出期限: 不明
+            </button>
+            {dueOverride !== '9999-12-31' && !dueOverride && nextLesson && (
               <span className="text-stone-500">
                 {nextLesson.fromTimetable ? `次の${subject}の授業 (${formClass ?? 1}組の時間割)` : '時間割に無いので次の平日'}
               </span>
             )}
-            {dueOverride && (
+            {dueOverride && dueOverride !== '9999-12-31' && (
               <button type="button" onClick={() => setDueOverride('')} className="text-stone-500 hover:text-white underline">
                 次の授業日に戻す
               </button>

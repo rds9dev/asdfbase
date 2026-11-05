@@ -1103,12 +1103,45 @@ app.post('/api/channels/unread-counts', authMiddleware, async (req, res) => {
        LEFT JOIN r ON r.ch = m.channel_id
        LEFT JOIN messages p ON p.id = m.reply_to_id
        GROUP BY m.channel_id`, [channelIds, lastReadIds, req.user.id, `@${req.user.username}`]);
+        // 暗号化メッセージのメンション判定 (暗号化によりSQL POSITIONでマッチしなかった未読を安全に補完)
+        const mentionsMap = {};
+        for (const r of result.rows) {
+            mentionsMap[r.channel_id] = Number(r.mentions);
+        }
+        const unreadChannelRows = result.rows.filter(r => Number(r.unread) > 0);
+        if (unreadChannelRows.length > 0) {
+            const targetChIds = unreadChannelRows.map(r => r.channel_id);
+            const unreadMsgsRes = await db_js_1.pool.query(`SELECT m.id, m.channel_id, m.content, m.reply_to_id, p.user_id as reply_user_id
+         FROM messages m
+         LEFT JOIN messages p ON p.id = m.reply_to_id
+         LEFT JOIN (
+           SELECT ch, MAX(lr) AS last_read FROM (
+             SELECT unnest($1::int[]) AS ch, unnest($2::int[]) AS lr
+             UNION ALL
+             SELECT channel_id, last_read_id FROM channel_reads WHERE user_id = $3
+           ) x GROUP BY ch
+         ) r ON r.ch = m.channel_id
+         WHERE m.channel_id = ANY($4::int[]) AND r.last_read IS NOT NULL AND m.id > r.last_read AND m.user_id IS DISTINCT FROM $3
+         ORDER BY m.id DESC LIMIT 100`, [channelIds, lastReadIds, req.user.id, targetChIds]);
+            const mentionTarget = `@${req.user.username}`;
+            const chMentionCounts = {};
+            for (const m of unreadMsgsRes.rows) {
+                const decryptedContent = (0, crypto_js_1.decryptMessageContent)(m.content, m.channel_id);
+                const isMention = decryptedContent.includes(mentionTarget) || decryptedContent.includes('@everyone') || m.reply_user_id === req.user.id;
+                if (isMention) {
+                    chMentionCounts[m.channel_id] = (chMentionCounts[m.channel_id] || 0) + 1;
+                }
+            }
+            for (const [chId, count] of Object.entries(chMentionCounts)) {
+                mentionsMap[Number(chId)] = Math.max(mentionsMap[Number(chId)] || 0, count);
+            }
+        }
         res.json(result.rows.map(r => ({
             channelId: r.channel_id,
             lastMessageId: Number(r.last_message_id),
             lastReadId: r.last_read == null ? null : Number(r.last_read),
             unread: Number(r.unread),
-            mentions: Number(r.mentions),
+            mentions: mentionsMap[r.channel_id] ?? Number(r.mentions),
         })));
     }
     catch (err) {

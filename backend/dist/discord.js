@@ -485,6 +485,8 @@ async function getDiscordServers(includeUnapproved = false) {
                         const parent = channel.parent;
                         const parentPos = parent ? ((parent.rawPosition ?? parent.position) ?? 0) : 999;
                         const chPos = (channel.rawPosition ?? channel.position) ?? 0;
+                        const isThread = Boolean((typeof channel.isThread === 'function' && channel.isThread()) ||
+                            chType === 10 || chType === 11 || chType === 12);
                         textChannels.push({
                             id: channel.id,
                             name: channel.name,
@@ -493,6 +495,7 @@ async function getDiscordServers(includeUnapproved = false) {
                             parentPosition: parentPos,
                             position: chPos,
                             type: chType,
+                            isThread,
                             boundAsdfChannelId: boundChId,
                             boundAsdfChannelName: boundChId ? (asdfMap.get(boundChId) || null) : null,
                         });
@@ -1043,10 +1046,12 @@ async function syncGuildChannels(targetGuildId) {
             if (boundDiscordIds.has(ch.id))
                 continue;
             const isVoice = ch.isVoiceBased();
+            const isThread = Boolean((typeof ch.isThread === 'function' && ch.isThread()) ||
+                ch.type === 10 || ch.type === 11 || ch.type === 12);
             const isText = 'isTextBased' in ch && typeof ch.isTextBased === 'function' && ch.isTextBased() && !isVoice;
             if (!isText && !isVoice)
                 continue;
-            const chType = isVoice ? 'voice' : 'text';
+            const chType = isVoice ? 'voice' : isThread ? 'thread' : 'text';
             const pos = (ch.rawPosition ?? ch.position) ?? 0;
             // 同一サーバーかつ同一type、同一名前で未バインドの既存チャンネルがあれば再利用
             let targetAsdfCh = existingChannels.find(c => c.server_id === gid && c.type === chType && c.name.toLowerCase() === ch.name.toLowerCase() && !boundAsdfIds.has(c.id));
@@ -1779,8 +1784,8 @@ async function sendDiscordDm(discordUserId, text, attachments) {
         return sent.id;
     }
     catch (err) {
-        if (err.code === 50007) {
-            throw new Error('相手のDiscord設定でBotからのDMが許可されていません（共通サーバーからのDM許可を確認してください）');
+        if (err.code === 50278 || err.code === 50007 || (typeof err.message === 'string' && err.message.includes('mutual guilds'))) {
+            throw new Error('相手のDiscord設定で、共通サーバーからのダイレクトメッセージが許可されていません。相手にDiscordでサーバー設定（プライバシー設定 → ダイレクトメッセージ）をONにしてもらってください。');
         }
         console.error(`[discord] sendDiscordDm failed to ${discordUserId}:`, err.message);
         throw err;
