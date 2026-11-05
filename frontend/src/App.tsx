@@ -722,6 +722,20 @@ export default function App() {
   const [pinsError, setPinsError] = useState<string | null>(null);
   const [chatInput, setChatInput] = useState('');
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
+  const knownUsernames = useMemo(() => {
+    const set = new Set<string>();
+    for (const u of onlineUsers) {
+      if (u.username) set.add(u.username);
+    }
+    for (const srv of discordServers) {
+      for (const m of (srv.members || [])) {
+        if (m.displayName) set.add(m.displayName);
+        if (m.username) set.add(m.username);
+        if (m.globalName) set.add(m.globalName);
+      }
+    }
+    return set;
+  }, [onlineUsers, discordServers]);
   const [discordReactionUsers, setDiscordReactionUsers] = useState<Record<number, string>>({});
   const resolvedReactionMsgIdsRef = useRef<Set<number>>(new Set());
 
@@ -5231,20 +5245,6 @@ export default function App() {
   const dateText = `${now.getMonth() + 1}/${now.getDate()}(${DAY_LABELS[now.getDay()]})`;
   const showNotifyBanner = notifyPermission === 'default' && !notifyBannerDismissed && (notifyPrefs.important || notifyPrefs.messages);
   const userById = new Map(onlineUsers.map(u => [u.id, u]));
-  const knownUsernames = useMemo(() => {
-    const set = new Set<string>();
-    for (const u of onlineUsers) {
-      if (u.username) set.add(u.username);
-    }
-    for (const srv of discordServers) {
-      for (const m of (srv.members || [])) {
-        if (m.displayName) set.add(m.displayName);
-        if (m.username) set.add(m.username);
-        if (m.globalName) set.add(m.globalName);
-      }
-    }
-    return set;
-  }, [onlineUsers, discordServers]);
   const channelByName = new Map(channels.filter(c => c.type !== 'voice').map(c => [c.name, c.id]));
   const typingHere = Object.entries(typingUsers).filter(([, v]) => v.channelId === activeChannelId).map(([, v]) => v.username);
   // 今日・明日が期限で、まだやっていない自分のクラスの宿題
