@@ -5976,26 +5976,28 @@ export default function App() {
                     )}
                   </button>
 
-                  {/* DM相手のアバター一覧 (Discord風 DM通知レール) */}
-                  {dmSessions.map(session => {
-                    const isSelected = selectedServerId === 'dm' && selectedDmSessionId === session.id;
-                    const unread = session.unread_count || 0;
-                    const name = session.discord_display_name || session.discord_username;
-                    return (
-                      <button
-                        key={session.id}
-                        type="button"
-                        onClick={() => {
-                          setSelectedServerId('dm');
-                          setSelectedDmSessionId(session.id);
-                        }}
-                        title={`DM: ${name}${unread > 0 ? ` (${unread}件の未読)` : ''}`}
-                        className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group cursor-pointer ${
-                          isSelected
-                            ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
-                            : 'bg-[#14161C] hover:rounded-xl border border-stone-800/80 hover:border-indigo-400/50'
-                        }`}
-                      >
+                  {/* 新規DMが来たときだけアイコン表示 (Discord風 DM通知レール) */}
+                  {dmSessions
+                    .filter(session => (session.unread_count || 0) > 0)
+                    .map(session => {
+                      const isSelected = selectedServerId === 'dm' && selectedDmSessionId === session.id;
+                      const unread = session.unread_count || 0;
+                      const name = session.discord_display_name || session.discord_username;
+                      return (
+                        <button
+                          key={session.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedServerId('dm');
+                            setSelectedDmSessionId(session.id);
+                          }}
+                          title={`新規DM: ${name} (${unread}件の未読)`}
+                          className={`relative w-9 h-9 rounded-2xl flex items-center justify-center transition group cursor-pointer anim-pop ${
+                            isSelected
+                              ? 'ring-2 ring-indigo-400 rounded-xl bg-indigo-500/20'
+                              : 'bg-[#14161C] hover:rounded-xl border border-stone-800/80 hover:border-indigo-400/50'
+                          }`}
+                        >
                         {isSelected ? (
                           <span className="absolute -left-1.5 w-1 h-5 rounded-r bg-indigo-400" />
                         ) : unread > 0 ? (
