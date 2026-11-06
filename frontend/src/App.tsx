@@ -1029,6 +1029,10 @@ export default function App() {
   const totalMentions = Object.entries(mentionCounts).reduce((a, [ch, cnt]) => {
     return visibleChannelIdSet.has(Number(ch)) ? a + (cnt || 0) : a;
   }, 0);
+  const totalUnreadElsewhere = Object.entries(unreadCounts).reduce((a, [ch, cnt]) => {
+    const viewing = activeTab === 'chat' && Number(ch) === activeChannelId;
+    return visibleChannelIdSet.has(Number(ch)) && !viewing ? a + (cnt || 0) : a;
+  }, 0);
   useEffect(() => {
     document.title = totalMentions > 0 ? `(${totalMentions}) asdfbase` : totalUnread > 0 ? '• asdfbase' : 'asdfbase';
     setFaviconBadge(totalMentions);
@@ -5203,6 +5207,8 @@ export default function App() {
           id: b.discordChannelId,
           name: b.discordChannelName,
           parentName: b.parentName || null,
+          parentId: b.parentDiscordChannelId || null,
+          isThread: Boolean(b.isThread),
           guildId: b.guildId,
         });
       }
@@ -5870,8 +5876,8 @@ export default function App() {
                       {totalMentions > 99 ? '99+' : totalMentions}
                     </span>
                   )}
-                  {tab.id === 'chat' && totalMentions === 0 && totalUnread > 0 && activeTab !== 'chat' && (
-                    <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,0.8)]" />
+                  {tab.id === 'chat' && totalMentions === 0 && totalUnreadElsewhere > 0 && (
+                    <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,0.8)]" title="未読のチャンネルがあります" />
                   )}
                   {tab.id === 'homework' && urgentHomework > 0 && (
                     <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-black text-[10px] font-bold leading-[18px] text-center" title="今日・明日までの宿題">
@@ -10837,7 +10843,7 @@ export default function App() {
                     {totalMentions > 99 ? '99+' : totalMentions}
                   </span>
                 )}
-                {tab.id === 'chat' && totalMentions === 0 && totalUnread > 0 && !isActive && (
+                {tab.id === 'chat' && totalMentions === 0 && totalUnreadElsewhere > 0 && (
                   <span className="absolute top-1 left-1/2 ml-2 w-2 h-2 rounded-full bg-white" />
                 )}
                 {tab.id === 'homework' && urgentHomework > 0 && (

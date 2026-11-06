@@ -5545,7 +5545,14 @@ server.listen(PORT, async () => {
     await startDiscordBot({
       getSetting,
       setSetting,
-      listAsdfChannels: async () => (await pool.query(`SELECT id, name, type, server_id FROM channels ORDER BY position ASC, id ASC`)).rows,
+      listAsdfChannels: async () => (await pool.query(`SELECT id, name, type, server_id, parent_channel_id FROM channels ORDER BY position ASC, id ASC`)).rows,
+      markAsdfChannelThread: async (asdfChannelId, parentAsdfChannelId) => {
+        const upd = await pool.query(
+          `UPDATE channels SET type = 'thread', parent_channel_id = $2 WHERE id = $1 RETURNING *`,
+          [asdfChannelId, parentAsdfChannelId]
+        );
+        if (upd.rows[0]) broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+      },
       createAsdfChannel: async (name, type, position, serverId, parentChannelId) => {
         const maxPosRes = await pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM channels`);
         const pos = position || maxPosRes.rows[0].next_pos;

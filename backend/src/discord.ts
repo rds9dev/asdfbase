@@ -70,7 +70,8 @@ export interface DiscordVoiceChannelInfo {
 export interface DiscordDeps {
   getSetting: (key: string, fallback?: string) => Promise<string>;
   setSetting: (key: string, value: string) => Promise<void>;
-  listAsdfChannels: () => Promise<{ id: number; name: string; type: string; server_id?: string | null }[]>;
+  listAsdfChannels: () => Promise<{ id: number; name: string; type: string; server_id?: string | null; parent_channel_id?: number | null }[]>;
+  markAsdfChannelThread?: (asdfChannelId: number, parentAsdfChannelId: number | null) => Promise<void>;
   assignChannelServer?: (asdfChannelId: number, guildId: string) => Promise<void>;
   // Discord から来たメッセージを asdfbase に保存・配信
   ingest: (asdfChannelId: number, username: string, content: string, meta: DiscordIngestMeta) => Promise<void>;
@@ -259,6 +260,8 @@ export async function getDiscordStatus() {
           guildName: gName,
           discordGuildName: gName,
           discordChannelName: ch?.name || b.discordChannelId,
+          isThread: Boolean(typeof ch?.isThread === 'function' && ch.isThread()),
+          parentDiscordChannelId: ch?.parentId || null,
           asdfChannelName: channels.find(c => c.id === b.asdfChannelId)?.name || String(b.asdfChannelId),
         };
       }),
@@ -1305,7 +1308,31 @@ export async function syncGuildChannels(targetGuildId?: string): Promise<{ creat
     }
   }
 
+  await backfillThreadChannels().catch(err => console.warn('[discord] thread backfill failed:', err.message));
+
   return { createdCount: totalCreated, boundCount: totalBound };
+}
+
+// 既にバインド済みのチャンネルが Discord 側ではスレッドだった場合、asdfbase 側の種類と親を補正する
+async function backfillThreadChannels() {
+  if (!client || !deps?.markAsdfChannelThread) return;
+  const bindings = await getBindings();
+  const asdfChannels = await deps.listAsdfChannels().catch(() => []);
+  const asdfById = new Map(asdfChannels.map(c => [c.id, c]));
+  let changed = false;
+  for (const b of bindings) {
+    const asdf = asdfById.get(b.asdfChannelId);
+    if (!asdf || asdf.type === 'voice') continue;
+    if (b.guildId && !isGuildAllowed(b.guildId)) continue;
+    const ch: any = client.channels.cache.get(b.discordChannelId);
+    if (!ch || typeof ch.isThread !== 'function' || !ch.isThread()) continue;
+    const parentBinding = ch.parentId ? bindings.find(x => x.discordChannelId === ch.parentId) : null;
+    const parentAsdfId = parentBinding ? parentBinding.asdfChannelId : null;
+    if (asdf.type === 'thread' && (asdf.parent_channel_id ?? null) === parentAsdfId) continue;
+    await deps.markAsdfChannelThread(asdf.id, parentAsdfId).catch(() => {});
+    changed = true;
+  }
+  if (changed) deps.onBindingsUpdated?.();
 }
 
 let autoSyncTimer: any = null;

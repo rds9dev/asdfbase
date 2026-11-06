@@ -11,9 +11,25 @@ export interface PatchNote {
   items: PatchNoteItem[];
 }
 
-export const LATEST_PATCH_VERSION = 'v3.1.2';
+export const LATEST_PATCH_VERSION = 'v3.1.3';
 
 export const PATCH_NOTES: PatchNote[] = [
+  {
+    version: 'v3.1.3',
+    date: '2026-11-06',
+    title: 'スレッド判定の修正・チャット未読バッジの表示条件を改善',
+    summary: '以前に取り込んだDiscordスレッドが通常チャンネル扱いのまま残っていた問題を修正し、チャットタブの未読バッジをチャット画面を開いている間も表示するようにしました。',
+    items: [
+      {
+        title: 'Discordスレッドの判定を修正',
+        description: '連携済みのチャンネルがDiscord側でスレッドなら、種類と親チャンネルを自動で補正するようにしました。10分ごとの同期と起動時に反映されます。'
+      },
+      {
+        title: 'チャットタブの未読バッジ',
+        description: 'チャット画面を開いている間も、表示中でない他のチャンネルに未読があればタブに白い点が出るようになりました。'
+      }
+    ]
+  },
   {
     version: 'v3.1.2',
     date: '2026-11-06',
