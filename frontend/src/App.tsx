@@ -387,6 +387,10 @@ export default function App() {
     const saved = LS.get('asdf_active_tab') as TabId;
     return TABS.some(t => t.id === saved) ? saved : 'chat';
   });
+  const activeTabRef = useRef<TabId>(activeTab);
+  activeTabRef.current = activeTab;
+  const flushMemoSaveRef = useRef<(() => void) | null>(null);
+
   const setActiveTab = (tab: TabId) => {
     if (activeTabRef.current === 'memo' && tab !== 'memo') {
       flushMemoSaveRef.current?.();
@@ -928,7 +932,6 @@ export default function App() {
   // Realtime refs (WS/ポーリングのコールバックから最新値を参照するため)
   const tokenRef = useRef(token);
   tokenRef.current = token;
-  const activeTabRef = useRef(activeTab);
   activeTabRef.current = activeTab;
   const chatAutoScrollModeRef = useRef(chatAutoScrollMode);
   chatAutoScrollModeRef.current = chatAutoScrollMode;
@@ -3361,6 +3364,7 @@ export default function App() {
         ...(DEFAULT_CONFIG.specialDayPeriodCounts || { 1: 4, 2: 4, 3: 4, 4: 4, 5: 4 }),
         ...(config.specialDayPeriodCounts || {}),
       },
+      dateOverrides: (config as any).dateOverrides || {},
     });
     if (nextActive !== prevActive) {
       fetchTodayTimetables(nextActive).catch(() => {});
@@ -3486,6 +3490,30 @@ export default function App() {
       toast(`今日の時程を${SCHEDULE_LABELS[type]}にしました`, { kind: 'success' });
     } else {
       toast('時程を変更できませんでした', { kind: 'error' });
+    }
+  };
+
+  const handleSetTomorrowSchedule = async (type: ScheduleType) => {
+    if (!token) return;
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowYmd = tomorrow.toISOString().slice(0, 10);
+    const ok = await confirmDialog({
+      title: `明日の時程を「${SCHEDULE_LABELS[type]}」にしますか？`,
+      message: `${tomorrowYmd} の時程として保存されます。日付が変わっても維持されます。`,
+      confirmLabel: '設定する',
+    });
+    if (!ok) return;
+    const res = await safeFetch('/api/timetables/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ targetDate: tomorrowYmd, scheduleType: type }),
+    }).catch(() => null);
+    if (res && res.ok) {
+      applyTimetableConfig(await res.json());
+      toast(`明日の時程を${SCHEDULE_LABELS[type]}に設定しました`, { kind: 'success' });
+    } else {
+      toast('明日の時程を設定できませんでした', { kind: 'error' });
     }
   };
 
@@ -4339,7 +4367,6 @@ export default function App() {
     }
   };
 
-  const flushMemoSaveRef = useRef(flushMemoSave);
   flushMemoSaveRef.current = flushMemoSave;
 
   const handleMemoContentChange = (newVal: string) => {
@@ -5202,10 +5229,10 @@ export default function App() {
   // 画面を離れる・閉じる時は保存待ちのメモをすぐ保存
   useEffect(() => {
     const onHide = () => {
-      if (document.hidden) flushMemoSaveRef.current();
+      if (document.hidden) flushMemoSaveRef.current?.();
     };
     const onUnload = () => {
-      flushMemoSaveRef.current();
+      flushMemoSaveRef.current?.();
     };
     document.addEventListener('visibilitychange', onHide);
     window.addEventListener('beforeunload', onUnload);
@@ -5333,7 +5360,13 @@ export default function App() {
     return curDow + 1;
   })();
   const tomorrowRows = todayTimetables.filter(t => t.day_of_week === nextTargetDow);
-  const tomorrowSchedule = 'normal';
+  const tomorrowYmd = (() => {
+    const nextDate = new Date(nowForStatus);
+    const addDays = nextTargetDow >= nowForStatus.getDay() ? nextTargetDow - nowForStatus.getDay() : (7 - nowForStatus.getDay() + nextTargetDow);
+    nextDate.setDate(nextDate.getDate() + (addDays === 0 ? 1 : addDays));
+    return nextDate.toISOString().slice(0, 10);
+  })();
+  const tomorrowSchedule = ttConfig.dateOverrides?.[tomorrowYmd] || 'normal';
   const tomorrowSlots = daySlots(ttConfig, nextTargetDow, tomorrowRows, tomorrowSchedule);
   const tomorrowItems = tomorrowRows
     .filter(t => t.items && t.items.trim())
@@ -13092,21 +13125,46 @@ export default function App() {
             </div>
 
             {/* 今日の時程: 全員共通・今日だけ有効 */}
-            <div className="px-3 sm:px-4 py-2.5 border-b border-stone-800 flex flex-wrap items-center gap-2 bg-amber-500/5">
-              <span className="text-stone-300 font-bold">今日の時程</span>
-              <span className="text-stone-500 text-[10px]">(全員共通・明日には通常に戻ります)</span>
+            <div className="px-3 sm:px-4 py-2 border-b border-stone-800 flex flex-wrap items-center gap-2 bg-amber-500/5">
+              <span className="text-stone-300 font-bold text-xs">今日の時程</span>
+              <span className="text-stone-500 text-[10px]">(全員共通・今日有効)</span>
               <div className="flex gap-1 ml-auto">
                 {(Object.keys(SCHEDULE_LABELS) as ScheduleType[]).map(t => (
                   <button
                     key={t}
                     onClick={() => handleSetTodaySchedule(t)}
-                    className={`px-2.5 py-1 rounded-lg border ${
+                    className={`px-2 py-0.5 text-xs rounded-lg border ${
                       todaySchedule === t ? 'bg-amber-500 text-black font-bold border-amber-500' : 'border-stone-700 text-stone-300 hover:text-white hover:border-stone-500'
                     }`}
                   >
                     {SCHEDULE_LABELS[t]}
                   </button>
                 ))}
+              </div>
+            </div>
+
+            {/* 明日の時程 (予約設定): 前日のうちに短縮時程などを設定可能 */}
+            <div className="px-3 sm:px-4 py-2 border-b border-stone-800 flex flex-wrap items-center gap-2 bg-sky-500/5">
+              <span className="text-stone-300 font-bold text-xs">明日の時程</span>
+              <span className="text-stone-500 text-[10px]">(明日予約設定 · 日付変更後も維持)</span>
+              <div className="flex gap-1 ml-auto">
+                {(Object.keys(SCHEDULE_LABELS) as ScheduleType[]).map(t => {
+                  const tomorrowDate = new Date(now);
+                  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+                  const tomorrowYmd = tomorrowDate.toISOString().slice(0, 10);
+                  const activeTomorrowType = ttConfig.dateOverrides?.[tomorrowYmd] || 'normal';
+                  return (
+                    <button
+                      key={t}
+                      onClick={() => handleSetTomorrowSchedule(t)}
+                      className={`px-2 py-0.5 text-xs rounded-lg border ${
+                        activeTomorrowType === t ? 'bg-sky-500 text-black font-bold border-sky-500' : 'border-stone-700 text-stone-300 hover:text-white hover:border-stone-500'
+                      }`}
+                    >
+                      {SCHEDULE_LABELS[t]}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -13189,6 +13247,9 @@ export default function App() {
                       {periodDraft.periods.map((p, i) =>
                         draftRow(`${i + 1}限`, p, v => setPeriodDraft(d => (d ? { ...d, periods: d.periods.map((x, j) => (j === i ? v : x)) } : d)))
                       )}
+                      {draftRow('給食', periodDraft.lunch || { start: '12:25', end: '12:50' }, v => setPeriodDraft(d => (d ? { ...d, lunch: v } : d)))}
+                      {draftRow('昼休み', periodDraft.lunchBreak || { start: '12:50', end: '13:20' }, v => setPeriodDraft(d => (d ? { ...d, lunchBreak: v } : d)))}
+                      {draftRow('清掃', periodDraft.cleaning || { start: '15:10', end: '15:25' }, v => setPeriodDraft(d => (d ? { ...d, cleaning: v } : d)))}
                       {draftRow('帰りの会', periodDraft.closing, v => setPeriodDraft(d => (d ? { ...d, closing: v } : d)))}
                     </div>
                     <div className="text-[10px] text-stone-500">5限の日は、帰りの会が5限のすぐ後になります。時程は全クラス共通で、時間割 (教科) は時程を変えても同じです。</div>

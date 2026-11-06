@@ -3556,6 +3556,7 @@ async function getTimetableConfig(): Promise<TimetableConfig & { activeDate: str
   let schedules: Record<ScheduleType, ScheduleDef> = { ...DEFAULT_SCHEDULES };
   let dayPeriodCounts = { ...DEFAULT_DAY_PERIOD_COUNTS };
   let specialDayPeriodCounts = { ...DEFAULT_SPECIAL_DAY_PERIOD_COUNTS };
+  let dateOverrides: Record<string, ScheduleType> = {};
   try {
     const saved = JSON.parse(await getSetting('timetable_config_v2', '{}'));
     for (const t of SCHEDULE_TYPES) {
@@ -3563,13 +3564,22 @@ async function getTimetableConfig(): Promise<TimetableConfig & { activeDate: str
     }
     if (saved.dayPeriodCounts) dayPeriodCounts = { ...dayPeriodCounts, ...saved.dayPeriodCounts };
     if (saved.specialDayPeriodCounts) specialDayPeriodCounts = { ...specialDayPeriodCounts, ...saved.specialDayPeriodCounts };
+    dateOverrides = JSON.parse(await getSetting('timetable_date_overrides', '{}')) || {};
   } catch (_) {}
-  // 「今日の時程」は設定した日だけ有効。日付が変わったら通常時程へ戻る
+  
+  const today = nowInTokyo().date;
   const active = await getSetting('timetable_active_schedule', 'normal');
   const activeDate = await getSetting('timetable_active_date', '');
-  const today = nowInTokyo().date;
-  const activeScheduleType = (SCHEDULE_TYPES as readonly string[]).includes(active) && activeDate === today ? active as ScheduleType : 'normal';
-  return { activeScheduleType, activeDate: today, schedules, dayPeriodCounts, specialDayPeriodCounts };
+  
+  // 今日の時程: 日付別オーバーライドがあれば最優先、なければ今日設定されたactiveScheduleType
+  let activeScheduleType: ScheduleType = 'normal';
+  if (dateOverrides[today] && (SCHEDULE_TYPES as readonly string[]).includes(dateOverrides[today])) {
+    activeScheduleType = dateOverrides[today];
+  } else if ((SCHEDULE_TYPES as readonly string[]).includes(active) && activeDate === today) {
+    activeScheduleType = active as ScheduleType;
+  }
+
+  return { activeScheduleType, activeDate: today, schedules, dayPeriodCounts, specialDayPeriodCounts, dateOverrides };
 }
 
 // 時程(朝の会・各時限・帰りの会)と「今日の時程」: 全員で共有
@@ -3583,12 +3593,36 @@ app.get('/api/timetables/config', authMiddleware, async (req, res) => {
 
 app.put('/api/timetables/config', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { activeScheduleType, schedules, dayPeriodCounts, specialDayPeriodCounts } = req.body || {};
+    const { activeScheduleType, schedules, dayPeriodCounts, specialDayPeriodCounts, targetDate, scheduleType: overrideType, dateOverrides: reqOverrides } = req.body || {};
     const changes: string[] = [];
+    const today = nowInTokyo().date;
+
+    // 日付指定オーバーライド (明日の短縮時程など)
+    if (targetDate && typeof targetDate === 'string') {
+      const currentOverrides: Record<string, ScheduleType> = JSON.parse(await getSetting('timetable_date_overrides', '{}')) || {};
+      if (overrideType && (SCHEDULE_TYPES as readonly string[]).includes(overrideType)) {
+        currentOverrides[targetDate] = overrideType as ScheduleType;
+        changes.push(`${targetDate} の時程を ${overrideType} に設定`);
+      } else {
+        delete currentOverrides[targetDate];
+        changes.push(`${targetDate} の時程指定を解除`);
+      }
+      await setSetting('timetable_date_overrides', JSON.stringify(currentOverrides));
+      if (targetDate === today) {
+        await setSetting('timetable_active_schedule', overrideType || 'normal');
+        await setSetting('timetable_active_date', today);
+      }
+    }
+
+    if (reqOverrides && typeof reqOverrides === 'object') {
+      await setSetting('timetable_date_overrides', JSON.stringify(reqOverrides));
+      changes.push('日付別時程を更新');
+    }
+
     if (activeScheduleType !== undefined) {
       if (!(SCHEDULE_TYPES as readonly string[]).includes(activeScheduleType)) return res.status(400).json({ error: '時程の種類が不正です' });
       await setSetting('timetable_active_schedule', activeScheduleType);
-      await setSetting('timetable_active_date', nowInTokyo().date);
+      await setSetting('timetable_active_date', today);
       changes.push(`今日の時程を ${activeScheduleType === 'normal' ? '通常' : activeScheduleType === 'short' ? '短縮' : '特別時程'} に変更`);
     }
     if (schedules !== undefined || dayPeriodCounts !== undefined || specialDayPeriodCounts !== undefined) {
