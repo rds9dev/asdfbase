@@ -32,6 +32,8 @@ export default defineConfig({
         ]
       },
       workbox: {
+        skipWaiting: true,
+        clientsClaim: true,
         // API はキャッシュしない (古いメモ等が表示されるのを防ぐ)
         navigateFallbackDenylist: [/^\/api\//, /^\/uploads\//],
         cleanupOutdatedCaches: true,

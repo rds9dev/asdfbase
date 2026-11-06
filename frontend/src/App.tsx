@@ -1481,25 +1481,53 @@ export default function App() {
       setIsCheckingAuth(false);
       return;
     }
+
+    let isMounted = true;
+    const safetyTimer = setTimeout(() => {
+      if (isMounted) {
+        setIsCheckingAuth(false);
+      }
+    }, 2500);
+
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), 3000);
+
     safeFetch('/api/auth/me', {
-      headers: { Authorization: `Bearer ${token}` }
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
     })
-      .then(res => {
-        if (!res.ok) throw new Error('Auth failed');
-        return res.json();
+      .then(async res => {
+        if (!res.ok) throw new Error(`Auth failed (${res.status})`);
+        return await res.json();
       })
       .then(data => {
+        if (!isMounted) return;
         setCurrentUser(data);
-        applySyncedPreferences(data?.preferences, true);
+        try {
+          applySyncedPreferences(data?.preferences, true);
+        } catch (_) {}
       })
-      .catch(() => {
-        localStorage.removeItem('asdf_token');
+      .catch(err => {
+        if (!isMounted) return;
+        console.warn('Auth check error:', err);
+        try { localStorage.removeItem('asdf_token'); } catch (_) {}
         setToken(null);
         setCurrentUser(null);
       })
       .finally(() => {
-        setIsCheckingAuth(false);
+        clearTimeout(safetyTimer);
+        clearTimeout(abortTimer);
+        if (isMounted) {
+          setIsCheckingAuth(false);
+        }
       });
+
+    return () => {
+      isMounted = false;
+      clearTimeout(safetyTimer);
+      clearTimeout(abortTimer);
+      controller.abort();
+    };
   }, [token]);
 
   const patchToastShownRef = useRef(false);
@@ -5282,11 +5310,26 @@ export default function App() {
 
   if (isCheckingAuth) {
     return (
-      <div className="min-h-screen bg-[#090A0C] flex flex-col items-center justify-center p-4 text-stone-400 font-mono text-xs">
-        <div className="flex items-center gap-2 mb-2">
+      <div className="min-h-screen bg-[#090A0C] flex flex-col items-center justify-center p-4 text-stone-400 font-mono text-xs select-none">
+        <div className="flex items-center gap-2 mb-3">
           <RefreshCw className="w-5 h-5 text-amber-400 animate-spin" />
-          <span className="font-bold text-white">セッション確認中...</span>
+          <span className="font-bold text-white text-sm">セッション確認中...</span>
         </div>
+        <p className="text-[11px] text-stone-500 mb-4 text-center max-w-xs">
+          サーバーとの同期を確認しています。通常数秒で完了します。
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            try { localStorage.removeItem('asdf_token'); } catch (_) {}
+            setToken(null);
+            setCurrentUser(null);
+            setIsCheckingAuth(false);
+          }}
+          className="text-[11px] text-stone-500 hover:text-amber-400 underline transition cursor-pointer"
+        >
+          画面が進まない場合はこちら（再ログイン）
+        </button>
       </div>
     );
   }
