@@ -11,9 +11,29 @@ export interface PatchNote {
   items: PatchNoteItem[];
 }
 
-export const LATEST_PATCH_VERSION = 'v3.1.3';
+export const LATEST_PATCH_VERSION = 'v3.1.4';
 
 export const PATCH_NOTES: PatchNote[] = [
+  {
+    version: 'v3.1.4',
+    date: '2026-11-06',
+    title: 'フォーラムチャンネル同期・スレッド階層表示・Discordチャンネル削除対応・未読白点修正',
+    summary: 'Discordのフォーラムチャンネルの同期とスレッドの階層表示に対応しました。また、asdfbase側からDiscordチャンネルの削除が可能になり、未読なし時に白点が表示され続ける不具合を修正しました。',
+    items: [
+      {
+        title: 'フォーラムチャンネルの同期とスレッドの階層表示',
+        description: 'Discordのフォーラムチャンネルを同期できるようにし、フォーラムから作成されたスレッドをフォーラム直下にツリー状に生やして表示するようにしました。フォーラムチャンネルを開くと配下のスレッド一覧カードが表示されます。'
+      },
+      {
+        title: 'asdfbase側からDiscordチャンネルを削除',
+        description: '連携チャンネルをasdfbase側で削除した際、Discord側のチャンネル・スレッドもDiscord API経由で自動削除されるようになりました。'
+      },
+      {
+        title: '未読白点の誤表示を修正',
+        description: 'ボイスチャンネル内のメッセージがチャット未読集計に含まれ、未読をすべて読んでも白点が出続けていた問題を修正しました。'
+      }
+    ]
+  },
   {
     version: 'v3.1.3',
     date: '2026-11-06',

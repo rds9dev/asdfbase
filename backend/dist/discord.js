@@ -7,6 +7,8 @@ exports.approveDiscordGuild = approveDiscordGuild;
 exports.removeApprovedDiscordGuild = removeApprovedDiscordGuild;
 exports.addDiscordBinding = addDiscordBinding;
 exports.removeDiscordBinding = removeDiscordBinding;
+exports.getDiscordBindings = getDiscordBindings;
+exports.deleteDiscordChannel = deleteDiscordChannel;
 exports.getBoundAsdfChannelIds = getBoundAsdfChannelIds;
 exports.isDiscordBotConfigured = isDiscordBotConfigured;
 exports.getDiscordStatus = getDiscordStatus;
@@ -138,6 +140,28 @@ async function removeDiscordBinding(filter) {
         await saveBindings(next);
     }
     return removed;
+}
+async function getDiscordBindings() {
+    return await getBindings();
+}
+async function deleteDiscordChannel(discordChannelId) {
+    if (!client || !connected)
+        return false;
+    try {
+        let ch = client.channels.cache.get(discordChannelId);
+        if (!ch) {
+            ch = await client.channels.fetch(discordChannelId).catch(() => null);
+        }
+        if (ch && typeof ch.delete === 'function') {
+            await ch.delete('asdfbaseから削除されました');
+            console.log(`[discord] Deleted Discord channel/thread ${discordChannelId} (${ch.name || 'unnamed'})`);
+            return true;
+        }
+    }
+    catch (err) {
+        console.warn(`[discord] Failed to delete Discord channel ${discordChannelId}:`, err.message);
+    }
+    return false;
 }
 // Bot で Discord に同期している asdfbase チャンネル
 async function getBoundAsdfChannelIds() {
@@ -492,7 +516,8 @@ async function getDiscordServers(includeUnapproved = false) {
                     const chType = channel.type;
                     const isThread = Boolean((typeof channel.isThread === 'function' && channel.isThread()) ||
                         chType === 10 || chType === 11 || chType === 12);
-                    if (chType === 0 || chType === 5 || isThread || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
+                    const isForum = chType === 15;
+                    if (chType === 0 || chType === 5 || isForum || isThread || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
                         const binding = bindings.find(b => b.discordChannelId === channel.id);
                         const boundChId = binding ? binding.asdfChannelId : null;
                         const parent = channel.parent;
@@ -510,6 +535,7 @@ async function getDiscordServers(includeUnapproved = false) {
                             position: chPos,
                             type: chType,
                             isThread,
+                            isForum,
                             boundAsdfChannelId: boundChId,
                             boundAsdfChannelName: boundChId ? (asdfMap.get(boundChId) || null) : null,
                         });
@@ -930,7 +956,24 @@ async function handleThreadAutoBind(thread) {
     const parentDiscordId = thread.parentId || thread.parent?.id;
     let parentAsdfId = null;
     if (parentDiscordId) {
-        const parentBinding = bindings.find(b => b.discordChannelId === parentDiscordId);
+        let parentBinding = bindings.find(b => b.discordChannelId === parentDiscordId);
+        if (!parentBinding && deps.createAsdfChannel) {
+            let parentCh = client.channels.cache.get(parentDiscordId);
+            if (!parentCh) {
+                parentCh = await client.channels.fetch(parentDiscordId).catch(() => null);
+            }
+            if (parentCh) {
+                const isParentForum = parentCh.type === 15;
+                const parentType = isParentForum ? 'forum' : 'text';
+                const parentPos = (parentCh.rawPosition ?? parentCh.position) ?? 0;
+                const createdParent = await deps.createAsdfChannel(parentCh.name, parentType, parentPos, guildId, null);
+                if (createdParent) {
+                    await addDiscordBinding(parentCh.id, createdParent.id, guildId);
+                    parentBinding = { discordChannelId: parentCh.id, asdfChannelId: createdParent.id, guildId };
+                    existingChannels.push(createdParent);
+                }
+            }
+        }
         if (parentBinding)
             parentAsdfId = parentBinding.asdfChannelId;
     }
@@ -1102,6 +1145,15 @@ async function syncGuildChannels(targetGuildId) {
                     channelCandidates.push(th);
             }
         }
+        // スレッド以外（通常チャンネル・フォーラム・VC）を先に同期し、その後にスレッドを処理する
+        // これにより親チャンネルが確実に先行作成・バインドされ、スレッドの parent_channel_id が正しく紐付く
+        channelCandidates.sort((a, b) => {
+            const aIsThread = Boolean((typeof a?.isThread === 'function' && a.isThread()) || a?.type === 10 || a?.type === 11 || a?.type === 12);
+            const bIsThread = Boolean((typeof b?.isThread === 'function' && b.isThread()) || b?.type === 10 || b?.type === 11 || b?.type === 12);
+            if (aIsThread === bIsThread)
+                return 0;
+            return aIsThread ? 1 : -1;
+        });
         for (const ch of channelCandidates) {
             if (!ch)
                 continue;
@@ -1110,10 +1162,11 @@ async function syncGuildChannels(targetGuildId) {
             const isVoice = typeof ch.isVoiceBased === 'function' ? ch.isVoiceBased() : false;
             const isThread = Boolean((typeof ch.isThread === 'function' && ch.isThread()) ||
                 ch.type === 10 || ch.type === 11 || ch.type === 12);
-            const isText = 'isTextBased' in ch && typeof ch.isTextBased === 'function' && ch.isTextBased() && !isVoice;
-            if (!isText && !isVoice)
+            const isForum = ch.type === 15;
+            const isText = ('isTextBased' in ch && typeof ch.isTextBased === 'function' && ch.isTextBased() && !isVoice) || isForum;
+            if (!isText && !isVoice && !isForum)
                 continue;
-            const chType = isVoice ? 'voice' : isThread ? 'thread' : 'text';
+            const chType = isVoice ? 'voice' : isForum ? 'forum' : isThread ? 'thread' : 'text';
             const pos = (ch.rawPosition ?? ch.position) ?? 0;
             let parentAsdfId = null;
             if (isThread) {
@@ -1137,6 +1190,7 @@ async function syncGuildChannels(targetGuildId) {
                 await addDiscordBinding(ch.id, targetAsdfCh.id, gid);
                 boundDiscordIds.add(ch.id);
                 boundAsdfIds.add(targetAsdfCh.id);
+                bindings.push({ discordChannelId: ch.id, asdfChannelId: targetAsdfCh.id, guildId: gid });
                 totalBound++;
             }
         }
@@ -1149,28 +1203,75 @@ async function syncGuildChannels(targetGuildId) {
     await backfillThreadChannels().catch(err => console.warn('[discord] thread backfill failed:', err.message));
     return { createdCount: totalCreated, boundCount: totalBound };
 }
-// 既にバインド済みのチャンネルが Discord 側ではスレッドだった場合、asdfbase 側の種類と親を補正する
+// 既にバインド済みのチャンネルが Discord 側ではスレッドやフォーラムだった場合、asdfbase 側の種類と親を補正する
 async function backfillThreadChannels() {
     if (!client || !deps?.markAsdfChannelThread)
         return;
     const bindings = await getBindings();
     const asdfChannels = await deps.listAsdfChannels().catch(() => []);
     const asdfById = new Map(asdfChannels.map(c => [c.id, c]));
+    const asdfByDiscordId = new Map(bindings.map(b => [b.discordChannelId, b.asdfChannelId]));
     let changed = false;
+    // 1. フォーラムチャンネル (type: 15) の type 補正
+    for (const b of bindings) {
+        const asdf = asdfById.get(b.asdfChannelId);
+        if (!asdf)
+            continue;
+        let ch = client.channels.cache.get(b.discordChannelId);
+        if (!ch) {
+            ch = await client.channels.fetch(b.discordChannelId).catch(() => null);
+        }
+        if (!ch)
+            continue;
+        if (ch.type === 15 && asdf.type !== 'forum' && deps.updateChannelType) {
+            await deps.updateChannelType(asdf.id, 'forum').catch(() => { });
+            asdf.type = 'forum';
+            changed = true;
+        }
+    }
+    // 2. スレッドの親チャンネル紐付けと type 補正
     for (const b of bindings) {
         const asdf = asdfById.get(b.asdfChannelId);
         if (!asdf || asdf.type === 'voice')
             continue;
         if (b.guildId && !isGuildAllowed(b.guildId))
             continue;
-        const ch = client.channels.cache.get(b.discordChannelId);
-        if (!ch || typeof ch.isThread !== 'function' || !ch.isThread())
+        let ch = client.channels.cache.get(b.discordChannelId);
+        if (!ch) {
+            ch = await client.channels.fetch(b.discordChannelId).catch(() => null);
+        }
+        if (!ch)
             continue;
-        const parentBinding = ch.parentId ? bindings.find(x => x.discordChannelId === ch.parentId) : null;
-        const parentAsdfId = parentBinding ? parentBinding.asdfChannelId : null;
+        const isThread = Boolean((typeof ch.isThread === 'function' && ch.isThread()) ||
+            ch.type === 10 || ch.type === 11 || ch.type === 12);
+        if (!isThread)
+            continue;
+        const parentDiscordId = ch.parentId || ch.parent?.id;
+        let parentAsdfId = parentDiscordId ? (asdfByDiscordId.get(parentDiscordId) ?? null) : null;
+        // 親チャンネルが未バインドの場合、親チャンネルを取得して作成・バインド
+        if (parentDiscordId && !parentAsdfId && deps.createAsdfChannel) {
+            let parentCh = client.channels.cache.get(parentDiscordId);
+            if (!parentCh) {
+                parentCh = await client.channels.fetch(parentDiscordId).catch(() => null);
+            }
+            if (parentCh) {
+                const isParentForum = parentCh.type === 15;
+                const parentType = isParentForum ? 'forum' : 'text';
+                const parentPos = (parentCh.rawPosition ?? parentCh.position) ?? 0;
+                const createdParent = await deps.createAsdfChannel(parentCh.name, parentType, parentPos, b.guildId || null, null);
+                if (createdParent) {
+                    await addDiscordBinding(parentCh.id, createdParent.id, b.guildId || undefined);
+                    asdfByDiscordId.set(parentCh.id, createdParent.id);
+                    parentAsdfId = createdParent.id;
+                    changed = true;
+                }
+            }
+        }
         if (asdf.type === 'thread' && (asdf.parent_channel_id ?? null) === parentAsdfId)
             continue;
         await deps.markAsdfChannelThread(asdf.id, parentAsdfId).catch(() => { });
+        asdf.parent_channel_id = parentAsdfId;
+        asdf.type = 'thread';
         changed = true;
     }
     if (changed)

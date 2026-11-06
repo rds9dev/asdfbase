@@ -953,8 +953,9 @@ app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
         if (chRes.rows.length === 0) {
             return res.status(404).json({ error: 'チャンネルが見つかりません' });
         }
+        const channel = chRes.rows[0];
         const boundIds = await (0, discord_js_1.getBoundAsdfChannelIds)();
-        const isSyncedChannel = Boolean(chRes.rows[0].server_id) || boundIds.includes(id);
+        const isSyncedChannel = Boolean(channel.server_id) || boundIds.includes(id);
         if (req.user.role !== 'admin' && !isSyncedChannel) {
             return res.status(403).json({ error: '通常チャンネルの削除は管理者のみ可能です' });
         }
@@ -962,13 +963,33 @@ app.delete('/api/channels/:id', authMiddleware, async (req, res) => {
         if (parseInt(countRes.rows[0].count, 10) <= 1) {
             return res.status(400).json({ error: '最後のチャンネルは削除できません' });
         }
-        await (0, discord_js_1.removeDiscordBinding)({ asdfChannelId: id }).catch(() => { });
+        // 配下の子スレッドチャンネルを取得
+        const childChannelsRes = await db_js_1.pool.query(`SELECT id FROM channels WHERE parent_channel_id = $1`, [id]);
+        const childIds = childChannelsRes.rows.map(r => r.id);
+        // Discord連携があれば Discord側のチャンネル・スレッドも削除
+        const allBindings = await (0, discord_js_1.getDiscordBindings)().catch(() => []);
+        const channelsToDelete = [id, ...childIds];
+        for (const chId of channelsToDelete) {
+            const targetBindings = allBindings.filter(b => b.asdfChannelId === chId);
+            for (const b of targetBindings) {
+                await (0, discord_js_1.deleteDiscordChannel)(b.discordChannelId).catch(err => {
+                    console.warn(`[channel-delete] Discord delete failed for ${b.discordChannelId}:`, err.message);
+                });
+            }
+            await (0, discord_js_1.removeDiscordBinding)({ asdfChannelId: chId }).catch(() => { });
+        }
+        // 子チャンネルをDBから削除
+        if (childIds.length > 0) {
+            await db_js_1.pool.query(`DELETE FROM channels WHERE id = ANY($1::int[])`, [childIds]);
+        }
         const delRes = await db_js_1.pool.query(`DELETE FROM channels WHERE id = $1 RETURNING name`, [id]);
-        broadcast({ type: 'CHANNEL_DELETED', payload: { id } });
+        for (const chId of channelsToDelete) {
+            broadcast({ type: 'CHANNEL_DELETED', payload: { id: chId } });
+        }
         broadcast({ type: 'DISCORD_BINDINGS_UPDATED', payload: await (0, discord_js_1.getDiscordStatus)() });
         logAudit(req.user, 'channel_delete', 'channel', id, { message: `チャンネル #${delRes.rows[0]?.name || id} を削除` });
         (0, discord_js_1.refreshDiscordCommands)();
-        res.json({ success: true, id });
+        res.json({ success: true, id, deletedChildIds: childIds });
     }
     catch (err) {
         console.error('Channel delete error:', err);
@@ -1078,6 +1099,8 @@ app.post('/api/channels/unread-counts', authMiddleware, async (req, res) => {
         const allChannels = (await db_js_1.pool.query(`SELECT * FROM channels`)).rows;
         const allowedChannelIds = [];
         for (const ch of allChannels) {
+            if (ch.type === 'voice')
+                continue;
             if (await checkServerPermission(req.user.id, req.user.role, ch.server_id)) {
                 if (checkChannelViewPermission(isAdmin, roles, ch)) {
                     allowedChannelIds.push(ch.id);
@@ -4985,6 +5008,12 @@ server.listen(PORT, async () => {
                 const upd = await db_js_1.pool.query(`UPDATE channels SET type = 'thread', parent_channel_id = $2 WHERE id = $1 RETURNING *`, [asdfChannelId, parentAsdfChannelId]);
                 if (upd.rows[0])
                     broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+            },
+            updateChannelType: async (asdfChannelId, type) => {
+                const upd = await db_js_1.pool.query(`UPDATE channels SET type = $2 WHERE id = $1 RETURNING *`, [asdfChannelId, type]);
+                if (upd.rows[0])
+                    broadcast({ type: 'CHANNEL_UPDATED', payload: upd.rows[0] });
+                return upd.rows[0] || null;
             },
             createAsdfChannel: async (name, type, position, serverId, parentChannelId) => {
                 const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM channels`);

@@ -18,7 +18,8 @@ import {
   CloudSun, 
   CalendarClock, 
   BookOpen, 
-  MessageSquare, 
+  MessageSquare,
+  MessagesSquare, 
   FileText, 
   Bot, 
   CheckSquare, 
@@ -1021,8 +1022,8 @@ export default function App() {
     } catch (_) {}
   }, [lastReadMessageIds]);
 
-  // 実際に画面上に存在しアクセス可能なチャンネルのみを未読対象とする
-  const visibleChannelIdSet = useMemo(() => new Set(channels.map(c => c.id)), [channels]);
+  // 実際に画面上に存在しアクセス可能なチャンネルのみを未読対象とする (ボイスチャンネルは除外)
+  const visibleChannelIdSet = useMemo(() => new Set(channels.filter(c => c.type !== 'voice').map(c => c.id)), [channels]);
   const totalUnread = Object.entries(unreadCounts).reduce((a, [ch, cnt]) => {
     return visibleChannelIdSet.has(Number(ch)) ? a + (cnt || 0) : a;
   }, 0);
@@ -3315,8 +3316,13 @@ export default function App() {
 
   const handleDeleteChannel = async (channelId: number) => {
     if (!token || channels.length <= 1) return;
-    const name = channels.find(c => c.id === channelId)?.name;
-    const ok = await confirmDialog({ title: `#${name} を削除しますか？`, message: 'チャンネル内のメッセージもすべて削除されます。元に戻せません。', confirmLabel: '削除する', danger: true });
+    const ch = channels.find(c => c.id === channelId);
+    const name = ch?.name;
+    const isBound = Boolean(bindingByAsdfId.get(channelId) || ch?.server_id);
+    const msg = isBound
+      ? 'チャンネル内の全メッセージが削除されます。\n※ Discord連携チャンネルのため、Discord側のチャンネル・スレッドも削除されます。元に戻せません。'
+      : 'チャンネル内のメッセージもすべて削除されます。元に戻せません。';
+    const ok = await confirmDialog({ title: `#${name} を削除しますか？`, message: msg, confirmLabel: '削除する', danger: true });
     if (!ok) return;
     try {
       const res = await safeFetch(`${API_BASE_URL}/api/channels/${channelId}`, {
@@ -5235,6 +5241,25 @@ export default function App() {
     });
   };
 
+  // フォーラム折りたたみステート (localStorage で永続化)
+  const [collapsedForums, setCollapsedForums] = useState<Record<number, boolean>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('asdf_collapsed_forums') || '{}');
+    } catch {
+      return {};
+    }
+  });
+
+  const toggleForumCollapse = (forumId: number) => {
+    setCollapsedForums(prev => {
+      const next = { ...prev, [forumId]: !prev[forumId] };
+      try {
+        localStorage.setItem('asdf_collapsed_forums', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
   // 選択中サーバーのチャンネルを Discord のカテゴリごとにグループ分け
   const groupedChannels = useMemo(() => {
     const currentServerChannels = channels.filter(
@@ -6654,16 +6679,33 @@ export default function App() {
                                 {group.channels.map((ch, idx, textChannels) => {
                                   const binding = bindingByAsdfId.get(ch.id);
                                   const isThread = ch.type === 'thread' || Boolean(binding && (binding as any).isThread) || ch.name.startsWith('ticket-') || ch.name.startsWith('closed-');
+                                  const isForum = ch.type === 'forum' || Boolean(binding && (binding as any).isForum);
+                                  const parentCh = ch.parent_channel_id ? channels.find(c => c.id === ch.parent_channel_id) : null;
+                                  const isFromForum = Boolean(parentCh?.type === 'forum');
+
+                                  // 親フォーラムが折りたたまれている場合、非アクティブな子スレッドは非表示
+                                  if (isThread && isFromForum && parentCh && collapsedForums[parentCh.id] && activeChannelId !== ch.id) {
+                                    return null;
+                                  }
+
                                   const isActiveCh = activeChannelId === ch.id;
                                   const childThreadIds = group.threadIdsByParent.get(ch.id) || [];
                                   const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0) + childThreadIds.reduce((s, tid) => s + (tid === activeChannelId ? 0 : (unreadCounts[tid] || 0)), 0);
                                   const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0) + childThreadIds.reduce((s, tid) => s + (tid === activeChannelId ? 0 : (mentionCounts[tid] || 0)), 0);
                                   const hasRoleRestriction = (Array.isArray(ch.view_roles) && ch.view_roles.length > 0) || (Array.isArray(ch.write_roles) && ch.write_roles.length > 0);
+                                  const isForumCollapsed = isForum && Boolean(collapsedForums[ch.id]);
+
                                   return (
                                     <div
                                       key={ch.id}
                                       className={`group relative flex items-center justify-between pr-1.5 py-1.5 rounded-lg text-sm transition ${
-                                        isThread ? 'ml-3 pl-2 border-l border-stone-800' : 'pl-2.5'
+                                        isThread && isFromForum
+                                          ? 'ml-4 pl-2 border-l-2 border-indigo-500/40 hover:border-indigo-400 bg-indigo-950/10'
+                                          : isThread
+                                            ? 'ml-3 pl-2 border-l border-stone-800'
+                                            : isForum
+                                              ? 'pl-2 bg-indigo-950/20 hover:bg-indigo-950/30 font-medium'
+                                              : 'pl-2.5'
                                       } ${
                                         isActiveCh
                                           ? 'bg-amber-500/15 text-amber-300 font-bold'
@@ -6678,6 +6720,22 @@ export default function App() {
                                       ) : unread > 0 ? (
                                         <span className="absolute -left-0.5 top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-white anim-badge" />
                                       ) : null}
+
+                                      {/* フォーラム展開/折りたたみボタン */}
+                                      {isForum && childThreadIds.length > 0 && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            toggleForumCollapse(ch.id);
+                                          }}
+                                          className="p-0.5 mr-0.5 text-stone-500 hover:text-indigo-300 transition shrink-0"
+                                          title={isForumCollapsed ? 'スレッドを展開' : 'スレッドを折りたたむ'}
+                                        >
+                                          {isForumCollapsed ? <ChevronRight className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                                        </button>
+                                      )}
+
                                       <button
                                         onClick={() => {
                                           const srvId = resolveChannelServerId(ch);
@@ -6686,14 +6744,21 @@ export default function App() {
                                         }}
                                         className="flex items-center gap-1.5 flex-1 text-left min-w-0"
                                       >
-                                        {isThread ? (
-                                          <CornerDownRight className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : unread > 0 ? 'text-stone-200' : 'text-stone-500'}`} />
+                                        {isForum ? (
+                                          <MessagesSquare className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : 'text-indigo-400'}`} />
+                                        ) : isThread ? (
+                                          <CornerDownRight className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : isFromForum ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-500'}`} />
                                         ) : (
                                           <Hash className={`w-3.5 h-3.5 shrink-0 ${isActiveCh ? 'text-amber-400' : binding ? 'text-indigo-400' : unread > 0 ? 'text-stone-200' : 'text-stone-600'}`} />
                                         )}
                                         <span className="truncate flex-1">{ch.name}</span>
+                                        {isForum && childThreadIds.length > 0 && (
+                                          <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-indigo-500/20 text-indigo-300 font-mono shrink-0" title={`${childThreadIds.length}件のスレッド`}>
+                                            {childThreadIds.length}
+                                          </span>
+                                        )}
                                         {isThread && (
-                                          <span className="text-[9px] px-1 py-0.2 rounded bg-stone-800/80 text-stone-400 font-mono shrink-0">
+                                          <span className={`text-[9px] px-1 py-0.2 rounded font-mono shrink-0 ${isFromForum ? 'bg-indigo-500/20 text-indigo-300' : 'bg-stone-800/80 text-stone-400'}`}>
                                             スレッド
                                           </span>
                                         )}
@@ -7293,8 +7358,24 @@ export default function App() {
                       <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 border-2 border-[#0C0D10]" />
                     )}
                   </button>
-                  <Hash className="w-4 h-4 text-amber-400 shrink-0" />
+                  {activeChannelObj?.type === 'forum' ? (
+                    <MessagesSquare className="w-4 h-4 text-indigo-400 shrink-0" />
+                  ) : activeChannelObj?.type === 'thread' ? (
+                    <CornerDownRight className="w-4 h-4 text-amber-400 shrink-0" />
+                  ) : (
+                    <Hash className="w-4 h-4 text-amber-400 shrink-0" />
+                  )}
                   <span className="text-sm truncate">{activeChannelName}</span>
+                  {activeChannelObj?.type === 'forum' && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-mono shrink-0">
+                      フォーラム
+                    </span>
+                  )}
+                  {activeChannelObj?.type === 'thread' && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-mono shrink-0">
+                      スレッド
+                    </span>
+                  )}
                   {activeChannelBinding && (
                     <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-[10px] font-normal shrink-0">
                       <span>Discord #{activeChannelBinding.discordChannelName}</span>
@@ -7604,6 +7685,88 @@ export default function App() {
                     </button>
                   </div>
                 )}
+
+                {/* フォーラムチャンネル表示: フォーラム内のスレッド一覧 */}
+                {activeChannelObj?.type === 'forum' && (
+                  <div className="mb-4 p-4 rounded-2xl bg-indigo-950/20 border border-indigo-500/30 anim-fade">
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <MessagesSquare className="w-5 h-5 text-indigo-400" />
+                      <h3 className="text-base font-bold text-white">#{activeChannelName} フォーラム</h3>
+                    </div>
+                    <p className="text-xs text-stone-400 mb-3">
+                      このフォーラムに投稿されたスレッド一覧です。スレッドを選択して閲覧・会話できます。
+                    </p>
+                    {(() => {
+                      const forumThreads = channels.filter(c => c.parent_channel_id === activeChannelId);
+                      if (forumThreads.length === 0) {
+                        return (
+                          <div className="p-4 text-center text-xs text-stone-500 border border-dashed border-stone-800 rounded-xl">
+                            まだスレッドが作成されていません。Discord側またはasdfbaseからスレッドを作成してください。
+                          </div>
+                        );
+                      }
+                      return (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {forumThreads.map(th => {
+                            const thUnread = unreadCounts[th.id] || 0;
+                            const thMentions = mentionCounts[th.id] || 0;
+                            return (
+                              <button
+                                key={th.id}
+                                type="button"
+                                onClick={() => setActiveChannelId(th.id)}
+                                className="flex items-center justify-between p-3 rounded-xl bg-stone-900/90 hover:bg-stone-800/90 border border-stone-800/80 hover:border-indigo-500/50 text-left transition group cursor-pointer shadow-sm"
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <CornerDownRight className="w-4 h-4 text-indigo-400 group-hover:text-indigo-300 shrink-0" />
+                                  <span className="text-xs font-bold text-stone-200 group-hover:text-white truncate">{th.name}</span>
+                                </div>
+                                <div className="flex items-center gap-1.5 shrink-0 ml-2">
+                                  {thMentions > 0 ? (
+                                    <span className="min-w-[18px] h-4 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center anim-badge">
+                                      {thMentions}
+                                    </span>
+                                  ) : thUnread > 0 ? (
+                                    <span className="w-2 h-2 rounded-full bg-white anim-badge" />
+                                  ) : null}
+                                  <ChevronRight className="w-3.5 h-3.5 text-stone-600 group-hover:text-stone-300 transition-transform" />
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+
+                {/* スレッド表示時の親チャンネル戻るヘッダー */}
+                {activeChannelObj?.type === 'thread' && activeChannelObj.parent_channel_id && (() => {
+                  const parentCh = channels.find(c => c.id === activeChannelObj.parent_channel_id);
+                  if (!parentCh) return null;
+                  return (
+                    <div className="mb-3 px-3 py-1.5 rounded-xl bg-stone-900/60 border border-stone-800/60 flex items-center justify-between text-xs text-stone-400">
+                      <div className="flex items-center gap-1.5 truncate">
+                        <span>親チャンネル:</span>
+                        <button
+                          type="button"
+                          onClick={() => setActiveChannelId(parentCh.id)}
+                          className="font-bold text-indigo-400 hover:text-indigo-300 hover:underline flex items-center gap-1 truncate"
+                        >
+                          {parentCh.type === 'forum' ? <MessagesSquare className="w-3 h-3 shrink-0" /> : <Hash className="w-3 h-3 shrink-0" />}
+                          <span className="truncate">{parentCh.name}</span>
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setActiveChannelId(parentCh.id)}
+                        className="text-[11px] text-stone-500 hover:text-stone-200 shrink-0 ml-2"
+                      >
+                        親に戻る
+                      </button>
+                    </div>
+                  );
+                })()}
 
                 {!hasMoreMessages && messages.length > 0 && !chatSearchQuery && (
                   <div className="text-center text-[11px] text-stone-600 py-3">
