@@ -15,6 +15,7 @@ exports.invalidateDiscordServerCache = invalidateDiscordServerCache;
 exports.getDiscordServers = getDiscordServers;
 exports.getDiscordGuildStatus = getDiscordGuildStatus;
 exports.getDiscordVoiceStatus = getDiscordVoiceStatus;
+exports.handleThreadAutoBind = handleThreadAutoBind;
 exports.syncDiscordHistory = syncDiscordHistory;
 exports.syncGuildChannels = syncGuildChannels;
 exports.startChannelAutoSyncTimer = startChannelAutoSyncTimer;
@@ -913,6 +914,36 @@ async function processDiscordMessage(msg, targets, isHistorySync = false) {
     }
     return count;
 }
+async function handleThreadAutoBind(thread) {
+    if (!client || !connected || !deps)
+        return null;
+    const guildId = thread.guildId || thread.guild?.id;
+    if (!guildId || !isGuildAllowed(guildId))
+        return null;
+    const bindings = await getBindings();
+    const existing = bindings.find(b => b.discordChannelId === thread.id);
+    if (existing)
+        return existing;
+    const existingChannels = await deps.listAsdfChannels().catch(() => []);
+    const parentDiscordId = thread.parentId || thread.parent?.id;
+    let parentAsdfId = null;
+    if (parentDiscordId) {
+        const parentBinding = bindings.find(b => b.discordChannelId === parentDiscordId);
+        if (parentBinding)
+            parentAsdfId = parentBinding.asdfChannelId;
+    }
+    const boundAsdfIds = new Set(bindings.map(b => b.asdfChannelId));
+    let targetAsdfCh = existingChannels.find(c => c.server_id === guildId && c.type === 'thread' && c.name.toLowerCase() === String(thread.name || '').toLowerCase() && !boundAsdfIds.has(c.id));
+    if (!targetAsdfCh && deps.createAsdfChannel) {
+        targetAsdfCh = (await deps.createAsdfChannel(thread.name || 'スレッド', 'thread', 0, guildId, parentAsdfId)) || undefined;
+    }
+    if (targetAsdfCh) {
+        const nextBindings = await addDiscordBinding(thread.id, targetAsdfCh.id, guildId);
+        deps.onBindingsUpdated?.();
+        return nextBindings.find(b => b.discordChannelId === thread.id) || null;
+    }
+    return null;
+}
 async function handleDiscordMessage(msg) {
     if (msg.author.bot)
         return;
@@ -955,7 +986,18 @@ async function handleDiscordMessage(msg) {
     if (isOurEchoMessage(msg))
         return;
     const bindings = await getBindings();
-    const targets = bindings.filter(b => b.discordChannelId === msg.channelId);
+    let targets = bindings.filter(b => b.discordChannelId === msg.channelId);
+    if (targets.length === 0) {
+        const ch = msg.channel;
+        const isThread = Boolean((typeof ch?.isThread === 'function' && ch.isThread()) ||
+            ch?.type === 10 || ch?.type === 11 || ch?.type === 12);
+        if (isThread) {
+            const bound = await handleThreadAutoBind(ch);
+            if (bound) {
+                targets = [bound];
+            }
+        }
+    }
     if (targets.length === 0)
         return;
     await processDiscordMessage(msg, targets, false);
@@ -1051,12 +1093,19 @@ async function syncGuildChannels(targetGuildId) {
         const bindings = await getBindings();
         const boundDiscordIds = new Set(bindings.map(b => b.discordChannelId));
         const boundAsdfIds = new Set(bindings.map(b => b.asdfChannelId));
-        for (const ch of guild.channels.cache.values()) {
+        const channelCandidates = Array.from(guild.channels.cache.values());
+        if (guild.threads?.cache) {
+            for (const th of guild.threads.cache.values()) {
+                if (!channelCandidates.some(c => c.id === th.id))
+                    channelCandidates.push(th);
+            }
+        }
+        for (const ch of channelCandidates) {
             if (!ch)
                 continue;
             if (boundDiscordIds.has(ch.id))
                 continue;
-            const isVoice = ch.isVoiceBased();
+            const isVoice = typeof ch.isVoiceBased === 'function' ? ch.isVoiceBased() : false;
             const isThread = Boolean((typeof ch.isThread === 'function' && ch.isThread()) ||
                 ch.type === 10 || ch.type === 11 || ch.type === 12);
             const isText = 'isTextBased' in ch && typeof ch.isTextBased === 'function' && ch.isTextBased() && !isVoice;
@@ -1064,10 +1113,19 @@ async function syncGuildChannels(targetGuildId) {
                 continue;
             const chType = isVoice ? 'voice' : isThread ? 'thread' : 'text';
             const pos = (ch.rawPosition ?? ch.position) ?? 0;
+            let parentAsdfId = null;
+            if (isThread) {
+                const parentId = ch.parentId || ch.parent?.id;
+                if (parentId) {
+                    const parentBinding = bindings.find(b => b.discordChannelId === parentId);
+                    if (parentBinding)
+                        parentAsdfId = parentBinding.asdfChannelId;
+                }
+            }
             // 同一サーバーかつ同一type、同一名前で未バインドの既存チャンネルがあれば再利用
             let targetAsdfCh = existingChannels.find(c => c.server_id === gid && c.type === chType && c.name.toLowerCase() === ch.name.toLowerCase() && !boundAsdfIds.has(c.id));
             if (!targetAsdfCh && deps.createAsdfChannel) {
-                targetAsdfCh = (await deps.createAsdfChannel(ch.name, chType, pos, gid)) || undefined;
+                targetAsdfCh = (await deps.createAsdfChannel(ch.name, chType, pos, gid, parentAsdfId)) || undefined;
                 if (targetAsdfCh) {
                     existingChannels.push(targetAsdfCh);
                     totalCreated++;
@@ -1723,6 +1781,42 @@ async function startDiscordBot(d) {
             }
             catch (err) {
                 console.error('[discord] channelDelete cleanup failed:', err.message);
+            }
+        });
+        // スレッド作成・削除・同期イベントの検知
+        c.on(discord_js_1.Events.ThreadCreate, async (thread) => {
+            try {
+                const guildId = thread.guildId || thread.guild?.id;
+                if (guildId && isGuildAllowed(guildId)) {
+                    await handleThreadAutoBind(thread);
+                }
+            }
+            catch (err) {
+                console.error('[discord] threadCreate handling failed:', err.message);
+            }
+        });
+        c.on(discord_js_1.Events.ThreadDelete, async (thread) => {
+            try {
+                const guildId = thread.guildId || thread.guild?.id;
+                if (guildId && isGuildAllowed(guildId)) {
+                    await removeDiscordBinding({ discordChannelId: thread.id });
+                    deps?.onBindingsUpdated?.();
+                }
+            }
+            catch (err) {
+                console.error('[discord] threadDelete cleanup failed:', err.message);
+            }
+        });
+        c.on(discord_js_1.Events.ThreadListSync, async (threads, guild) => {
+            try {
+                if (guild && isGuildAllowed(guild.id)) {
+                    for (const thread of threads.values()) {
+                        await handleThreadAutoBind(thread);
+                    }
+                }
+            }
+            catch (err) {
+                console.error('[discord] threadListSync handling failed:', err.message);
             }
         });
         c.on(discord_js_1.Events.VoiceStateUpdate, (_oldState, newState) => {

@@ -995,8 +995,18 @@ export default function App() {
   };
 
   const markChannelRead = (channelId: number, messageId: number) => {
-    setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
-    setMentionCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
+    setUnreadCounts(prev => {
+      if (!prev[channelId]) return prev;
+      const next = { ...prev };
+      delete next[channelId];
+      return next;
+    });
+    setMentionCounts(prev => {
+      if (!prev[channelId]) return prev;
+      const next = { ...prev };
+      delete next[channelId];
+      return next;
+    });
     if (messageId > 0 && (lastReadMessageIdsRef.current[channelId] || 0) < messageId) {
       lastReadMessageIdsRef.current = { ...lastReadMessageIdsRef.current, [channelId]: messageId };
       setLastReadMessageIds(prev => ((prev[channelId] || 0) >= messageId ? prev : { ...prev, [channelId]: messageId }));
@@ -1010,9 +1020,14 @@ export default function App() {
     } catch (_) {}
   }, [lastReadMessageIds]);
 
-  // 赤い数字はメンションだけ。普通の未読はハイライトのみ
-  const totalUnread = Object.values(unreadCounts).reduce((a, b) => a + (b || 0), 0);
-  const totalMentions = Object.values(mentionCounts).reduce((a, b) => a + (b || 0), 0);
+  // 実際に画面上に存在しアクセス可能なチャンネルのみを未読対象とする
+  const visibleChannelIdSet = useMemo(() => new Set(channels.map(c => c.id)), [channels]);
+  const totalUnread = Object.entries(unreadCounts).reduce((a, [ch, cnt]) => {
+    return visibleChannelIdSet.has(Number(ch)) ? a + (cnt || 0) : a;
+  }, 0);
+  const totalMentions = Object.entries(mentionCounts).reduce((a, [ch, cnt]) => {
+    return visibleChannelIdSet.has(Number(ch)) ? a + (cnt || 0) : a;
+  }, 0);
   useEffect(() => {
     document.title = totalMentions > 0 ? `(${totalMentions}) asdfbase` : totalUnread > 0 ? '• asdfbase' : 'asdfbase';
     setFaviconBadge(totalMentions);
@@ -1736,7 +1751,20 @@ export default function App() {
     const confirmed = messagesRef.current.filter(m => m.id > 0 && m.channel_id === ch);
     const last = confirmed[confirmed.length - 1];
     if (last) markChannelRead(ch, last.id);
-    else setUnreadCounts(prev => (prev[ch] ? { ...prev, [ch]: 0 } : prev));
+    else {
+      setUnreadCounts(prev => {
+        if (!prev[ch]) return prev;
+        const next = { ...prev };
+        delete next[ch];
+        return next;
+      });
+      setMentionCounts(prev => {
+        if (!prev[ch]) return prev;
+        const next = { ...prev };
+        delete next[ch];
+        return next;
+      });
+    }
   };
   const markActiveChannelSeenRef = useRef(markActiveChannelSeen);
   markActiveChannelSeenRef.current = markActiveChannelSeen;
@@ -2458,8 +2486,18 @@ export default function App() {
     } else {
       setUnreadAnchor(null);
     }
-    setUnreadCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
-    setMentionCounts(prev => (prev[channelId] ? { ...prev, [channelId]: 0 } : prev));
+    setUnreadCounts(prev => {
+      if (!prev[channelId]) return prev;
+      const next = { ...prev };
+      delete next[channelId];
+      return next;
+    });
+    setMentionCounts(prev => {
+      if (!prev[channelId]) return prev;
+      const next = { ...prev };
+      delete next[channelId];
+      return next;
+    });
     setNewBelowCount(0);
     setMessages([]);
     setHasMoreMessages(true);

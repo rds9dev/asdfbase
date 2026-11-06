@@ -11,9 +11,29 @@ export interface PatchNote {
   items: PatchNoteItem[];
 }
 
-export const LATEST_PATCH_VERSION = 'v3.1.0';
+export const LATEST_PATCH_VERSION = 'v3.1.1';
 
 export const PATCH_NOTES: PatchNote[] = [
+  {
+    version: 'v3.1.1',
+    date: '2026-11-06',
+    title: 'Discordスレッド自動検知・タブ未読表示是正・オンライン判定精度向上アップデート',
+    summary: 'Discordで作成されたスレッドの即時検知とオンデマンド自動同期、ブラウザタブ名の未読表示（• asdfbase）が既読後も消えない問題の解消、およびユーザーのオンライン・オフライン状態判定のリアルタイム同期を実装しました。',
+    items: [
+      {
+        title: 'Discordスレッドの即時検知と自動チャンネル生成',
+        description: 'Discord上で新規スレッドが作成された際やスレッド内にメッセージが投稿された際、親チャンネルを自動認識してasdfbase側に対応するスレッドチャンネルを即座に作成・バインドするように強化しました。'
+      },
+      {
+        title: 'ブラウザタブ名・未読表示の計算是正',
+        description: 'アクセス権限のない非表示チャンネルの未読がタブ名（• asdfbase）に含まれて消えなくなる問題を解消し、閲覧可能なチャンネルのみを対象に集計するよう改善しました。既読操作時のクリア処理も徹底しました。'
+      },
+      {
+        title: 'ユーザーのオンライン判定の精度向上と自動補正',
+        description: 'WebSocketハートビートとプレゼンス状態を直接連動させ、ブラウザ切断時やサーバー再起動後も古いオンライン状態が残り続けないよう自動クリーンアップと整合性補正を追加しました。'
+      }
+    ]
+  },
   {
     version: 'v3.1.0',
     date: '2026-11-06',

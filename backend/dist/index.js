@@ -1074,6 +1074,18 @@ app.get('/api/messages/since', authMiddleware, async (req, res) => {
 // 未読数: 既読位置はサーバー (全端末共通) と端末の記録の新しい方を使う
 app.post('/api/channels/unread-counts', authMiddleware, async (req, res) => {
     try {
+        const { isAdmin, roles } = await getUserAllRoles(req.user.id, req.user.role);
+        const allChannels = (await db_js_1.pool.query(`SELECT * FROM channels`)).rows;
+        const allowedChannelIds = [];
+        for (const ch of allChannels) {
+            if (await checkServerPermission(req.user.id, req.user.role, ch.server_id)) {
+                if (checkChannelViewPermission(isAdmin, roles, ch)) {
+                    allowedChannelIds.push(ch.id);
+                }
+            }
+        }
+        if (allowedChannelIds.length === 0)
+            return res.json([]);
         const lastRead = req.body?.lastRead || {};
         const channelIds = [];
         const lastReadIds = [];
@@ -1102,7 +1114,8 @@ app.post('/api/channels/unread-counts', authMiddleware, async (req, res) => {
        FROM messages m
        LEFT JOIN r ON r.ch = m.channel_id
        LEFT JOIN messages p ON p.id = m.reply_to_id
-       GROUP BY m.channel_id`, [channelIds, lastReadIds, req.user.id, `@${req.user.username}`]);
+       WHERE m.channel_id = ANY($5::int[])
+       GROUP BY m.channel_id`, [channelIds, lastReadIds, req.user.id, `@${req.user.username}`, allowedChannelIds]);
         // 暗号化メッセージのメンション判定 (暗号化によりSQL POSITIONでマッチしなかった未読を安全に補完)
         const mentionsMap = {};
         for (const r of result.rows) {
@@ -3924,9 +3937,66 @@ app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'パスワード変更エラー' });
     }
 });
+const presence = new Map();
+const PRESENCE_TIMEOUT_MS = 35000;
+async function setUserStatus(userId, status) {
+    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
+    if (p.status === status)
+        return;
+    p.status = status;
+    presence.set(userId, p);
+    try {
+        await db_js_1.pool.query(`UPDATE users SET status = $1, last_active_at = NOW() WHERE id = $2`, [status, userId]);
+    }
+    catch (_) { }
+    broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId, status } });
+}
+function touchPresence(userId) {
+    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
+    p.lastHttp = Date.now();
+    presence.set(userId, p);
+    if (p.status === 'offline')
+        setUserStatus(userId, 'online');
+}
+function addConnection(userId) {
+    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
+    p.connections++;
+    p.lastHttp = Date.now();
+    presence.set(userId, p);
+    if (p.status === 'offline')
+        setUserStatus(userId, 'online');
+}
+function removeConnection(userId) {
+    const p = presence.get(userId);
+    if (!p)
+        return;
+    p.connections = Math.max(0, p.connections - 1);
+    p.lastHttp = Date.now();
+}
+setInterval(async () => {
+    const now = Date.now();
+    for (const [userId, p] of presence.entries()) {
+        if (p.status !== 'offline' && p.connections === 0 && now - p.lastHttp > PRESENCE_TIMEOUT_MS) {
+            await setUserStatus(userId, 'offline');
+        }
+    }
+    try {
+        const activeUserIds = Array.from(presence.entries())
+            .filter(([_, p]) => p.status !== 'offline' && (p.connections > 0 || now - p.lastHttp <= PRESENCE_TIMEOUT_MS))
+            .map(([id]) => id);
+        if (activeUserIds.length > 0) {
+            await db_js_1.pool.query(`UPDATE users SET status = 'offline' WHERE status != 'offline' AND NOT (id = ANY($1::int[]))`, [activeUserIds]);
+        }
+        else {
+            await db_js_1.pool.query(`UPDATE users SET status = 'offline' WHERE status != 'offline'`);
+        }
+    }
+    catch (_) { }
+}, 10000);
 app.get('/api/users', authMiddleware, async (req, res) => {
     try {
         const result = await db_js_1.pool.query(`SELECT id, username, role, status, custom_status, avatar_url, class_no, custom_roles, last_active_at, created_at FROM users ORDER BY username ASC`);
+        const now = Date.now();
         // すでに解決済みの Discord メンバー名マップから pseudoUsers を生成 (重い Discord API fetch はブロックしない)
         const pseudoUsers = Array.from(exports.discordReactionUsernames.entries()).map(([id, uname]) => ({
             id,
@@ -3940,10 +4010,19 @@ app.get('/api/users', authMiddleware, async (req, res) => {
             last_active_at: null,
         }));
         res.json([
-            ...result.rows.map(r => ({
-                ...r,
-                custom_roles: Array.isArray(r.custom_roles) ? r.custom_roles : [],
-            })),
+            ...result.rows.map(r => {
+                const p = presence.get(r.id);
+                const isOnline = Boolean(p && (p.connections > 0 || (p.lastHttp && now - p.lastHttp < PRESENCE_TIMEOUT_MS)));
+                const effectiveStatus = isOnline ? (p?.status === 'away' ? 'away' : 'online') : 'offline';
+                if (r.status !== effectiveStatus) {
+                    db_js_1.pool.query(`UPDATE users SET status = $1 WHERE id = $2`, [effectiveStatus, r.id]).catch(() => { });
+                }
+                return {
+                    ...r,
+                    status: effectiveStatus,
+                    custom_roles: Array.isArray(r.custom_roles) ? r.custom_roles : [],
+                };
+            }),
             ...pseudoUsers,
         ]);
     }
@@ -4436,51 +4515,6 @@ function eventsSince(after, boot, userId, connId) {
     }
     return { reset: false, events };
 }
-const presence = new Map();
-const PRESENCE_TIMEOUT_MS = 35000;
-async function setUserStatus(userId, status) {
-    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
-    if (p.status === status)
-        return;
-    p.status = status;
-    presence.set(userId, p);
-    try {
-        await db_js_1.pool.query(`UPDATE users SET status = $1, last_active_at = NOW() WHERE id = $2`, [status, userId]);
-    }
-    catch (_) { }
-    broadcast({ type: 'USER_STATUS_CHANGED', payload: { userId, status } });
-}
-function touchPresence(userId) {
-    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
-    p.lastHttp = Date.now();
-    presence.set(userId, p);
-    if (p.status === 'offline')
-        setUserStatus(userId, 'online');
-}
-function addConnection(userId) {
-    const p = presence.get(userId) || { connections: 0, lastHttp: 0, status: 'offline' };
-    p.connections++;
-    p.lastHttp = Date.now();
-    presence.set(userId, p);
-    if (p.status === 'offline')
-        setUserStatus(userId, 'online');
-}
-function removeConnection(userId) {
-    const p = presence.get(userId);
-    if (!p)
-        return;
-    p.connections = Math.max(0, p.connections - 1);
-    // 即オフラインにせず、HTTP系トランスポートへの切替猶予を残す
-    p.lastHttp = Date.now();
-}
-setInterval(() => {
-    const now = Date.now();
-    for (const [userId, p] of presence.entries()) {
-        if (p.status !== 'offline' && p.connections === 0 && now - p.lastHttp > PRESENCE_TIMEOUT_MS) {
-            setUserStatus(userId, 'offline');
-        }
-    }
-}, 10000);
 // ---------------- クライアント→サーバー メッセージ (WS / HTTP 共通) ----------------
 async function handleClientMessage(user, connId, msg) {
     if (msg.type === 'SEND_MESSAGE') {
@@ -4705,6 +4739,10 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(data.toString());
             // Application-level heartbeat (keeps proxies from idling out & lets client detect dead links)
             if (msg.type === 'PING') {
+                const clientInfo = clients.get(ws);
+                if (clientInfo?.userId) {
+                    touchPresence(clientInfo.userId);
+                }
                 if (ws.readyState === ws_1.WebSocket.OPEN)
                     ws.send(JSON.stringify({ type: 'PONG', t: msg.t || Date.now() }));
                 return;
@@ -4921,6 +4959,7 @@ server.listen(PORT, async () => {
     try {
         await (0, db_js_1.initDb)();
         await db_js_1.pool.query(`ALTER TABLE channels ADD COLUMN IF NOT EXISTS permissions_overwrites JSONB DEFAULT '[]'`).catch(() => { });
+        await db_js_1.pool.query(`ALTER TABLE channels ADD COLUMN IF NOT EXISTS parent_channel_id INT REFERENCES channels(id) ON DELETE SET NULL`).catch(() => { });
         await (0, gemini_js_1.initAiUsageDb)(db_js_1.pool);
         (0, gemini_js_1.onAiUsageUpdated)(() => {
             broadcast({ type: 'AI_USAGE_UPDATED', payload: (0, gemini_js_1.getAiUsageStats)() });
@@ -4942,10 +4981,10 @@ server.listen(PORT, async () => {
             getSetting,
             setSetting,
             listAsdfChannels: async () => (await db_js_1.pool.query(`SELECT id, name, type, server_id FROM channels ORDER BY position ASC, id ASC`)).rows,
-            createAsdfChannel: async (name, type, position, serverId) => {
+            createAsdfChannel: async (name, type, position, serverId, parentChannelId) => {
                 const maxPosRes = await db_js_1.pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM channels`);
                 const pos = position || maxPosRes.rows[0].next_pos;
-                const ins = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id) VALUES ($1, $2, $3, $4) RETURNING *`, [name, type || 'text', pos, serverId]);
+                const ins = await db_js_1.pool.query(`INSERT INTO channels (name, type, position, server_id, parent_channel_id) VALUES ($1, $2, $3, $4, $5) RETURNING *`, [name, type || 'text', pos, serverId, parentChannelId || null]);
                 const ch = ins.rows[0];
                 if (ch)
                     broadcast({ type: 'CHANNEL_CREATED', payload: ch });
