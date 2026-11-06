@@ -18,7 +18,10 @@ exports.DEFAULT_SCHEDULES = {
             { start: '08:35', end: '09:25' }, { start: '09:35', end: '10:25' }, { start: '10:35', end: '11:25' },
             { start: '11:35', end: '12:25' }, { start: '13:20', end: '14:10' }, { start: '14:20', end: '15:10' },
         ],
-        closing: { start: '15:10', end: '15:40' },
+        lunch: { start: '12:25', end: '12:50' },
+        lunchBreak: { start: '12:50', end: '13:20' },
+        cleaning: { start: '15:10', end: '15:25' },
+        closing: { start: '15:25', end: '15:40' },
     },
     short: {
         morning: { start: '08:10', end: '08:25' },
@@ -26,7 +29,10 @@ exports.DEFAULT_SCHEDULES = {
             { start: '08:35', end: '09:15' }, { start: '09:25', end: '10:05' }, { start: '10:15', end: '10:55' },
             { start: '11:05', end: '11:45' }, { start: '12:40', end: '13:20' }, { start: '13:30', end: '14:10' },
         ],
-        closing: { start: '14:10', end: '14:40' },
+        lunch: { start: '11:45', end: '12:10' },
+        lunchBreak: { start: '12:10', end: '12:40' },
+        cleaning: { start: '14:10', end: '14:25' },
+        closing: { start: '14:25', end: '14:40' },
     },
     s_short: {
         morning: { start: '08:10', end: '08:25' },
@@ -34,7 +40,10 @@ exports.DEFAULT_SCHEDULES = {
             { start: '08:35', end: '09:05' }, { start: '09:15', end: '09:45' }, { start: '09:55', end: '10:25' },
             { start: '10:35', end: '11:05' }, { start: '12:00', end: '12:30' }, { start: '12:40', end: '13:10' },
         ],
-        closing: { start: '13:10', end: '13:40' },
+        lunch: { start: '11:05', end: '11:30' },
+        lunchBreak: { start: '11:30', end: '12:00' },
+        cleaning: { start: '13:10', end: '13:25' },
+        closing: { start: '13:25', end: '13:40' },
     },
     special: {
         morning: { start: '08:10', end: '08:25' },
@@ -42,7 +51,10 @@ exports.DEFAULT_SCHEDULES = {
             { start: '08:35', end: '09:20' }, { start: '09:30', end: '10:15' }, { start: '10:25', end: '11:10' },
             { start: '11:20', end: '12:05' }, { start: '13:00', end: '13:45' }, { start: '13:55', end: '14:40' },
         ],
-        closing: { start: '14:45', end: '15:15' },
+        lunch: { start: '12:05', end: '12:30' },
+        lunchBreak: { start: '12:30', end: '13:00' },
+        cleaning: { start: '14:40', end: '14:55' },
+        closing: { start: '14:55', end: '15:15' },
     },
 };
 // 曜日(1=月..5=金)ごとの授業数 (1〜6限)
@@ -51,8 +63,17 @@ exports.DEFAULT_SPECIAL_DAY_PERIOD_COUNTS = { 1: 4, 2: 4, 3: 4, 4: 4, 5: 4 };
 const TIME_RE = /^\d{2}:\d{2}$/;
 const isTime = (p) => Boolean(p) && TIME_RE.test(p.start) && TIME_RE.test(p.end);
 function isValidSchedule(def) {
-    return Boolean(def) && isTime(def.morning) && isTime(def.closing) &&
-        Array.isArray(def.periods) && def.periods.length === exports.MAX_PERIODS && def.periods.every(isTime);
+    if (!def || !isTime(def.morning) || !isTime(def.closing))
+        return false;
+    if (!Array.isArray(def.periods) || def.periods.length !== exports.MAX_PERIODS || !def.periods.every(isTime))
+        return false;
+    if (def.lunch && !isTime(def.lunch))
+        return false;
+    if (def.lunchBreak && !isTime(def.lunchBreak))
+        return false;
+    if (def.cleaning && !isTime(def.cleaning))
+        return false;
+    return true;
 }
 function toMinutes(hhmm) {
     const [h, m] = hhmm.split(':').map(Number);

@@ -471,28 +471,38 @@ async function getDiscordServers(includeUnapproved = false) {
                     }
                 }
                 voiceChannels.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
-                // テキスト & アナウンスチャンネル一覧 (キャッシュ優先で即座に取得)
+                // テキスト & アナウンス & スレッド一覧 (キャッシュ優先で即座に取得)
                 const textChannels = [];
                 const channelCollection = guild.channels.cache;
+                const threadCollection = guild.threads?.cache;
+                const allCandidates = [
+                    ...channelCollection.values(),
+                    ...(threadCollection ? threadCollection.values() : []),
+                ];
+                const seenCandidateIds = new Set();
                 const asdfChannels = deps?.listAsdfChannels ? await deps.listAsdfChannels().catch(() => []) : [];
                 const asdfMap = new Map(asdfChannels.map(c => [c.id, c.name]));
-                for (const channel of channelCollection.values()) {
-                    if (!channel)
+                for (const channel of allCandidates) {
+                    if (!channel || seenCandidateIds.has(channel.id))
                         continue;
+                    seenCandidateIds.add(channel.id);
                     const chType = channel.type;
-                    if (chType === 0 || chType === 5 || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
+                    const isThread = Boolean((typeof channel.isThread === 'function' && channel.isThread()) ||
+                        chType === 10 || chType === 11 || chType === 12);
+                    if (chType === 0 || chType === 5 || isThread || ('isTextBased' in channel && typeof channel.isTextBased === 'function' && channel.isTextBased() && !channel.isVoiceBased())) {
                         const binding = bindings.find(b => b.discordChannelId === channel.id);
                         const boundChId = binding ? binding.asdfChannelId : null;
                         const parent = channel.parent;
-                        const parentPos = parent ? ((parent.rawPosition ?? parent.position) ?? 0) : 999;
+                        const grandParent = isThread && parent ? parent.parent : null;
+                        const effectiveCategory = grandParent || (!isThread ? parent : null);
+                        const parentPos = effectiveCategory ? ((effectiveCategory.rawPosition ?? effectiveCategory.position) ?? 0) : 999;
+                        const parentName = effectiveCategory ? (effectiveCategory.name || null) : null;
                         const chPos = (channel.rawPosition ?? channel.position) ?? 0;
-                        const isThread = Boolean((typeof channel.isThread === 'function' && channel.isThread()) ||
-                            chType === 10 || chType === 11 || chType === 12);
                         textChannels.push({
                             id: channel.id,
                             name: channel.name,
                             parentId: channel.parentId || parent?.id || null,
-                            parentName: parent?.name || null,
+                            parentName,
                             parentPosition: parentPos,
                             position: chPos,
                             type: chType,

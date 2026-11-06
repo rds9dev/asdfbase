@@ -388,6 +388,9 @@ export default function App() {
     return TABS.some(t => t.id === saved) ? saved : 'chat';
   });
   const setActiveTab = (tab: TabId) => {
+    if (activeTabRef.current === 'memo' && tab !== 'memo') {
+      flushMemoSaveRef.current?.();
+    }
     setActiveTabState(tab);
     setIsNotifyPopoverOpen(false);
     LS.set('asdf_active_tab', tab);
@@ -1122,7 +1125,9 @@ export default function App() {
     };
   }, []);
 
-  // Safe fetch helper: always strictly same-origin relative path
+  const authExpiredToastShownRef = useRef(false);
+
+  // Safe fetch helper: always strictly same-origin relative path & 401 / offline handling
   const safeFetch = async (input: string, init?: RequestInit): Promise<Response> => {
     let cleanPath = input;
     if (cleanPath.startsWith('http://') || cleanPath.startsWith('https://')) {
@@ -1140,7 +1145,28 @@ export default function App() {
     if (cleanPath.startsWith('/api/')) {
       cleanPath = `${getApiBaseUrl()}${cleanPath}`;
     }
-    return fetch(cleanPath, init);
+
+    try {
+      const res = await fetch(cleanPath, init);
+      if (res.status === 401 && !cleanPath.includes('/api/auth/login') && !cleanPath.includes('/api/auth/register')) {
+        if (!authExpiredToastShownRef.current && tokenRef.current) {
+          authExpiredToastShownRef.current = true;
+          toast('ログインセッションの有効期限が切れました。再度ログインしてください', { kind: 'error' });
+          setTimeout(() => {
+            localStorage.removeItem('asdf_token');
+            setToken(null);
+            setCurrentUser(null);
+            authExpiredToastShownRef.current = false;
+          }, 1500);
+        }
+      }
+      return res;
+    } catch (err: any) {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        toast('オフラインです。ネットワーク接続を確認してください', { kind: 'error' });
+      }
+      throw err;
+    }
   };
 
   const applySyncedPreferences = (prefs: Record<string, any> | undefined, isInitial = false) => {
@@ -1644,24 +1670,32 @@ export default function App() {
         body: JSON.stringify({ lastRead: lastReadMessageIdsRef.current }),
       });
       if (!res.ok) return null;
-      const rows: { channelId: number; lastMessageId: number; lastReadId: number | null; unread: number; mentions?: number }[] = await res.json();
+      const rows: any[] = await res.json();
       const counts: Record<number, number> = {};
       const mentions: Record<number, number> = {};
       const reads: Record<number, number> = {};
       const viewing = activeTabRef.current === 'chat' && !document.hidden && !hasNewerRef.current ? activeChannelIdRef.current : null;
       let maxId = 0;
       for (const r of rows) {
-        maxId = Math.max(maxId, r.lastMessageId);
-        if (r.lastReadId == null) {
+        const chId = Number(r.channelId ?? r.channel_id);
+        if (!Number.isFinite(chId) || chId <= 0) continue;
+        const lastMsgId = Number(r.lastMessageId ?? r.last_message_id ?? 0);
+        const lastReadRaw = r.lastReadId !== undefined ? r.lastReadId : r.last_read;
+        const lastReadVal = lastReadRaw == null ? null : Number(lastReadRaw);
+        const unreadCnt = Number(r.unread ?? 0);
+        const mentionCnt = Number(r.mentions ?? 0);
+
+        maxId = Math.max(maxId, lastMsgId);
+        if (lastReadVal == null) {
           // どの端末でも開いたことがないチャンネル: それまでの履歴は既読扱い
-          reads[r.channelId] = r.lastMessageId;
+          reads[chId] = lastMsgId;
           continue;
         }
-        serverReadRef.current[r.channelId] = Math.max(serverReadRef.current[r.channelId] || 0, r.lastReadId);
-        if ((lastReadMessageIdsRef.current[r.channelId] || 0) < r.lastReadId) reads[r.channelId] = r.lastReadId;
-        if (r.channelId !== viewing && r.unread > 0) {
-          counts[r.channelId] = r.unread;
-          if (r.mentions) mentions[r.channelId] = r.mentions;
+        serverReadRef.current[chId] = Math.max(serverReadRef.current[chId] || 0, lastReadVal);
+        if ((lastReadMessageIdsRef.current[chId] || 0) < lastReadVal) reads[chId] = lastReadVal;
+        if (chId !== viewing && unreadCnt > 0) {
+          counts[chId] = unreadCnt;
+          if (mentionCnt > 0) mentions[chId] = mentionCnt;
         }
       }
       if (Object.keys(reads).length > 0) {
@@ -4201,7 +4235,7 @@ export default function App() {
   // メモ保存: 保存先スロットは呼び出し時点で固定する (保存待ちの間にスロットを切り替えても混ざらない)
   const memoStateRef = useRef({ title: memoTitle, content: memoContent, mode: memoMode, language: memoLanguage });
   memoStateRef.current = { title: memoTitle, content: memoContent, mode: memoMode, language: memoLanguage };
-  const pendingMemoSaveRef = useRef<{ slot: number; timer: any } | null>(null);
+  const pendingMemoSaveRef = useRef<{ slot: number; timer: any; data?: any } | null>(null);
 
   const handleSaveMemo = async (
     slot = selectedSlotIndexRef.current,
@@ -4257,7 +4291,7 @@ export default function App() {
     pendingMemoSaveRef.current = null;
     const wait = memoAutoSaveIntervalRef.current;
     if (wait <= 0) return;
-    pendingMemoSaveRef.current = { slot, timer: setTimeout(() => handleSaveMemo(slot, data), wait) };
+    pendingMemoSaveRef.current = { slot, data, timer: setTimeout(() => handleSaveMemo(slot, data), wait) };
   };
 
   // スロットを切り替える前に、保存待ちの変更をすぐ保存
@@ -4266,7 +4300,7 @@ export default function App() {
     if (pending) {
       clearTimeout(pending.timer);
       pendingMemoSaveRef.current = null;
-      handleSaveMemo(pending.slot, { ...memoStateRef.current });
+      handleSaveMemo(pending.slot, pending.data || { ...memoStateRef.current });
     }
   };
 
@@ -5099,9 +5133,39 @@ export default function App() {
     // カテゴリの順序でソート (Discord の親カテゴリ position 順)
     groups.sort((a, b) => (a.position - b.position) || a.name.localeCompare(b.name, 'ja'));
 
-    // 各カテゴリ内のチャンネルを Discord の position 順にソート
+    // 各カテゴリ内のチャンネルをソート (通常チャンネル順、スレッドは親チャンネルの直後に配置)
     for (const g of groups) {
-      g.channels.sort((a, b) => {
+      const nonThreads: ChannelItem[] = [];
+      const threadsByParentAsdfId = new Map<number, ChannelItem[]>();
+      const unassignedThreads: ChannelItem[] = [];
+
+      for (const ch of g.channels) {
+        const dc = dcChannelMap.get(ch.id);
+        const isThread = ch.type === 'thread' || Boolean(dc?.isThread) || ch.name.startsWith('ticket-') || ch.name.startsWith('closed-');
+        if (isThread) {
+          let parentAsdfId: number | null = null;
+          if (dc?.parentId) {
+            for (const other of currentServerChannels) {
+              const otherDc = dcChannelMap.get(other.id);
+              if (otherDc?.id === dc.parentId) {
+                parentAsdfId = other.id;
+                break;
+              }
+            }
+          }
+          if (parentAsdfId) {
+            const list = threadsByParentAsdfId.get(parentAsdfId) || [];
+            list.push(ch);
+            threadsByParentAsdfId.set(parentAsdfId, list);
+          } else {
+            unassignedThreads.push(ch);
+          }
+        } else {
+          nonThreads.push(ch);
+        }
+      }
+
+      nonThreads.sort((a, b) => {
         const dcA = dcChannelMap.get(a.id);
         const dcB = dcChannelMap.get(b.id);
         const posA = dcA?.position ?? a.position ?? 0;
@@ -5109,6 +5173,18 @@ export default function App() {
         if (posA !== posB) return posA - posB;
         return a.name.localeCompare(b.name, 'ja');
       });
+
+      const sortedChannels: ChannelItem[] = [];
+      for (const parentCh of nonThreads) {
+        sortedChannels.push(parentCh);
+        const childThreads = threadsByParentAsdfId.get(parentCh.id);
+        if (childThreads) {
+          childThreads.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+          sortedChannels.push(...childThreads);
+        }
+      }
+      sortedChannels.push(...unassignedThreads);
+      g.channels = sortedChannels;
     }
 
     return groups;
@@ -5123,13 +5199,20 @@ export default function App() {
     }
   }, [activeChannelId, channels]);
 
-  // 画面を離れる時は保存待ちのメモをすぐ保存
+  // 画面を離れる・閉じる時は保存待ちのメモをすぐ保存
   useEffect(() => {
     const onHide = () => {
       if (document.hidden) flushMemoSaveRef.current();
     };
+    const onUnload = () => {
+      flushMemoSaveRef.current();
+    };
     document.addEventListener('visibilitychange', onHide);
-    return () => document.removeEventListener('visibilitychange', onHide);
+    window.addEventListener('beforeunload', onUnload);
+    return () => {
+      document.removeEventListener('visibilitychange', onHide);
+      window.removeEventListener('beforeunload', onUnload);
+    };
   }, []);
 
   if (isCheckingAuth) {
@@ -5240,7 +5323,22 @@ export default function App() {
     .filter(t => t.items && t.items.trim())
     .sort((a, b) => a.period - b.period)
     .map(t => `${t.period}限 ${t.subject}: ${t.items}`);
-  const StatusIcon = schoolStatus.kind === 'holiday' ? Sun : schoolStatus.kind === 'before' ? Sunrise : schoolStatus.kind === 'after' ? Moon : BookOpen;
+  const StatusIcon = schoolStatus.kind === 'holiday' ? Sun : schoolStatus.kind === 'night' ? Moon : (schoolStatus.kind === 'before' || schoolStatus.kind === 'pre_school') ? Sunrise : schoolStatus.kind === 'after' ? Moon : BookOpen;
+  
+  // 放課後・夜間枠の場合は「明日の時間割」をホバー表示
+  const isNextDayTarget = schoolStatus.kind === 'after' || schoolStatus.kind === 'night';
+  const nextTargetDow = (() => {
+    const curDow = nowForStatus.getDay();
+    if (curDow === 5 || curDow === 6 || curDow === 0) return 1; // 金・土・日は月曜の時間割
+    return curDow + 1;
+  })();
+  const tomorrowRows = todayTimetables.filter(t => t.day_of_week === nextTargetDow);
+  const tomorrowSchedule = 'normal';
+  const tomorrowSlots = daySlots(ttConfig, nextTargetDow, tomorrowRows, tomorrowSchedule);
+  const tomorrowItems = tomorrowRows
+    .filter(t => t.items && t.items.trim())
+    .sort((a, b) => a.period - b.period)
+    .map(t => `${t.period}限 ${t.subject}: ${t.items}`);
   const WeatherIcon = weatherIcon(weather.weatherCode);
   const pad2 = (n: number) => String(n).padStart(2, '0');
   const clockText = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
@@ -5824,17 +5922,17 @@ export default function App() {
           >
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <span className="text-white font-bold">今日の時間割</span>
-                <span className="text-stone-500">{SCHEDULE_LABELS[todaySchedule]}</span>
+                <span className="text-white font-bold">{isNextDayTarget ? `明日の時間割 (${DAY_LABELS[nextTargetDow]})` : '今日の時間割'}</span>
+                <span className="text-stone-500">{isNextDayTarget ? '通常時程' : SCHEDULE_LABELS[todaySchedule]}</span>
               </div>
-              {schoolStatus.kind === 'holiday' ? (
+              {!isNextDayTarget && schoolStatus.kind === 'holiday' ? (
                 <div className="text-stone-500">今日は休みです</div>
               ) : (
                 <div className="space-y-0.5">
-                  {todaySlots.map(slot => (
+                  {(isNextDayTarget ? tomorrowSlots : todaySlots).map(slot => (
                     <div
                       key={slot.key}
-                      className={`flex items-center gap-2 px-2 py-1 rounded-lg ${slot.key === schoolStatus.currentKey ? 'bg-amber-500/15 text-amber-200' : 'text-stone-300'}`}
+                      className={`flex items-center gap-2 px-2 py-1 rounded-lg ${!isNextDayTarget && slot.key === schoolStatus.currentKey ? 'bg-amber-500/15 text-amber-200' : 'text-stone-300'}`}
                     >
                       <span className="w-14 shrink-0 font-bold text-amber-400/90">{slot.label}</span>
                       <span className="flex-1 truncate">{slot.subject || (slot.key.startsWith('p') ? '—' : '')}</span>
@@ -5843,10 +5941,10 @@ export default function App() {
                   ))}
                 </div>
               )}
-              {todayItems.length > 0 && (
+              {(isNextDayTarget ? tomorrowItems : todayItems).length > 0 && (
                 <div className="pt-2 border-t border-stone-800 space-y-0.5">
-                  <div className="text-stone-400 font-bold flex items-center gap-1"><Backpack className="w-3 h-3" /> 持ち物</div>
-                  {todayItems.map(item => <div key={item} className="text-stone-300">{item}</div>)}
+                  <div className="text-stone-400 font-bold flex items-center gap-1"><Backpack className="w-3 h-3" /> {isNextDayTarget ? '明日の持ち物' : '持ち物'}</div>
+                  {(isNextDayTarget ? tomorrowItems : todayItems).map(item => <div key={item} className="text-stone-300">{item}</div>)}
                 </div>
               )}
               <div className="text-[10px] text-stone-600 text-right">クリックで時間割を開く</div>
@@ -7681,6 +7779,7 @@ export default function App() {
                                 <div className="flex items-center gap-2 text-[11px] text-red-400 mt-0.5 font-bold">
                                   <span>送信に失敗しました</span>
                                   <button onClick={() => handleRetryMessage(m)} className="underline hover:text-red-300 bg-red-500/10 px-1.5 py-0.5 rounded border border-red-500/30">再試行</button>
+                                  <button onClick={() => { setChatInput(m.content); handleDiscardFailedMessage(m); }} className="underline hover:text-amber-300 text-stone-300 font-normal">下書きに戻す</button>
                                   <button onClick={() => handleDiscardFailedMessage(m)} className="underline text-stone-500 hover:text-stone-300 font-normal">取り消す</button>
                                 </div>
                               )}
@@ -9137,13 +9236,33 @@ export default function App() {
                     )}
                   </div>
                   <div>
-                    <label className="text-[10px] text-stone-400 block mb-1">再提出締切日</label>
-                    <input
-                      type="date"
-                      value={newAssignResubmitDeadline}
-                      onChange={e => setNewAssignResubmitDeadline(e.target.value)}
-                      className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
-                    />
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[10px] text-stone-400">再提出締切日</label>
+                      <button
+                        type="button"
+                        onClick={() => setNewAssignResubmitDeadline(newAssignResubmitDeadline === '9999-12-31' ? '' : '9999-12-31')}
+                        className={`text-[10px] px-1.5 py-0.5 rounded transition ${
+                          newAssignResubmitDeadline === '9999-12-31'
+                            ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/40'
+                            : 'bg-stone-800 text-stone-400 hover:text-stone-200'
+                        }`}
+                      >
+                        {newAssignResubmitDeadline === '9999-12-31' ? '期限: 不明中' : '「不明」にする'}
+                      </button>
+                    </div>
+                    {newAssignResubmitDeadline === '9999-12-31' ? (
+                      <div className="w-full bg-[#16181D] border border-amber-500/40 rounded-xl px-3 py-2 text-amber-300 text-xs font-bold flex items-center justify-between">
+                        <span>再提出締切: 不明</span>
+                        <button type="button" onClick={() => setNewAssignResubmitDeadline('')} className="text-stone-400 hover:text-white text-[11px]">解除</button>
+                      </div>
+                    ) : (
+                      <input
+                        type="date"
+                        value={newAssignResubmitDeadline}
+                        onChange={e => setNewAssignResubmitDeadline(e.target.value)}
+                        className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500/60"
+                      />
+                    )}
                   </div>
                 </div>
 
@@ -9319,7 +9438,7 @@ export default function App() {
                             </div>
                           )}
                           {item.resubmit_deadline && (
-                            <div>再提出締切: <span className="text-amber-300 font-bold">{new Date(item.resubmit_deadline).toLocaleDateString()}</span></div>
+                            <div>再提出締切: <span className="text-amber-300 font-bold">{item.resubmit_deadline.startsWith('9999-12-31') ? '不明' : new Date(item.resubmit_deadline).toLocaleDateString()}</span></div>
                           )}
                         </div>
 
@@ -13405,13 +13524,45 @@ export default function App() {
               </div>
 
               <div>
-                <label className="text-[10px] text-stone-400 block mb-1">再提出締切日 (任意)</label>
-                <input
-                  type="date"
-                  value={editingAssignment.resubmit_deadline ? editingAssignment.resubmit_deadline.slice(0, 10) : ''}
-                  onChange={e => setEditingAssignment({ ...editingAssignment, resubmit_deadline: e.target.value || undefined })}
-                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
-                />
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-[10px] text-stone-400">再提出締切日 (任意)</label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const isUnknown = editingAssignment.resubmit_deadline?.startsWith('9999-12-31');
+                      setEditingAssignment({
+                        ...editingAssignment,
+                        resubmit_deadline: isUnknown ? undefined : '9999-12-31',
+                      });
+                    }}
+                    className={`text-[10px] px-1.5 py-0.5 rounded transition ${
+                      editingAssignment.resubmit_deadline?.startsWith('9999-12-31')
+                        ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/40'
+                        : 'bg-stone-800 text-stone-400 hover:text-stone-200'
+                    }`}
+                  >
+                    {editingAssignment.resubmit_deadline?.startsWith('9999-12-31') ? '期限: 不明中' : '「不明」にする'}
+                  </button>
+                </div>
+                {editingAssignment.resubmit_deadline?.startsWith('9999-12-31') ? (
+                  <div className="w-full bg-[#16181D] border border-amber-500/40 rounded-xl px-3 py-2 text-amber-300 text-xs font-bold flex items-center justify-between">
+                    <span>再提出締切: 不明</span>
+                    <button
+                      type="button"
+                      onClick={() => setEditingAssignment({ ...editingAssignment, resubmit_deadline: undefined })}
+                      className="text-stone-400 hover:text-white text-[11px]"
+                    >
+                      解除
+                    </button>
+                  </div>
+                ) : (
+                  <input
+                    type="date"
+                    value={editingAssignment.resubmit_deadline ? editingAssignment.resubmit_deadline.slice(0, 10) : ''}
+                    onChange={e => setEditingAssignment({ ...editingAssignment, resubmit_deadline: e.target.value || undefined })}
+                    className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+                  />
+                )}
               </div>
 
               <div>

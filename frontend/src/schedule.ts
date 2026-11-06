@@ -4,6 +4,9 @@ export type PeriodTime = { start: string; end: string };
 export interface ScheduleDef {
   morning: PeriodTime;
   periods: PeriodTime[];
+  lunch?: PeriodTime;
+  lunchBreak?: PeriodTime;
+  cleaning?: PeriodTime;
   closing: PeriodTime;
 }
 export interface TimetableConfig {
@@ -11,6 +14,7 @@ export interface TimetableConfig {
   schedules: Record<ScheduleType, ScheduleDef>;
   dayPeriodCounts: Record<string, number>;
   specialDayPeriodCounts?: Record<string, number>;
+  dateOverrides?: Record<string, ScheduleType>;
 }
 
 export interface TimetableItem {
@@ -48,6 +52,9 @@ export const DEFAULT_CONFIG: TimetableConfig = {
         { start: '08:35', end: '09:25' }, { start: '09:35', end: '10:25' }, { start: '10:35', end: '11:25' },
         { start: '11:35', end: '12:25' }, { start: '13:20', end: '14:10' }, { start: '14:20', end: '15:10' },
       ],
+      lunch: { start: '12:25', end: '12:50' },
+      lunchBreak: { start: '12:50', end: '13:20' },
+      cleaning: { start: '15:10', end: '15:25' },
       closing: { start: '15:25', end: '15:40' },
     },
     short: {
@@ -56,6 +63,9 @@ export const DEFAULT_CONFIG: TimetableConfig = {
         { start: '08:35', end: '09:15' }, { start: '09:25', end: '10:05' }, { start: '10:15', end: '10:55' },
         { start: '11:05', end: '11:45' }, { start: '12:40', end: '13:20' }, { start: '13:30', end: '14:10' },
       ],
+      lunch: { start: '11:45', end: '12:10' },
+      lunchBreak: { start: '12:10', end: '12:40' },
+      cleaning: { start: '14:10', end: '14:25' },
       closing: { start: '14:25', end: '14:40' },
     },
     s_short: {
@@ -64,6 +74,9 @@ export const DEFAULT_CONFIG: TimetableConfig = {
         { start: '08:35', end: '09:05' }, { start: '09:15', end: '09:45' }, { start: '09:55', end: '10:25' },
         { start: '10:35', end: '11:05' }, { start: '12:00', end: '12:30' }, { start: '12:40', end: '13:10' },
       ],
+      lunch: { start: '11:05', end: '11:30' },
+      lunchBreak: { start: '11:30', end: '12:00' },
+      cleaning: { start: '13:10', end: '13:25' },
       closing: { start: '13:25', end: '13:40' },
     },
     special: {
@@ -72,11 +85,15 @@ export const DEFAULT_CONFIG: TimetableConfig = {
         { start: '08:35', end: '09:20' }, { start: '09:30', end: '10:15' }, { start: '10:25', end: '11:10' },
         { start: '11:20', end: '12:05' }, { start: '13:00', end: '13:45' }, { start: '13:55', end: '14:40' },
       ],
+      lunch: { start: '12:05', end: '12:30' },
+      lunchBreak: { start: '12:30', end: '13:00' },
+      cleaning: { start: '14:40', end: '14:55' },
       closing: { start: '14:55', end: '15:15' },
     },
   },
   dayPeriodCounts: { 1: 6, 2: 6, 3: 6, 4: 6, 5: 6 },
   specialDayPeriodCounts: { 1: 4, 2: 4, 3: 4, 4: 4, 5: 4 },
+  dateOverrides: {},
 };
 
 export function toMinutes(hhmm: string): number {
@@ -175,7 +192,7 @@ export function daySlots(config: TimetableConfig, dow: number, rows: TimetableIt
   return slots;
 }
 
-export type SchoolStatusKind = 'holiday' | 'before' | 'homeroom' | 'class' | 'break' | 'after';
+export type SchoolStatusKind = 'holiday' | 'night' | 'before' | 'pre_school' | 'homeroom' | 'class' | 'break' | 'after';
 
 export function computeSchoolStatus(now: Date, config: TimetableConfig, today: TimetableItem[]): {
   kind: SchoolStatusKind;
@@ -189,10 +206,22 @@ export function computeSchoolStatus(now: Date, config: TimetableConfig, today: T
   if (dow === 0 || dow === 6) return { kind: 'holiday', label: '休み', sub: dow === 6 ? '土曜日' : '日曜日' };
   const slots = daySlots(config, dow, today);
   const nowMin = now.getHours() * 60 + now.getMinutes();
-  const first = slots[0];
-  if (nowMin < toMinutes(first.time.start)) {
-    return { kind: 'before', label: '登校前', sub: `朝の会 ${first.time.start}~` };
+
+  // 18:00 (1080分) 〜 06:00 (360分): 夜間枠
+  if (nowMin >= 1080 || nowMin < 360) {
+    return { kind: 'night', label: '夜間枠', sub: '明日 06:00~' };
   }
+  // 06:00 (360分) 〜 07:50 (470分): 登校前
+  if (nowMin < 470) {
+    return { kind: 'before', label: '登校前', sub: '07:50 始業前~' };
+  }
+  const first = slots[0];
+  const morningStart = first ? toMinutes(first.time.start) : 490; // デフォルト 08:10
+  // 07:50 (470分) 〜 朝の会開始: 始業前
+  if (nowMin < morningStart) {
+    return { kind: 'pre_school', label: '始業前', sub: `朝の会 ${first?.time.start || '08:10'}~` };
+  }
+
   for (let i = 0; i < slots.length; i++) {
     const s = slots[i];
     const start = toMinutes(s.time.start);
@@ -217,7 +246,8 @@ export function computeSchoolStatus(now: Date, config: TimetableConfig, today: T
       };
     }
   }
-  return { kind: 'after', label: '放課後', sub: `${periodCountFor(config, dow)}限授業の日` };
+  // 帰りの会終了 〜 18:00 (1080分): 放課後
+  return { kind: 'after', label: '放課後', sub: '18:00まで' };
 }
 
 // 'YYYY-MM-DD' (ローカル日付) → 「10/22(木)」

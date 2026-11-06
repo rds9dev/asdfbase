@@ -1263,8 +1263,11 @@ app.post('/api/channels/unread-counts', authMiddleware, async (req: AuthRequest,
 
     res.json(result.rows.map(r => ({
       channelId: r.channel_id,
+      channel_id: r.channel_id,
       lastMessageId: Number(r.last_message_id),
+      last_message_id: Number(r.last_message_id),
       lastReadId: r.last_read == null ? null : Number(r.last_read),
+      last_read: r.last_read == null ? null : Number(r.last_read),
       unread: Number(r.unread),
       mentions: mentionsMap[r.channel_id] ?? Number(r.mentions),
     })));
@@ -1339,6 +1342,15 @@ app.post('/api/channels/read-all', authMiddleware, async (req: AuthRequest, res)
           [userId, channelId, maxId]
         );
         readUpdates[channelId] = maxId;
+      }
+    }
+    // targetChannelIds で渡されたチャンネルでメッセージがまだない場合も既読扱い
+    if (Array.isArray(targetChannelIds)) {
+      for (const id of targetChannelIds) {
+        const numId = Number(id);
+        if (Number.isFinite(numId) && numId > 0 && !(numId in readUpdates)) {
+          readUpdates[numId] = 0;
+        }
       }
     }
     publish({ type: 'ALL_CHANNELS_READ', payload: { userId, readUpdates, serverId: serverId || null } }, { targetUserId: userId });
@@ -3942,14 +3954,16 @@ app.put('/api/notes/:slotIndex', authMiddleware, async (req: AuthRequest, res) =
     const effectiveLanguage = language || currentNote?.language || 'typescript';
 
     const updated = await pool.query(
-      `UPDATE notes 
-       SET title = COALESCE($1, title), 
-           content = COALESCE($2, content), 
-           mode = $3, 
+      `INSERT INTO notes (slot_index, title, content, mode, language, version, updated_at)
+       VALUES ($5, COALESCE($1, '無題のメモ'), COALESCE($2, ''), $3, $4, 1, NOW())
+       ON CONFLICT (slot_index) DO UPDATE
+       SET title = COALESCE($1, notes.title),
+           content = COALESCE($2, notes.content),
+           mode = $3,
            language = $4,
-           version = version + 1, 
-           updated_at = NOW() 
-       WHERE slot_index = $5 RETURNING *`,
+           version = notes.version + 1,
+           updated_at = NOW()
+       RETURNING *`,
       [title, content, effectiveMode, effectiveLanguage, slotIndex]
     );
 
@@ -5421,6 +5435,17 @@ setTimeout(() => {
   setInterval(() => runRetention().catch(err => console.error('Retention error:', err.message)), RETENTION_INTERVAL_MS);
 }, 2 * 60 * 1000);
 
+// Express グローバルエラーハンドリングミドルウェア (JSONパース不正等の捕捉)
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({ error: '不正なJSONリクエストです' });
+  }
+  console.error('[Unhandled Express Error]:', err);
+  if (!res.headersSent) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバー内部エラーが発生しました' });
+  }
+});
+
 server.listen(PORT, async () => {
   console.log(`[asdfbase-backend] Server listening on http://127.0.0.1:${PORT}`);
   try {
@@ -5780,4 +5805,12 @@ server.listen(PORT, async () => {
   } catch (err) {
     console.error('Discord bot start failed:', err);
   }
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL uncaughtException]:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[WARN unhandledRejection]:', reason);
 });

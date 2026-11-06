@@ -21,7 +21,7 @@ exports.MODEL_SPECS = {
     fast: {
         id: 'gemini-3.5-flash-lite',
         name: '高速モード (gemini-3.5-flash-lite)',
-        fallbacks: ['gemini-flash-lite-latest'],
+        fallbacks: ['gemini-flash-lite-latest', 'gemini-2.5-flash', 'gemini-1.5-flash'],
         rpmLimit: 30,
         tpmLimit: 10_000_000,
         rpdLimit: 1500,
@@ -29,7 +29,7 @@ exports.MODEL_SPECS = {
     thinking: {
         id: 'gemini-3.8-flash',
         name: '思考モード (gemini-3.8-flash)',
-        fallbacks: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest'],
+        fallbacks: ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-2.5-flash'],
         rpmLimit: 15,
         tpmLimit: 3_000_000,
         rpdLimit: 1500,
@@ -329,14 +329,17 @@ async function askGemini(prompt, systemInstruction, mode = 'fast') {
             catch (err) {
                 lastError = err;
                 console.warn(`[Gemini askGemini] Slot ${chosen.slotIndex + 1} Model ${model} failed: ${err.message || err}`);
-                // 503 (Spikes in demand) や 429 の場合は別スロットへ即切り替え
-                if (String(err?.message || '').includes('503') || String(err?.message || '').includes('429')) {
-                    break; // 次のスロットへ
+                const errMsg = String(err?.message || err || '');
+                if (errMsg.includes('429')) {
+                    break; // レートリミットなので別スロットへ
+                }
+                if (errMsg.includes('503') || errMsg.includes('high demand') || errMsg.includes('UNAVAILABLE')) {
+                    continue; // モデル過負荷なので次のフォールバックモデルへ
                 }
             }
         }
-        // 少し待機してリトライ
-        await new Promise(r => setTimeout(r, 200));
+        // スロット切り替え時のバックオフ待機
+        await new Promise(r => setTimeout(r, 200 * (slotTry + 1)));
     }
     return `AI呼び出しエラー: すべてのAPIキーまたはモデルでの呼び出しに失敗しました (${lastError?.message || '不明なエラー'})`;
 }
@@ -383,13 +386,16 @@ async function generateWithFallback(contents, config, pinned, mode) {
             catch (err) {
                 lastError = err;
                 console.warn(`[Gemini agent] Slot ${chosenSlot.slotIndex + 1} Model ${model} failed: ${err.message || err}`);
-                // 503 または 429 は別スロットへ
-                if (String(err?.message || '').includes('503') || String(err?.message || '').includes('429')) {
-                    break;
+                const errMsg = String(err?.message || err || '');
+                if (errMsg.includes('429')) {
+                    break; // レートリミットなので別スロットへ
+                }
+                if (errMsg.includes('503') || errMsg.includes('high demand') || errMsg.includes('UNAVAILABLE')) {
+                    continue; // モデル過負荷なので次のフォールバックモデルへ
                 }
             }
         }
-        await new Promise(r => setTimeout(r, 250));
+        await new Promise(r => setTimeout(r, 250 * (slotTry + 1)));
     }
     throw new Error(lastError?.message || 'すべてのAPIキーまたはモデルでの呼び出しに失敗しました');
 }
