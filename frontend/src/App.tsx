@@ -157,6 +157,7 @@ interface ChannelItem {
   type: string;
   position?: number;
   server_id?: string | null;
+  parent_channel_id?: number | null;
   discord_channel_id?: string;
   view_roles?: string[];
   write_roles?: string[];
@@ -1930,6 +1931,9 @@ export default function App() {
           setMemoMode(first?.mode || 'markdown');
         }
       } else if (msg.type === 'USER_STATUS_CHANGED') {
+        if (currentUserRef.current?.id === msg.payload.userId) {
+          setCurrentUser(u => (u ? { ...u, status: msg.payload.status } : u));
+        }
         setOnlineUsers(prev => {
           if (!prev.some(u => u.id === msg.payload.userId)) {
             // 新規メンバー: 一覧を取り直す
@@ -2161,6 +2165,13 @@ export default function App() {
   // Realtime 接続: 設定 (方式 / ポーリング間隔 / 経路) が変わったら張り直す
   useEffect(() => {
     if (!token) return;
+    const IDLE_AFTER_MS = 5 * 60 * 1000;
+    let isIdle = false;
+    let idleTimer: any = null;
+    const desiredStatus = () => (document.hidden || isIdle ? 'away' : 'online');
+    const sendDesiredStatus = () => {
+      realtimeRef.current?.send({ type: 'SET_STATUS', status: desiredStatus() }).catch(() => {});
+    };
     const client = new RealtimeClient({
       token,
       transport: rtTransport,
@@ -2170,6 +2181,8 @@ export default function App() {
         setWsStatus(status);
         setActiveTransport(transport);
         if (status === 'online') {
+          // 再接続直後はサーバー側が常に online 扱いなので、実際の状態 (非表示/放置) を送り直す
+          setTimeout(sendDesiredStatus, 0);
           // 接続/再接続のたびに取りこぼしを補完。切断から戻った時は表示中のデータも取り直す
           syncMissedMessagesRef.current();
           if (hasBeenOnlineRef.current && lastRtStatusRef.current !== 'online') {
@@ -2196,7 +2209,7 @@ export default function App() {
     client.start();
 
     const handleVisibilityStatus = () => {
-      client.send({ type: 'SET_STATUS', status: document.hidden ? 'away' : 'online' }).catch(() => {});
+      sendDesiredStatus();
       if (!document.hidden) {
         syncMissedMessagesRef.current();
         // 取りこぼし補完が届いてから既読にする
@@ -2205,8 +2218,31 @@ export default function App() {
     };
     document.addEventListener('visibilitychange', handleVisibilityStatus);
 
+    // 表示中でも5分間操作がなければ離席中にする
+    const armIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (!isIdle) {
+          isIdle = true;
+          sendDesiredStatus();
+        }
+      }, IDLE_AFTER_MS);
+    };
+    const handleActivity = () => {
+      if (isIdle) {
+        isIdle = false;
+        sendDesiredStatus();
+      }
+      armIdleTimer();
+    };
+    const activityEvents = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'wheel'] as const;
+    activityEvents.forEach(ev => window.addEventListener(ev, handleActivity, { passive: true }));
+    armIdleTimer();
+
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityStatus);
+      activityEvents.forEach(ev => window.removeEventListener(ev, handleActivity));
+      clearTimeout(idleTimer);
       client.stop();
       if (realtimeRef.current === client) realtimeRef.current = null;
     };
@@ -5204,11 +5240,28 @@ export default function App() {
       name: string;
       position: number;
       channels: ChannelItem[];
+      threadIdsByParent: Map<number, number[]>;
     }[] = [];
     const groupMap = new Map<string, typeof groups[0]>();
 
-    for (const ch of currentServerChannels) {
+    const isThreadChannel = (ch: ChannelItem) => {
       const dc = dcChannelMap.get(ch.id);
+      return ch.type === 'thread' || Boolean(dc?.isThread) || ch.name.startsWith('ticket-') || ch.name.startsWith('closed-');
+    };
+    const resolveParentAsdfId = (ch: ChannelItem): number | null => {
+      if (ch.parent_channel_id && currentServerChannels.some(o => o.id === ch.parent_channel_id)) return ch.parent_channel_id;
+      const dc = dcChannelMap.get(ch.id);
+      if (dc?.parentId) {
+        for (const other of currentServerChannels) {
+          if (other.id !== ch.id && dcChannelMap.get(other.id)?.id === dc.parentId) return other.id;
+        }
+      }
+      return null;
+    };
+
+    for (const ch of currentServerChannels) {
+      const parentAsdfId = isThreadChannel(ch) ? resolveParentAsdfId(ch) : null;
+      const dc = dcChannelMap.get(parentAsdfId ?? ch.id);
       const catName = dc?.parentName ? String(dc.parentName).trim() : '';
       const catKey = catName ? `cat-${selectedServerId}-${catName}` : `cat-${selectedServerId}-uncategorized`;
       const displayName = catName || 'チャンネル';
@@ -5216,7 +5269,7 @@ export default function App() {
 
       let g = groupMap.get(catKey);
       if (!g) {
-        g = { key: catKey, name: displayName, position: catPos, channels: [] };
+        g = { key: catKey, name: displayName, position: catPos, channels: [], threadIdsByParent: new Map() };
         groupMap.set(catKey, g);
         groups.push(g);
       }
@@ -5233,20 +5286,9 @@ export default function App() {
       const unassignedThreads: ChannelItem[] = [];
 
       for (const ch of g.channels) {
-        const dc = dcChannelMap.get(ch.id);
-        const isThread = ch.type === 'thread' || Boolean(dc?.isThread) || ch.name.startsWith('ticket-') || ch.name.startsWith('closed-');
-        if (isThread) {
-          let parentAsdfId: number | null = null;
-          if (dc?.parentId) {
-            for (const other of currentServerChannels) {
-              const otherDc = dcChannelMap.get(other.id);
-              if (otherDc?.id === dc.parentId) {
-                parentAsdfId = other.id;
-                break;
-              }
-            }
-          }
-          if (parentAsdfId) {
+        if (isThreadChannel(ch)) {
+          const parentAsdfId = resolveParentAsdfId(ch);
+          if (parentAsdfId && g.channels.some(o => o.id === parentAsdfId)) {
             const list = threadsByParentAsdfId.get(parentAsdfId) || [];
             list.push(ch);
             threadsByParentAsdfId.set(parentAsdfId, list);
@@ -5278,6 +5320,7 @@ export default function App() {
       }
       sortedChannels.push(...unassignedThreads);
       g.channels = sortedChannels;
+      for (const [pid, list] of threadsByParentAsdfId) g.threadIdsByParent.set(pid, list.map(t => t.id));
     }
 
     return groups;
@@ -6606,8 +6649,9 @@ export default function App() {
                                   const binding = bindingByAsdfId.get(ch.id);
                                   const isThread = ch.type === 'thread' || Boolean(binding && (binding as any).isThread) || ch.name.startsWith('ticket-') || ch.name.startsWith('closed-');
                                   const isActiveCh = activeChannelId === ch.id;
-                                  const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0);
-                                  const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0);
+                                  const childThreadIds = group.threadIdsByParent.get(ch.id) || [];
+                                  const unread = isActiveCh ? 0 : (unreadCounts[ch.id] || 0) + childThreadIds.reduce((s, tid) => s + (tid === activeChannelId ? 0 : (unreadCounts[tid] || 0)), 0);
+                                  const mentions = isActiveCh ? 0 : (mentionCounts[ch.id] || 0) + childThreadIds.reduce((s, tid) => s + (tid === activeChannelId ? 0 : (mentionCounts[tid] || 0)), 0);
                                   const hasRoleRestriction = (Array.isArray(ch.view_roles) && ch.view_roles.length > 0) || (Array.isArray(ch.write_roles) && ch.write_roles.length > 0);
                                   return (
                                     <div
