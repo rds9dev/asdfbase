@@ -241,6 +241,26 @@ export async function deleteDiscordChannel(discordChannelId: string): Promise<bo
   return false;
 }
 
+export async function createDiscordForumThread(discordForumChannelId: string, threadName: string, initialMessageContent?: string): Promise<{ threadId: string; name: string } | null> {
+  if (!client || !connected) return null;
+  try {
+    let ch = client.channels.cache.get(discordForumChannelId) as any;
+    if (!ch) {
+      ch = await client.channels.fetch(discordForumChannelId).catch(() => null);
+    }
+    if (ch && typeof ch.threads?.create === 'function') {
+      const thread = await ch.threads.create({
+        name: threadName,
+        message: { content: initialMessageContent || `スレッド「${threadName}」が作成されました` },
+      });
+      return { threadId: thread.id, name: thread.name };
+    }
+  } catch (err: any) {
+    console.warn(`[discord] Failed to create forum thread in ${discordForumChannelId}:`, err.message);
+  }
+  return null;
+}
+
 // Bot で Discord に同期している asdfbase チャンネル
 export async function getBoundAsdfChannelIds(): Promise<number[]> {
   if (!client || !deps) return [];

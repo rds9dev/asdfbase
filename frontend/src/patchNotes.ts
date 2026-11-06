@@ -11,9 +11,29 @@ export interface PatchNote {
   items: PatchNoteItem[];
 }
 
-export const LATEST_PATCH_VERSION = 'v3.1.4';
+export const LATEST_PATCH_VERSION = 'v3.1.5';
 
 export const PATCH_NOTES: PatchNote[] = [
+  {
+    version: 'v3.1.5',
+    date: '2026-11-06',
+    title: 'フォーラム専用スレッド選択ビュー & スレッド作成機能を追加',
+    summary: 'フォーラムチャンネルを開いた際に、画面全体でフォーラム内のスレッド一覧を閲覧・検索・選択できる専用画面に刷新しました。また、asdfbase側から新規スレッドを作成できるようになりました。',
+    items: [
+      {
+        title: 'フォーラム専用のスレッド選択ビュー',
+        description: 'フォーラムチャンネル(projectなど)を開くと、スレッド一覧カードが並ぶ専用画面が表示され、スレッドを直接選んで会話へ移動できるようになりました。スレッド名でのリアルタイム絞り込み検索も可能です。'
+      },
+      {
+        title: 'asdfbaseから新規スレッドを作成',
+        description: 'フォーラム画面から直接新しいスレッドを作成できるようになりました。Discordと同期しているフォーラムの場合はDiscord側にもスレッドが自動投稿されます。'
+      },
+      {
+        title: '親フォーラムへのワンクリック戻るナビゲーション',
+        description: 'スレッドを開いているとき、上部に親フォーラムへのリンクが表示され、簡単にフォーラム画面へ戻れるようになりました。'
+      }
+    ]
+  },
   {
     version: 'v3.1.4',
     date: '2026-11-06',

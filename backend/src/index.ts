@@ -19,7 +19,7 @@ import type { Content } from '@google/genai';
 import {
   startDiscordBot, relayToDiscordBot, editRelayedOnDiscord, deleteRelayedOnDiscord, getDiscordStatus, getDiscordGuildStatus, refreshDiscordCommands, getBoundAsdfChannelIds,
   relayReactionToDiscord, relayPinToDiscord, resolveDiscordReactionUsers,
-  getDiscordServers, addDiscordBinding, removeDiscordBinding, getDiscordBindings, deleteDiscordChannel, syncDiscordHistory, approveDiscordGuild, removeApprovedDiscordGuild,
+  getDiscordServers, addDiscordBinding, removeDiscordBinding, getDiscordBindings, deleteDiscordChannel, createDiscordForumThread, syncDiscordHistory, approveDiscordGuild, removeApprovedDiscordGuild,
   sendDiscordDm, deleteDiscordDm, triggerDiscordDmTyping, getDiscordUserPresence,
 } from './discord.js';
 import {
@@ -985,6 +985,71 @@ app.post('/api/channels', authMiddleware, adminOnly, async (req: AuthRequest, re
   } catch (err) {
     console.error('Channel create error:', err);
     res.status(500).json({ error: 'チャンネル作成に失敗しました' });
+  }
+});
+
+app.post('/api/channels/:id/threads', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const parentId = parseInt(req.params.id, 10);
+    const parentRes = await pool.query(`SELECT * FROM channels WHERE id = $1`, [parentId]);
+    if (parentRes.rows.length === 0) {
+      return res.status(404).json({ error: '親チャンネルが見つかりません' });
+    }
+    const parentCh = parentRes.rows[0];
+    const { name, message } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'スレッド名を入力してください' });
+    }
+    const cleanName = name.trim().replace(/\s+/g, '-');
+
+    // Discord連携チャンネルの場合、Discord側にもフォーラムスレッドを作成
+    const bindings = await getDiscordBindings().catch(() => []);
+    const parentBinding = bindings.find(b => b.asdfChannelId === parentId);
+    let createdDiscordThread: { threadId: string; name: string } | null = null;
+
+    if (parentBinding && parentCh.type === 'forum') {
+      createdDiscordThread = await createDiscordForumThread(
+        parentBinding.discordChannelId,
+        cleanName,
+        message ? `${req.user!.username}: ${message}` : undefined
+      ).catch(() => null);
+    }
+
+    const maxPosRes = await pool.query(`SELECT COALESCE(MAX(position), 0) as max_pos FROM channels`);
+    const nextPos = parseInt(maxPosRes.rows[0].max_pos, 10) + 1;
+
+    // asdfbase 側にスレッドチャンネルを作成
+    const insRes = await pool.query(
+      `INSERT INTO channels (name, type, position, server_id, parent_channel_id) VALUES ($1, 'thread', $2, $3, $4) RETURNING *`,
+      [cleanName, nextPos, parentCh.server_id, parentId]
+    );
+    const newThread = insRes.rows[0];
+
+    // Discord側で作成された場合はバインド
+    if (createdDiscordThread) {
+      await addDiscordBinding(createdDiscordThread.threadId, newThread.id, parentBinding?.guildId);
+    }
+
+    broadcast({ type: 'CHANNEL_CREATED', payload: newThread });
+    logAudit(req.user!, 'channel_create', 'channel', newThread.id, { message: `スレッド #${newThread.name} を作成 (親: #${parentCh.name})` });
+    refreshDiscordCommands();
+
+    // 初期メッセージがあれば messages に投稿
+    if (message && message.trim()) {
+      const enc = encryptMessageContent(message.trim(), newThread.id);
+      const msgRes = await pool.query(
+        `INSERT INTO messages (channel_id, user_id, username, content) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [newThread.id, req.user!.id, req.user!.username, enc]
+      );
+      const inserted = msgRes.rows[0];
+      inserted.content = message.trim();
+      broadcast({ type: 'MESSAGE_CREATED', payload: inserted });
+    }
+
+    res.json(newThread);
+  } catch (err) {
+    console.error('Thread create error:', err);
+    res.status(500).json({ error: 'スレッド作成に失敗しました' });
   }
 });
 

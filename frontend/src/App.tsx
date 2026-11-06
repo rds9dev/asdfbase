@@ -5260,6 +5260,43 @@ export default function App() {
     });
   };
 
+  // フォーラム画面用のステート
+  const [forumSearchQuery, setForumSearchQuery] = useState('');
+  const [showCreateThreadModal, setShowCreateThreadModal] = useState(false);
+  const [newThreadTitle, setNewThreadTitle] = useState('');
+  const [newThreadInitialMsg, setNewThreadInitialMsg] = useState('');
+  const [isCreatingThread, setIsCreatingThread] = useState(false);
+
+  const handleCreateThread = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newThreadTitle.trim() || isCreatingThread || !token) return;
+    setIsCreatingThread(true);
+    try {
+      const res = await safeFetch(`${API_BASE_URL}/api/channels/${activeChannelId}/threads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ name: newThreadTitle.trim(), message: newThreadInitialMsg.trim() }),
+      });
+      if (res.ok) {
+        const newCh = await res.json();
+        setChannels(prev => [...prev.filter(c => c.id !== newCh.id), newCh]);
+        setActiveChannelId(newCh.id);
+        setShowCreateThreadModal(false);
+        setNewThreadTitle('');
+        setNewThreadInitialMsg('');
+        toast(`スレッド #${newCh.name} を作成しました`, { kind: 'success' });
+      } else {
+        const d = await res.json().catch(() => ({}));
+        toast(d.error || 'スレッド作成に失敗しました', { kind: 'error' });
+      }
+    } catch (err) {
+      console.error(err);
+      toast('スレッド作成エラー', { kind: 'error' });
+    } finally {
+      setIsCreatingThread(false);
+    }
+  };
+
   // 選択中サーバーのチャンネルを Discord のカテゴリごとにグループ分け
   const groupedChannels = useMemo(() => {
     const currentServerChannels = channels.filter(
@@ -7661,7 +7698,160 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="relative flex-1 min-h-0 flex flex-col">
+              {activeChannelObj?.type === 'forum' ? (
+                <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 bg-[#090A0C]">
+                  <div className="max-w-4xl mx-auto space-y-4 sm:space-y-6">
+                    {/* フォーラムトップバナー */}
+                    <div className="p-4 sm:p-6 rounded-2xl bg-gradient-to-br from-indigo-950/60 via-[#12141c] to-stone-900/60 border border-indigo-500/30 shadow-xl anim-fade">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex items-start sm:items-center gap-3.5">
+                          <div className="p-3 rounded-2xl bg-indigo-500/20 border border-indigo-500/40 text-indigo-400 shrink-0 shadow-lg shadow-indigo-500/10">
+                            <MessagesSquare className="w-6 h-6 sm:w-7 sm:h-7" />
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h2 className="text-lg sm:text-xl font-bold text-white">
+                                #{activeChannelName}
+                              </h2>
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 font-mono font-medium">
+                                フォーラム
+                              </span>
+                              {activeChannelBinding && (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-stone-800 text-stone-300 border border-stone-700 font-mono">
+                                  Discord #{activeChannelBinding.discordChannelName}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-stone-400 mt-1.5 leading-relaxed">
+                              このフォーラム内のスレッドを選択して閲覧・会話できます。
+                            </p>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => setShowCreateThreadModal(true)}
+                          className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-xs font-bold transition flex items-center justify-center gap-2 shrink-0 shadow-lg shadow-indigo-600/30 cursor-pointer self-start sm:self-auto"
+                        >
+                          <Plus className="w-4 h-4" />
+                          <span>新しいスレッドを作成</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* スレッド検索・フィルターバー */}
+                    {(() => {
+                      const allForumThreads = channels.filter(c => c.parent_channel_id === activeChannelId);
+                      const filtered = allForumThreads.filter(th => {
+                        if (!forumSearchQuery.trim()) return true;
+                        return th.name.toLowerCase().includes(forumSearchQuery.toLowerCase());
+                      });
+
+                      return (
+                        <>
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                            <div className="relative flex-1 max-w-md">
+                              <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+                              <input
+                                type="text"
+                                value={forumSearchQuery}
+                                onChange={e => setForumSearchQuery(e.target.value)}
+                                placeholder="スレッドを検索..."
+                                className="w-full bg-[#121418] border border-stone-800 focus:border-indigo-500 rounded-xl pl-9 pr-8 py-2 text-xs text-stone-200 placeholder-stone-500 outline-none transition"
+                              />
+                              {forumSearchQuery && (
+                                <button
+                                  type="button"
+                                  onClick={() => setForumSearchQuery('')}
+                                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-500 hover:text-stone-300 text-xs px-1"
+                                >
+                                  ✕
+                                </button>
+                              )}
+                            </div>
+
+                            <div className="text-[11px] text-stone-400 font-mono self-end sm:self-auto">
+                              スレッド <span className="font-bold text-indigo-400">{filtered.length}</span> 件
+                            </div>
+                          </div>
+
+                          {/* スレッドカード一覧 */}
+                          {filtered.length === 0 ? (
+                            <div className="py-16 text-center border border-dashed border-stone-800 rounded-2xl p-8 space-y-3 bg-[#0d0e12]">
+                              <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center mx-auto">
+                                <MessagesSquare className="w-6 h-6" />
+                              </div>
+                              <div className="text-sm font-bold text-stone-200">
+                                {forumSearchQuery ? '一致するスレッドが見つかりませんでした' : 'まだスレッドがありません'}
+                              </div>
+                              <p className="text-xs text-stone-500 max-w-sm mx-auto">
+                                {forumSearchQuery
+                                  ? '検索キーワードを変更してもう一度お試しください。'
+                                  : '最初のスレッドを作成して、ディスカッションを始めましょう。'}
+                              </p>
+                              <button
+                                type="button"
+                                onClick={() => setShowCreateThreadModal(true)}
+                                className="px-4 py-2 rounded-xl bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/40 text-xs font-bold transition inline-flex items-center gap-1.5 cursor-pointer mt-2"
+                              >
+                                <Plus className="w-3.5 h-3.5" /> 最初のスレッドを作成
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              {filtered.map(th => {
+                                const thBinding = bindingByAsdfId.get(th.id);
+                                const thUnread = unreadCounts[th.id] || 0;
+                                const thMentions = mentionCounts[th.id] || 0;
+                                return (
+                                  <div
+                                    key={th.id}
+                                    onClick={() => setActiveChannelId(th.id)}
+                                    className="group p-4 rounded-2xl bg-[#121418] hover:bg-[#181B22] border border-stone-800/80 hover:border-indigo-500/50 transition cursor-pointer flex flex-col justify-between shadow-sm hover:shadow-xl hover:shadow-indigo-500/10"
+                                  >
+                                    <div>
+                                      <div className="flex items-start justify-between gap-2 mb-2">
+                                        <div className="flex items-center gap-2 min-w-0">
+                                          <span className="p-1.5 rounded-lg bg-indigo-500/10 group-hover:bg-indigo-500/20 text-indigo-400 transition shrink-0">
+                                            <CornerDownRight className="w-4 h-4" />
+                                          </span>
+                                          <h4 className="text-sm font-bold text-stone-200 group-hover:text-white truncate">
+                                            {th.name}
+                                          </h4>
+                                        </div>
+                                        <div className="flex items-center gap-1 shrink-0">
+                                          {thMentions > 0 ? (
+                                            <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-red-500 text-white text-[10px] font-bold leading-5 text-center anim-badge shadow">
+                                              {thMentions > 99 ? '99+' : thMentions}
+                                            </span>
+                                          ) : thUnread > 0 ? (
+                                            <span className="w-2.5 h-2.5 rounded-full bg-white anim-badge shadow-[0_0_6px_rgba(255,255,255,0.8)]" />
+                                          ) : null}
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <div className="pt-3 border-t border-stone-800/60 flex items-center justify-between text-[11px] text-stone-500">
+                                      <span className="font-mono text-stone-400 truncate max-w-[180px]">
+                                        {thBinding ? `#${thBinding.discordChannelName}` : 'asdfbase スレッド'}
+                                      </span>
+                                      <span className="text-indigo-400 group-hover:translate-x-0.5 transition-transform font-bold flex items-center gap-1 shrink-0">
+                                        開く <ChevronRight className="w-3.5 h-3.5" />
+                                      </span>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              ) : (
+                <>
+                <div className="relative flex-1 min-h-0 flex flex-col">
               <div ref={chatScrollContainerRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto px-1.5 sm:px-4 py-3">
                 {/* 過去ログ読み込み (上端で自動 / 手動ボタン) */}
                 {hasMoreMessages && messages.length > 0 && !chatSearchQuery && (
@@ -7683,60 +7873,6 @@ export default function App() {
                         </>
                       )}
                     </button>
-                  </div>
-                )}
-
-                {/* フォーラムチャンネル表示: フォーラム内のスレッド一覧 */}
-                {activeChannelObj?.type === 'forum' && (
-                  <div className="mb-4 p-4 rounded-2xl bg-indigo-950/20 border border-indigo-500/30 anim-fade">
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <MessagesSquare className="w-5 h-5 text-indigo-400" />
-                      <h3 className="text-base font-bold text-white">#{activeChannelName} フォーラム</h3>
-                    </div>
-                    <p className="text-xs text-stone-400 mb-3">
-                      このフォーラムに投稿されたスレッド一覧です。スレッドを選択して閲覧・会話できます。
-                    </p>
-                    {(() => {
-                      const forumThreads = channels.filter(c => c.parent_channel_id === activeChannelId);
-                      if (forumThreads.length === 0) {
-                        return (
-                          <div className="p-4 text-center text-xs text-stone-500 border border-dashed border-stone-800 rounded-xl">
-                            まだスレッドが作成されていません。Discord側またはasdfbaseからスレッドを作成してください。
-                          </div>
-                        );
-                      }
-                      return (
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          {forumThreads.map(th => {
-                            const thUnread = unreadCounts[th.id] || 0;
-                            const thMentions = mentionCounts[th.id] || 0;
-                            return (
-                              <button
-                                key={th.id}
-                                type="button"
-                                onClick={() => setActiveChannelId(th.id)}
-                                className="flex items-center justify-between p-3 rounded-xl bg-stone-900/90 hover:bg-stone-800/90 border border-stone-800/80 hover:border-indigo-500/50 text-left transition group cursor-pointer shadow-sm"
-                              >
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <CornerDownRight className="w-4 h-4 text-indigo-400 group-hover:text-indigo-300 shrink-0" />
-                                  <span className="text-xs font-bold text-stone-200 group-hover:text-white truncate">{th.name}</span>
-                                </div>
-                                <div className="flex items-center gap-1.5 shrink-0 ml-2">
-                                  {thMentions > 0 ? (
-                                    <span className="min-w-[18px] h-4 px-1 rounded-full bg-red-500 text-white text-[9px] font-bold leading-4 text-center anim-badge">
-                                      {thMentions}
-                                    </span>
-                                  ) : thUnread > 0 ? (
-                                    <span className="w-2 h-2 rounded-full bg-white anim-badge" />
-                                  ) : null}
-                                  <ChevronRight className="w-3.5 h-3.5 text-stone-600 group-hover:text-stone-300 transition-transform" />
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      );
-                    })()}
                   </div>
                 )}
 
@@ -8580,6 +8716,8 @@ export default function App() {
                 </form>
               )}
               </div>
+              </>
+              )}
             </section>
             )}
 
@@ -11330,6 +11468,63 @@ export default function App() {
               >
                 変更を保存
               </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* フォーラム スレッド作成モーダル */}
+      {showCreateThreadModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 anim-fade" onClick={() => setShowCreateThreadModal(false)}>
+          <div onClick={e => e.stopPropagation()} className="w-full max-w-sm bg-[#111214] border border-stone-800 rounded-2xl p-5 shadow-2xl font-mono text-xs space-y-4 anim-pop">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-white text-sm flex items-center gap-1.5">
+                <MessagesSquare className="w-4 h-4 text-indigo-400" />
+                <span>新規スレッドを作成</span>
+              </span>
+              <button onClick={() => setShowCreateThreadModal(false)} className="text-stone-500 hover:text-white text-base cursor-pointer">&times;</button>
+            </div>
+            <div className="text-[11px] text-stone-400">
+              #{activeChannelName} に新しいスレッドを投稿します。
+            </div>
+            <form onSubmit={handleCreateThread} className="space-y-3">
+              <div>
+                <label className="block text-stone-400 mb-1">スレッド名 <span className="text-rose-400">*</span></label>
+                <input
+                  type="text"
+                  required
+                  placeholder="例: 機能要望・アイデア"
+                  value={newThreadTitle}
+                  onChange={e => setNewThreadTitle(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+              <div>
+                <label className="block text-stone-400 mb-1">初期メッセージ (任意)</label>
+                <textarea
+                  rows={3}
+                  placeholder="スレッドの最初の投稿内容..."
+                  value={newThreadInitialMsg}
+                  onChange={e => setNewThreadInitialMsg(e.target.value)}
+                  className="w-full bg-[#16181D] border border-stone-800 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-indigo-500 resize-none"
+                />
+              </div>
+              <div className="flex gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowCreateThreadModal(false)}
+                  className="flex-1 py-2 bg-stone-800 hover:bg-stone-700 text-stone-300 font-bold rounded-xl transition cursor-pointer"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="submit"
+                  disabled={!newThreadTitle.trim() || isCreatingThread}
+                  className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold rounded-xl transition cursor-pointer"
+                >
+                  {isCreatingThread ? '作成中…' : 'スレッド作成'}
+                </button>
+              </div>
             </form>
           </div>
         </div>
